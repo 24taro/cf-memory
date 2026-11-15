@@ -1,0 +1,8 @@
+{
+  "name": "cf-memory-agent",
+  "author": {
+    "name": "24taro"
+  },
+  "version": "0.3.1",
+  "description": "Keeps prompts, replies and one-line tool actions in cf-memory for keyword search, and injects recall and session context. No summarization."
+}

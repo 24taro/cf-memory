@@ -1,0 +1,13 @@
+-- Drop the retired eg_live_ key store (2026-08-14, review round 6).
+--
+-- Bearer authentication moved to auth.example.com introspection: resolvePrincipal
+-- no longer reads this table, and src/ contains zero references to it. What was
+-- left was 16 rows of which 4 still had revoked_at IS NULL — two of them
+-- 'admin' — so the table read as "there are live admin keys" while in fact no
+-- code path could ever accept one. Those two facts cannot both be checked at a
+-- glance, and the wrong one is the reassuring one.
+--
+-- The key-issuance UI (KeysPage, mintApiKey, the /access console row type) went
+-- with it in the same commit. search made the equivalent surface an explicit 410;
+-- here the routes were already gone, so only the store remains to remove.
+DROP TABLE IF EXISTS api_keys;

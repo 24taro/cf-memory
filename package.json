@@ -1,0 +1,46 @@
+{
+  "name": "cf-memory",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A self-hostable memory layer for AI agents and the humans operating them \u2014 one Cloudflare-native notes+skills store with a human web garden and an MCP/REST/CLI agent door.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy && wrangler d1 migrations apply DB --remote && wrangler d1 migrations apply LOGS --remote",
+    "deploy:production": "node scripts/deploy.mjs -c wrangler.production.jsonc",
+    "typecheck": "tsc --noEmit",
+    "test": "node scripts/test.mjs",
+    "test:agent": "node scripts/test-agent.mjs",
+    "test:migrations": "vitest run test/capture.test.ts test/access-only-migration.test.ts test/logs-migration.test.ts --maxWorkers=1",
+    "agent:doctor": "node cf-memory-agent/scripts/agent.mjs doctor",
+    "agent:install": "node cf-memory-agent/scripts/agent.mjs install",
+    "test:watch": "vitest",
+    "db:apply:local": "wrangler d1 migrations apply DB --local",
+    "db:apply": "wrangler d1 migrations apply DB --remote",
+    "db:logs:apply:local": "wrangler d1 migrations apply LOGS --local",
+    "db:logs:apply": "wrangler d1 migrations apply LOGS --remote",
+    "cli": "node --experimental-strip-types cli/cf-memory.ts",
+    "build:check": "wrangler deploy --dry-run"
+  },
+  "dependencies": {
+    "hono": "^4.6.14",
+    "marked": "^14.1.3",
+    "sanitize-html": "^2.17.5"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260930.1",
+    "@types/node": "^22.10.2",
+    "@types/sanitize-html": "^2.16.1",
+    "miniflare": "5.20260926.1-alpha",
+    "typescript": "^5.7.2",
+    "vitest": "^4.1.11",
+    "wrangler": "^4.144.0",
+    "yaml": "2.9.1"
+  },
+  "overrides": {
+    "miniflare": {
+      "undici": "^7.29.1",
+      "sharp": "^0.35.4"
+    }
+  }
+}

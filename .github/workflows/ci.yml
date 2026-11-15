@@ -1,0 +1,54 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '*.md'
+  workflow_dispatch:
+    inputs:
+      full:
+        description: Run all tests and the Worker deployment dry-run
+        type: boolean
+        default: false
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run test:migrations
+      - name: Install script syntax and lint
+        run: bash -n install.sh && shellcheck install.sh
+      - name: Install script stops cleanly without a Cloudflare login
+        timeout-minutes: 6
+        run: |
+          set +e
+          out=$(./install.sh --no-client 2>&1); code=$?
+          echo "$out" | tail -n 25
+          test "$code" -ne 0 && echo "$out" | grep -q "not logged in to Cloudflare"
+      - name: Full test prerequisites (manual only)
+        if: github.event_name == 'workflow_dispatch' && inputs.full
+        run: command -v jq || (sudo apt-get update && sudo apt-get install -y jq)
+      - name: Full test suite (manual only)
+        if: github.event_name == 'workflow_dispatch' && inputs.full
+        run: npm test -- --maxWorkers=2
+        env:
+          CF_MEMORY_TEST_TIME_SCALE: '10'
+      - name: Worker dry-run (manual only)
+        if: github.event_name == 'workflow_dispatch' && inputs.full
+        run: npm run build:check -- --outdir /tmp/cf-memory-dry-run
+        env:
+          WRANGLER_SEND_METRICS: 'false'

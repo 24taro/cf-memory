@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  // The configuration anyone can deploy: `./install.sh` creates the two D1
+  // databases and the R2 bucket on your account by name (this file needs no
+  // ids), applies the migrations, and serves at
+  // https://cf-memory.<your-subdomain>.workers.dev.
+  "name": "cf-memory",
+  "main": "src/index.tsx",
+  "compatibility_date": "2025-06-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": { "enabled": true },
+  // Preview URLs would be a second way in that a Cloudflare Access app on the
+  // main host does not cover.
+  "preview_urls": false,
+  // Agents authenticate with one fixed token. Set it before the first deploy:
+  //   openssl rand -hex 32 | npx wrangler secret put API_TOKEN
+  // Fewer than 32 characters is refused.
+  "secrets": { "required": ["API_TOKEN"] },
+  "vars": {
+    "OWNER_HANDLE": "owner",
+    "RECALL_TOKEN_BUDGET": "4000",
+    // `action` and `error` log rows older than this are deleted by the daily
+    // cron. Prompts and final replies are kept.
+    "LOG_ACTION_RETENTION_DAYS": "90"
+    // Optional — the web pages, behind Cloudflare Access (see docs/WEB-ACCESS.md):
+    //   "ACCESS_TEAM_DOMAIN": "<team>.cloudflareaccess.com",
+    //   "ACCESS_AUD": "<application audience tag>",
+    //   "OWNER_EMAIL": "<the address you sign in with>"
+    // Optional — several people, with an OAuth authorization server
+    // (see docs/TEAM-MODE.md): "AUTH_ISSUER", "RESOURCE_URI", the AUTH service
+    // binding and the INTROSPECTION_SECRET secret.
+  },
+  // Daily log maintenance, 18:00 UTC.
+  "triggers": { "crons": ["0 18 * * *"] },
+  "d1_databases": [
+    // Notes, skills, memory blocks.
+    { "binding": "DB", "database_name": "cf-memory", "migrations_dir": "migrations" },
+    // The kept conversation: prompts, final replies, one-line actions.
+    { "binding": "LOGS", "database_name": "cf-memory-logs", "migrations_dir": "migrations-logs" }
+  ],
+  // Files attached to skills.
+  "r2_buckets": [{ "binding": "BUNDLES", "bucket_name": "cf-memory-bundles" }]
+}

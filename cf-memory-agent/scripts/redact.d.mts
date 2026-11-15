@@ -1,0 +1,12 @@
+export const DEFAULT_DENY_PATHS: string[];
+export function scrubText(value: unknown): string;
+export function scrub(value: unknown, depth?: number): unknown;
+export function deniedPath(path: unknown, patterns?: string[]): boolean;
+export function hasDeniedPath(value: unknown, patterns?: string[], depth?: number): boolean;
+export function hasCredentialReader(value: unknown, depth?: number): boolean;
+export function redactPayload(input: unknown, output: unknown, patterns?: string[]): { input: unknown; output: unknown; denied: boolean };
+export function boundPayload(payload: unknown, maxBytes?: number): { payload: unknown; truncated: boolean };
+export function boundToolPayload(payload: unknown, maxBytes?: number): { payload: unknown; truncated: boolean };
+export function markedPrivate(value: unknown, depth?: number): boolean;
+export function scrubFreeTextSecrets(value: unknown): string;
+export function scrubEntryText(value: unknown): string;

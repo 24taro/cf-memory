@@ -1,0 +1,15 @@
+{
+  "name": "cf-memory",
+  "description": "Cloudflare-native durable memory: notes, skills and kept conversations searched by keyword.",
+  "owner": {
+    "name": "24taro"
+  },
+  "plugins": [
+    {
+      "name": "cf-memory-agent",
+      "source": "./cf-memory-agent",
+      "description": "Keeps prompts, replies and tool actions in cf-memory, injects recall and session context, and has a doctor.",
+      "version": "0.3.1"
+    }
+  ]
+}

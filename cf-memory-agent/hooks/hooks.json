@@ -1,0 +1,9 @@
+{
+  "hooks": {
+    "SessionStart": [{"hooks": [{"type": "command", "command": "NODE_OPTIONS= node \"${CLAUDE_PLUGIN_ROOT}/scripts/agent.mjs\" session-start", "timeout": 10}]}],
+    "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "NODE_OPTIONS= node \"${CLAUDE_PLUGIN_ROOT}/scripts/agent.mjs\" user-prompt-submit", "timeout": 12}]}],
+    "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command", "command": "NODE_OPTIONS= node \"${CLAUDE_PLUGIN_ROOT}/scripts/agent.mjs\" post-tool-use", "timeout": 5}]}],
+    "PostToolUseFailure": [{"matcher": ".*", "hooks": [{"type": "command", "command": "NODE_OPTIONS= node \"${CLAUDE_PLUGIN_ROOT}/scripts/agent.mjs\" post-tool-use-failure", "timeout": 5}]}],
+    "Stop": [{"hooks": [{"type": "command", "command": "NODE_OPTIONS= node \"${CLAUDE_PLUGIN_ROOT}/scripts/agent.mjs\" stop", "timeout": 10}]}]
+  }
+}
