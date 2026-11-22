@@ -12,7 +12,7 @@ cf-memory は独立したプロジェクトです。Cloudflare 上で動きま�
 
 ## 導入
 
-R2 を有効にした Workers Paid プランの Cloudflare アカウント、Git、Bash、Node.js 22.12 以降の 22.x または 24 以上と npm、OpenSSL、curl が必要です。エージェントを接続する場合は Claude Code か Codex を用意します。Worker だけをデプロイする場合は `./install.sh --no-client` を使います。
+R2 を有効にした Workers Paid プランの Cloudflare アカウント、Git、Bash、Node.js 22.12 以降の 22.x または 24 以上と npm、OpenSSL、curl が必要です。エージェントを接続する場合は Claude Code 2.1.327 以降か Codex を用意します。インストーラーはデプロイやクライアント設定の変更前に Claude Code のバージョンを確認します。旧版が入っている場合は先に更新してください。Worker だけをデプロイする場合は `./install.sh --no-client` を使います。
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git

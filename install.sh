@@ -28,6 +28,21 @@ if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number
   fail "Node.js 22.12+ on the 22.x line, or Node.js 24+, is required (found $(node -v))"
 fi
 
+CLAUDE=0
+if [ "$CLIENTS" = 1 ] && command -v claude >/dev/null 2>&1; then
+  claude_requirement="Claude Code 2.1.327 or later is required. Update Claude Code or run './install.sh --no-client' to deploy only."
+  if ! claude_version=$(claude --version) || ! [[ "$claude_version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([[:space:]]|$) ]]; then
+    fail "could not determine the Claude Code version. $claude_requirement"
+  fi
+  major=${BASH_REMATCH[1]}
+  minor=${BASH_REMATCH[2]}
+  patch=${BASH_REMATCH[3]}
+  if (( 10#$major < 2 || (10#$major == 2 && (10#$minor < 1 || (10#$minor == 1 && 10#$patch < 327))) )); then
+    fail "found Claude Code $major.$minor.$patch. $claude_requirement"
+  fi
+  CLAUDE=1
+fi
+
 say "Installing dependencies"
 npm ci --no-audit --no-fund
 
@@ -78,7 +93,7 @@ done
 echo "The server accepts your token."
 
 CONNECTED=""
-if [ "$CLIENTS" = 1 ] && command -v claude >/dev/null 2>&1; then
+if [ "$CLAUDE" = 1 ]; then
   say "Connecting Claude Code"
   claude mcp remove cf-memory --scope user >/dev/null 2>&1 || true
   # add-json accepts stdin, so the credential never appears in a process argument.

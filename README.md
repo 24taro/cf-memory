@@ -20,9 +20,11 @@ The initial release supports one owner per instance using a fixed API token.
 ## Install
 
 You need a Cloudflare account on the Workers Paid plan with R2 enabled, Git,
-Bash, Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. Install Claude Code or
-Codex to connect an agent. Run `./install.sh --no-client` to deploy the Worker
-on its own.
+Bash, Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. To connect an
+agent, install Claude Code 2.1.327 or later, or Codex. If an older Claude Code
+version is installed, update it before running the installer. The installer
+checks the Claude Code version before deploying or changing any client settings.
+Run `./install.sh --no-client` to deploy the Worker on its own.
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git
