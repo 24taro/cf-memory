@@ -85,7 +85,7 @@ if [ "$CLIENTS" = 1 ] && command -v claude >/dev/null 2>&1; then
   printf '%s' "$TOKEN" |
     node -e '
       const token = require("node:fs").readFileSync(0, "utf8");
-      const config = { type: "http", url: process.argv[1], headers: { Authorization: `Bearer ${token}` } };
+      const config = { type: "http", url: process.argv[1], headers: { Authorization: "Bearer " + token } };
       process.stdout.write(JSON.stringify(config));
     ' "$URL/mcp" |
     claude mcp add-json --scope user cf-memory -
