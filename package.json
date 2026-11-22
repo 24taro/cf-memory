@@ -4,6 +4,9 @@
   "private": true,
   "description": "A self-hostable memory layer for AI agents and the humans operating them \u2014 one Cloudflare-native notes+skills store with a human web garden and an MCP/REST/CLI agent door.",
   "type": "module",
+  "engines": {
+    "node": "^22.12.0 || >=24.0.0"
+  },
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy && wrangler d1 migrations apply DB --remote && wrangler d1 migrations apply LOGS --remote",
@@ -23,9 +26,9 @@
     "build:check": "wrangler deploy --dry-run"
   },
   "dependencies": {
-    "hono": "^4.6.14",
+    "hono": "^4.13.16",
     "marked": "^14.1.3",
-    "sanitize-html": "^2.17.5"
+    "sanitize-html": "^2.18.0"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260930.1",
@@ -33,13 +36,13 @@
     "@types/sanitize-html": "^2.16.1",
     "miniflare": "5.20260926.1-alpha",
     "typescript": "^5.7.2",
-    "vitest": "^4.1.11",
+    "vitest": "^4.1.12",
     "wrangler": "^4.144.0",
     "yaml": "2.9.1"
   },
   "overrides": {
     "miniflare": {
-      "undici": "^7.29.1",
+      "undici": "^7.30.1",
       "sharp": "^0.35.4"
     }
   }

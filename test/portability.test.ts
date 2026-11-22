@@ -189,10 +189,12 @@ it('a concurrent bundle writer keeps its manifest and bytes, and a deleted targe
   beforePut = () => svc.skills.putFile(alice, skill, 'assets/race.txt', new TextEncoder().encode('winner'), 'text/plain').then(() => {});
   await expect(svc.skills.putFile(alice, skill, 'assets/race.txt', new TextEncoder().encode('loser'), 'text/plain', true)).rejects.toThrow();
   expect(new TextDecoder().decode((await svc.skills.getFile(skill.id, 'assets/race.txt'))!.bytes)).toBe('winner');
+  expect((await bucket.list({ prefix: `skills/${skill.id}/` })).objects).toHaveLength(1);
   const deleted = (await svc.skills.upsert(alice, { slug: 'asset-deleted-race', name: 'Deleted', instructions: 'Procedure' })).skill;
   beforePut = () => db.prepare('UPDATE skills SET deleted_at=1 WHERE id=?').bind(deleted.id).run().then(() => {});
   await expect(svc.skills.putFile(alice, deleted, 'assets/example.txt', new TextEncoder().encode('safe'), 'text/plain', true)).rejects.toThrow();
   expect(await svc.skills.getFileRow(deleted.id, 'assets/example.txt')).toBeNull();
+  expect((await bucket.list({ prefix: `skills/${deleted.id}/` })).objects).toHaveLength(0);
 });
 it('guarded archive cannot hide a note changed/shared/re-scoped after restore verification', async () => {
   const note = (await services.notes.upsert(alice, { slug: 'archive-restore-guard', title: 'Archive', body_md: 'Stable fact.', shared: false })).note;

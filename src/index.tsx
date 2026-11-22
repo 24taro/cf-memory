@@ -13,7 +13,7 @@ import { searchFilters, SearchInputError, standaloneSearch } from "./search";
 import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData } from "./serialize";
 import { blockWriteResult, ensureOwner, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
 import { attachmentDisposition, BundleQuotaError, BundlesUnconfiguredError, MAX_BUNDLE_FILE_BYTES, resolveServeContentType, validateBundlePath } from "./bundle";
-import type { SkillInput, SkillRow } from "./skills";
+import { SkillsRepo, type SkillInput, type SkillRow } from "./skills";
 import { slugify, slugifyPath } from "./slug";
 import type { Env, Principal } from "./types";
 import { isReadable, readableSqlFor } from "./visibility";
@@ -1553,10 +1553,15 @@ app.all("/mcp", async (c) => {
 });
 
 export default Object.assign(app, {
-  /** Daily log maintenance (cron `0 18 * * *` = 03:00 JST): delete `action` and
+  /** Daily maintenance (cron `0 18 * * *` = 03:00 JST): delete `action` and
    * `error` rows past LOG_ACTION_RETENTION_DAYS and old `log_daily` rows, in
    * bounded batches for at most ~20 s. Whatever is left resumes the next day. */
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (env.BUNDLES) {
+      ctx.waitUntil(new SkillsRepo(env.DB, env.BUNDLES).sweepBundleFiles(controller.scheduledTime).then(removed => {
+        if (removed) console.info(JSON.stringify({ event: 'cf_memory_bundle_sweep', removed }));
+      }).catch(() => console.error('[bundles] sweep failed; retries next run')));
+    }
     if (!env.LOGS) return;
     ctx.waitUntil(pruneLogs(env.LOGS, logSettings(env)).then(result => {
       console.info(JSON.stringify({ event: 'cf_memory_log_prune', ...result }));

@@ -11,6 +11,7 @@ import {
   MAX_BUNDLE_FILE_COUNT,
   MAX_BUNDLE_TOTAL_BYTES,
   sanitizeUploadContentType,
+  validateBundlePath,
 } from "./bundle";
 import { normalizeScope } from "./context";
 import { clampLimit, now, sha256hex, sha256hexBytes, ulid } from "./db";
@@ -114,6 +115,18 @@ export interface SkillFileRow {
   sha256: string | null;
   created_at: number;
   updated_at: number;
+}
+
+const OTHER_BUNDLE_FILES = "SELECT COUNT(*) AS count, COALESCE(SUM(size),0) AS bytes FROM skill_files WHERE skill_id=? AND path<>?";
+const BUNDLE_PUBLISH_WINDOW_MS = 15 * 60_000;
+const BUNDLE_SWEEP_GRACE_MS = 24 * 60 * 60_000;
+const BUNDLE_SWEEP_PAGE_SIZE = 100;
+const BUNDLE_SWEEP_PAGES = 5;
+const BUNDLE_SWEEP_CURSOR = "skill_bundle_sweep_cursor";
+
+function managedBundleKey(key: string): boolean {
+  const match = /^skills\/[0-9A-HJKMNP-TV-Z]{26}\/(?:(?:imports\/[a-f0-9]{64}|objects\/[0-9A-HJKMNP-TV-Z]{26})\/)?(.+)$/.exec(key);
+  return match !== null && validateBundlePath(match[1]) === match[1];
 }
 
 function bumpPatch(v: string): string {
@@ -365,23 +378,35 @@ export class SkillsRepo {
   }
 
   // ── Bundle files (phase 2b): bytes in R2, one manifest row per live path ──────
-  // softDelete() and fork() are intentionally NOT changed for R2: a soft-delete
-  // RETAINS bytes (resurrectable — path-based keys are id-scoped, not version-
-  // scoped, so a re-push restores file access), and fork() mints a NEW id so it
-  // copies zero bytes (the fork starts SKILL.md-only). Hard-delete + orphan-GC is
-  // a deferred follow-up.
+  // Soft-deleting a skill retains its manifest and bytes for restore. Forks
+  // start with a new skill ID and no bundle files.
 
-  /** Upload/overwrite one bundle file (owner-only; the route pre-checks ownership).
-   * Writes the R2 object first, then upserts the manifest row keyed by
-   * (skill_id, path). Enforces the per-skill count + total-size caps. `path` MUST
-   * already be validateBundlePath()-checked by the caller. Idempotent overwrite. */
+  private async checkBundleQuota(skillId: string, path: string, size: number): Promise<void> {
+    const usage = await this.db.prepare(OTHER_BUNDLE_FILES).bind(skillId, path).first<{ count: number; bytes: number }>();
+    if ((usage?.count ?? 0) >= MAX_BUNDLE_FILE_COUNT) throw new BundleQuotaError("count");
+    if ((usage?.bytes ?? 0) + size > MAX_BUNDLE_TOTAL_BYTES) throw new BundleQuotaError("total");
+  }
+
+  private async removeBundleObject(key: string): Promise<void> {
+    try {
+      await this.bundles!.delete(key);
+    } catch {
+      // The manifest already stopped referring to this immutable key. The
+      // scheduled scan retries deletion if this request cannot finish it.
+      console.warn("[bundles] object cleanup deferred");
+    }
+  }
+
+  /** Publish an owned bundle file at an already-validated path. Each upload
+   * has an immutable R2 key, so concurrent writers never overwrite live bytes. */
   async putFile(principal: Principal, skill: SkillRow, path: string, bytes: Uint8Array, clientContentType: string | null, createOnly = false): Promise<SkillFileRow> {
     if (!this.bundles) throw new BundlesUnconfiguredError();
     if (skill.user_id !== principal.userId || skill.deleted_at) throw new Error("putFile requires an owned, non-deleted skill"); // defense; route already 404s
     const existing = await this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skill.id, path).first<SkillFileRow>();
     const sha = await sha256hexBytes(bytes);
+    const contentType = sanitizeUploadContentType(clientContentType);
     const verifiedExisting = async (row: SkillFileRow): Promise<SkillFileRow> => {
-      if (row.sha256 !== sha || row.content_type !== sanitizeUploadContentType(clientContentType)) throw new StaleUpsertError();
+      if (row.sha256 !== sha || row.content_type !== contentType) throw new StaleUpsertError();
       const object = await this.bundles!.get(row.r2_key);
       if (!object || object.size !== bytes.byteLength || await sha256hexBytes(new Uint8Array(await object.arrayBuffer())) !== sha) throw new StaleUpsertError();
       return row;
@@ -391,32 +416,40 @@ export class SkillsRepo {
       if (!live || live.user_id !== principal.userId || live.deleted_at) throw new StaleUpsertError();
       return verifiedExisting(existing);
     }
-    if (!existing) {
-      const cnt = await this.db.prepare("SELECT COUNT(*) AS n FROM skill_files WHERE skill_id=?").bind(skill.id).first<{ n: number }>();
-      if ((cnt?.n ?? 0) >= MAX_BUNDLE_FILE_COUNT) throw new BundleQuotaError("count");
-    }
-    const sum = await this.db.prepare("SELECT COALESCE(SUM(size),0) AS total FROM skill_files WHERE skill_id=? AND path!=?").bind(skill.id, path).first<{ total: number }>();
-    if ((sum?.total ?? 0) + bytes.byteLength > MAX_BUNDLE_TOTAL_BYTES) throw new BundleQuotaError("total");
-    const contentType = sanitizeUploadContentType(clientContentType);
-    const r2Key = createOnly ? `skills/${skill.id}/imports/${sha}/${path}` : `skills/${skill.id}/${path}`;
+    await this.checkBundleQuota(skill.id, path, bytes.byteLength);
+    const uploadStartedAt = now();
+    const r2Key = `skills/${skill.id}/objects/${ulid(uploadStartedAt)}/${path}`;
     await this.bundles.put(r2Key, bytes, { httpMetadata: { contentType } });
     const ts = now();
-    const written = await this.db
-      .prepare(
-        `INSERT INTO skill_files (id,skill_id,path,r2_key,content_type,size,sha256,created_at,updated_at)
-         ${createOnly ? 'SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM skills WHERE id=? AND user_id=? AND deleted_at IS NULL)' : 'VALUES (?,?,?,?,?,?,?,?,?)'}
-         ${createOnly ? 'ON CONFLICT(skill_id,path) DO NOTHING' : 'ON CONFLICT(skill_id,path) DO UPDATE SET r2_key=excluded.r2_key, content_type=excluded.content_type, size=excluded.size, sha256=excluded.sha256, updated_at=excluded.updated_at'}`,
-      )
-      .bind(existing?.id ?? ulid(ts), skill.id, path, r2Key, contentType, bytes.byteLength, sha, ts, ts, ...(createOnly ? [skill.id, principal.userId] : []))
-      .run();
-    if (createOnly && !written.meta.changes) {
-      const winner = await this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skill.id,path).first<SkillFileRow>();
+    // Read the old pointer and publish in the same D1 transaction. If the
+    // transaction's result is unknown, the sweep uses the committed manifest
+    // to decide what to delete. Only a recent upload can publish a new key.
+    const conflict = createOnly ? "DO NOTHING" : `DO UPDATE SET r2_key=excluded.r2_key,
+      content_type=excluded.content_type, size=excluded.size, sha256=excluded.sha256, updated_at=excluded.updated_at`;
+    const [previous, published] = await this.db.batch<SkillFileRow>([
+      this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skill.id, path),
+      this.db.prepare(`INSERT INTO skill_files (id,skill_id,path,r2_key,content_type,size,sha256,created_at,updated_at)
+        SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS (SELECT 1 FROM skills WHERE id=? AND user_id=? AND deleted_at IS NULL)
+        AND unixepoch() * 1000 < ?
+        AND EXISTS (SELECT 1 FROM (${OTHER_BUNDLE_FILES}) AS other WHERE count < ? AND bytes + ? <= ?)
+        ON CONFLICT(skill_id,path) ${conflict} RETURNING *`)
+        .bind(ulid(ts), skill.id, path, r2Key, contentType, bytes.byteLength, sha, ts, ts,
+          skill.id, principal.userId, uploadStartedAt + BUNDLE_PUBLISH_WINDOW_MS,
+          skill.id, path, MAX_BUNDLE_FILE_COUNT, bytes.byteLength, MAX_BUNDLE_TOTAL_BYTES),
+    ]);
+    const old = previous.results[0];
+    const written = published.results[0];
+    if (!written) {
+      await this.removeBundleObject(r2Key);
       const live = await this.getById(skill.id);
-      if (!winner || !live || live.user_id !== principal.userId || live.deleted_at || winner.sha256 !== sha || winner.content_type !== contentType) throw new StaleUpsertError();
-      return verifiedExisting(winner);
+      if (!live || live.user_id !== principal.userId || live.deleted_at) throw new StaleUpsertError();
+      if (createOnly && old) return verifiedExisting(old);
+      await this.checkBundleQuota(skill.id, path, bytes.byteLength);
+      throw new StaleUpsertError();
     }
-    await this.fileEvent(principal, existing ? "skill.file.updated" : "skill.file.added", skill.id, path, bytes.byteLength);
-    return (await this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skill.id, path).first<SkillFileRow>()) as SkillFileRow;
+    if (old) await this.removeBundleObject(old.r2_key);
+    await this.fileEvent(principal, old ? "skill.file.updated" : "skill.file.added", skill.id, path, bytes.byteLength);
+    return written;
   }
 
   /** Read one bundle file's bytes + manifest row. Authz-free like getById — the
@@ -462,12 +495,43 @@ export class SkillsRepo {
   async deleteFile(principal: Principal, skill: SkillRow, path: string): Promise<boolean> {
     if (!this.bundles) throw new BundlesUnconfiguredError();
     if (skill.user_id !== principal.userId || skill.deleted_at) return false; // defense; the route already 404s a non-owned/deleted skill
-    const row = await this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skill.id, path).first<SkillFileRow>();
+    const row = await this.db.prepare(`DELETE FROM skill_files WHERE skill_id=? AND path=?
+      AND EXISTS (SELECT 1 FROM skills WHERE id=? AND user_id=? AND deleted_at IS NULL) RETURNING r2_key,size`)
+      .bind(skill.id, path, skill.id, principal.userId).first<{ r2_key: string; size: number | null }>();
     if (!row) return false;
-    await this.bundles.delete(row.r2_key);
-    await this.db.prepare("DELETE FROM skill_files WHERE id=?").bind(row.id).run();
+    await this.removeBundleObject(row.r2_key);
     await this.fileEvent(principal, "skill.file.deleted", skill.id, path, row.size ?? 0);
     return true;
+  }
+
+  /** Recover objects left by older releases, failed writes or interrupted
+   * cleanup. A young object may still be waiting for its D1 transaction. */
+  async sweepBundleFiles(timestamp = now()): Promise<number> {
+    if (!this.bundles) return 0;
+    const checkpoint = await this.db.prepare("SELECT value FROM meta WHERE key=?")
+      .bind(BUNDLE_SWEEP_CURSOR).first<{ value: string }>();
+    let cursor = checkpoint?.value || undefined;
+    let removed = 0;
+    for (let i = 0; i < BUNDLE_SWEEP_PAGES; i++) {
+      const page = await this.bundles.list({ prefix: "skills/", limit: BUNDLE_SWEEP_PAGE_SIZE, cursor });
+      const keys = page.objects.filter(({ key, uploaded }) =>
+        uploaded.getTime() <= timestamp - BUNDLE_SWEEP_GRACE_MS && managedBundleKey(key)).map(({ key }) => key);
+      if (keys.length) {
+        const { results } = await this.db.prepare(`SELECT r2_key FROM skill_files WHERE r2_key IN (${keys.map(() => "?").join(",")})`)
+          .bind(...keys).all<{ r2_key: string }>();
+        const referenced = new Set(results.map(({ r2_key }) => r2_key));
+        const orphans = keys.filter(key => !referenced.has(key));
+        if (orphans.length) {
+          await this.bundles.delete(orphans);
+          removed += orphans.length;
+        }
+      }
+      cursor = page.truncated ? page.cursor : undefined;
+      if (!cursor) break;
+    }
+    await this.db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES (?,?)")
+      .bind(BUNDLE_SWEEP_CURSOR, cursor ?? "").run();
+    return removed;
   }
 
   private async fileEvent(principal: Principal, verb: string, skillId: string, path: string, size: number): Promise<void> {

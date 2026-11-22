@@ -11,7 +11,8 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { parseDocument } from "yaml";
 import { validateBundlePath } from "../src/bundle";
 import app from "../src/index";
-import { bearerKeyFixture, rsEnvVars } from "./helpers";
+import { SkillsRepo } from "../src/skills";
+import { bearerKeyFixture, principalFixture, rsEnvVars } from "./helpers";
 
 const OWNER = "u_owner";
 const OTHER = "u_other";
@@ -84,7 +85,7 @@ describe("skill bundle files — harness + round-trip", () => {
     expect(await put.json()).toMatchObject({ ok: true, path: "scripts/run.ts", size: body.length });
 
     const manifestRow = await db.prepare("SELECT r2_key, size FROM skill_files WHERE skill_id=? AND path=?").bind(id, "scripts/run.ts").first<{ r2_key: string; size: number }>();
-    expect(manifestRow?.r2_key).toBe(`skills/${id}/scripts/run.ts`);
+    expect(manifestRow?.r2_key).toMatch(new RegExp(`^skills/${id}/objects/[^/]+/scripts/run\\.ts$`));
     expect(await bundles.get(manifestRow!.r2_key)).not.toBeNull();
 
     const raw = await req(`/@owner/skills/${slug}/files/scripts/run.ts`, { headers: { get authorization() { return `Bearer ${TOKEN}`; } } });
@@ -99,18 +100,59 @@ describe("skill bundle files — harness + round-trip", () => {
 
     const del = await req(`/api/v1/skills/${id}/files/scripts/run.ts`, { method: "DELETE", headers: { get authorization() { return `Bearer ${TOKEN}`; } } });
     expect(del.status).toBe(200);
-    expect(await bundles.get(`skills/${id}/scripts/run.ts`)).toBeNull();
+    expect(await bundles.get(manifestRow!.r2_key)).toBeNull();
     expect(await db.prepare("SELECT 1 FROM skill_files WHERE skill_id=? AND path=?").bind(id, "scripts/run.ts").first()).toBeNull();
   });
 
-  it("overwrite is idempotent (same key, one row)", async () => {
+  it("overwrite keeps one manifest row and removes the old R2 object", async () => {
     const { id } = await pushSkill("rt-overwrite");
-    await putFile(id, "references/a.md", "v1", "text/markdown");
-    await putFile(id, "references/a.md", "v2-longer", "text/markdown");
+    const path = "references/a.md";
+    const legacyKey = `skills/${id}/imports/${"a".repeat(64)}/${path}`;
+    await bundles.put(legacyKey, "v1");
+    await db.prepare("INSERT INTO skill_files (id,skill_id,path,r2_key,size,created_at,updated_at) VALUES (?,?,?,?,?,0,0)")
+      .bind("fixture-legacy-import", id, path, legacyKey, 2).run();
+    expect((await putFile(id, path, "v2-longer", "text/markdown")).status).toBe(200);
     const rows = await db.prepare("SELECT COUNT(*) AS n FROM skill_files WHERE skill_id=? AND path=?").bind(id, "references/a.md").first<{ n: number }>();
     expect(rows?.n).toBe(1);
+    expect(await bundles.get(legacyKey)).toBeNull();
+    expect((await bundles.list({ prefix: `skills/${id}/` })).objects).toHaveLength(1);
     const raw = await req(`/@owner/skills/rt-overwrite/files/references/a.md`, { headers: { get authorization() { return `Bearer ${TOKEN}`; } } });
     expect(await raw.text()).toBe("v2-longer");
+  });
+
+  it("the scheduled sweep retries interrupted cleanup and removes unreferenced legacy objects after a grace period", async () => {
+    const { id, slug } = await pushSkill("rt-sweep");
+    const retainedPath = "assets/kept.txt";
+    expect((await putFile(id, retainedPath, "kept for restore", "text/plain")).status).toBe(200);
+    const repo = new SkillsRepo(db, bundles);
+    const retained = await repo.getFileRow(id, retainedPath);
+    expect(retained).not.toBeNull();
+    expect((await mcpCall(TOKEN, "skills_delete", { slug })).deleted).toBe(true);
+    const legacyKey = `skills/${id}/references/obsolete.txt`;
+    const foreignKey = `skills/${id}/other/do-not-touch.txt`;
+    await bundles.put(legacyKey, "obsolete");
+    await bundles.put(foreignKey, "unmanaged");
+    const { id: deletedId } = await pushSkill("rt-sweep-retry");
+    const path = "references/deleted.txt";
+    expect((await putFile(deletedId, path, "delete me", "text/plain")).status).toBe(200);
+    const deleted = (await repo.getFileRow(deletedId, path))!;
+    const failingBucket = new Proxy(bundles, { get(target, prop) {
+      if (prop === "delete") return async () => { throw new Error("temporary R2 failure"); };
+      return Reflect.get(target, prop);
+    } });
+    const failingRepo = new SkillsRepo(db, failingBucket);
+    expect(await failingRepo.deleteFile(principalFixture({ userId: OWNER }), (await repo.getById(deletedId))!, path)).toBe(true);
+    expect(await repo.getFileRow(deletedId, path)).toBeNull();
+    expect(await bundles.get(deleted.r2_key)).not.toBeNull();
+
+    await repo.sweepBundleFiles();
+    expect(await bundles.get(legacyKey)).not.toBeNull();
+    expect(await repo.sweepBundleFiles(Date.now() + 25 * 60 * 60_000)).toBeGreaterThan(0);
+
+    expect(await bundles.get(legacyKey)).toBeNull();
+    expect(await bundles.get(deleted.r2_key)).toBeNull();
+    expect(await bundles.get(retained!.r2_key)).not.toBeNull();
+    expect(await bundles.get(foreignKey)).not.toBeNull();
   });
 });
 

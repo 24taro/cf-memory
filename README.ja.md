@@ -8,9 +8,11 @@ Claude Code や Codex は、昨日決めたことを覚えていません。cf-m
 
 cf-memory は独立したプロジェクトです。Cloudflare 上で動きますが、Cloudflare, Inc. とは提携しておらず、承認も受けていません。
 
+初回リリースのサポート対象は、固定 API トークンを使う単一オーナー構成です。[チームモード](docs/TEAM-MODE.md) は実験的な機能です。
+
 ## 導入
 
-必要なもの: Workers Paid プランの Cloudflare アカウント、Node.js 22 以上、Claude Code か Codex。
+R2 を有効にした Workers Paid プランの Cloudflare アカウント、Git、Bash、Node.js 22.12 以降の 22.x または 24 以上と npm、OpenSSL、curl が必要です。エージェントを接続する場合は Claude Code か Codex を用意します。Worker だけをデプロイする場合は `./install.sh --no-client` を使います。
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git
@@ -27,13 +29,15 @@ cd cf-memory
 - サーバーの応答確認
 - Claude Code と Codex への接続(入っている場合)
 
-終わったらエージェントを再起動してください。状態は次のコマンドで確認できます。
+Codex を使う場合は、インストーラーが表示する `export` 2 行をシェルの設定ファイルに追加し、反映してから Codex を起動してください。`/hooks` で cf-memory のフック4件を承認します。更新後に再承認を求められた場合も、同じ画面で確認して承認してください。
+
+動作を確認するには、テスト用の情報を伝え、最終回答で復唱させます。同じ Git リポジトリで新しいセッションを開き、その情報を尋ねてください。接続とフックの状態は次のコマンドで確認できます。
 
 ```bash
 node cf-memory-agent/scripts/agent.mjs doctor
 ```
 
-更新するときも `./install.sh` をもう一度実行します。データとトークンは残ります。
+更新するときは同じチェックアウトで最新の変更を取り込み、`./install.sh` をもう一度実行します。同じ Cloudflare アカウントを使い、`.cf-memory.secrets` を残しておくと、既存のデータベース、バケット、トークンを再利用します。
 
 ## 仕組み
 
@@ -53,10 +57,35 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 Workers Paid プランを前提にしています。Free プランは D1 の読み取りが 1 日 500 万行までで、作者自身の利用では多い日に約 800 万行を読みました。Free プランでは翌日まで応答が止まることがあります。
 
+## アンインストール
+
+導入したクライアントのコマンドを実行して、エージェントの接続を解除します。
+
+```bash
+node cf-memory-agent/scripts/agent.mjs uninstall --client claude-code
+claude mcp remove cf-memory --scope user
+
+node cf-memory-agent/scripts/agent.mjs uninstall --client codex
+codex mcp remove cf-memory
+```
+
+Codex の場合は、シェルの設定ファイルから `CF_MEMORY_MCP_URL` と `CF_MEMORY_ACCESS_TOKEN` の `export` 行も削除し、新しいシェルを開いてください。ローカルの送信待ちログと診断データは `~/.cf-memory/v3` に残ります。
+
+Cloudflare 上のインスタンスとデータを完全に削除する場合は、導入先のアカウントを選び、次のコマンドを実行してください。
+
+```bash
+npx wrangler delete
+npx wrangler d1 delete cf-memory
+npx wrangler d1 delete cf-memory-logs
+npx wrangler r2 bucket delete cf-memory-bundles
+```
+
+R2 バケットにオブジェクトがある場合は、先に空にしてください。Cloudflare Access や独自ドメインを設定した場合は、Cloudflare 側の関連設定も削除してください。API トークンが不要になったら、チェックアウトの `.cf-memory.secrets` を削除します。
+
 ## そのほか
 
 - [Web 画面(Cloudflare Access)](docs/WEB-ACCESS.md)
-- [チームで使う](docs/TEAM-MODE.md)
+- [チームで使う（実験的機能）](docs/TEAM-MODE.md)
 - [エージェントプラグイン](cf-memory-agent/README.md)
 - [セキュリティ](SECURITY.md)
 

@@ -24,8 +24,9 @@ fail() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
 for tool in node npm openssl curl; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but was not found"
 done
-NODE_MAJOR=$(node -p 'process.versions.node.split(".")[0]')
-[ "$NODE_MAJOR" -ge 22 ] || fail "Node.js 22 or newer is required (found $(node -v))"
+if ! node -e 'const [major, minor] = process.versions.node.split(".").map(Number); process.exit(major >= 24 || (major === 22 && minor >= 12) ? 0 : 1)'; then
+  fail "Node.js 22.12+ on the 22.x line, or Node.js 24+, is required (found $(node -v))"
+fi
 
 say "Installing dependencies"
 npm ci --no-audit --no-fund
@@ -49,6 +50,7 @@ if [ ! -s "$SECRETS_FILE" ]; then
 fi
 chmod 600 "$SECRETS_FILE"
 TOKEN=$(sed -n 's/^API_TOKEN=//p' "$SECRETS_FILE" | head -n 1)
+export -n TOKEN
 [ "${#TOKEN}" -ge 32 ] || fail "$SECRETS_FILE holds no API_TOKEN of 32 or more characters; delete it and run again"
 
 say "Deploying the Worker (creates the D1 databases and the R2 bucket on first run)"
@@ -69,7 +71,7 @@ CI=true wrangler d1 migrations apply LOGS --remote
 say "Checking $URL"
 OK=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if curl -fsS -m 15 -H "Authorization: Bearer $TOKEN" "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
+  if printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -fsS -m 15 -H @- "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
   sleep 3
 done
 [ "$OK" = 1 ] || fail "the Worker is deployed at $URL but did not accept the token. Run this script again in a minute"
@@ -79,7 +81,14 @@ CONNECTED=""
 if [ "$CLIENTS" = 1 ] && command -v claude >/dev/null 2>&1; then
   say "Connecting Claude Code"
   claude mcp remove cf-memory --scope user >/dev/null 2>&1 || true
-  claude mcp add --scope user --transport http cf-memory "$URL/mcp" --header "Authorization: Bearer $TOKEN"
+  # add-json accepts stdin, so the credential never appears in a process argument.
+  printf '%s' "$TOKEN" |
+    node -e '
+      const token = require("node:fs").readFileSync(0, "utf8");
+      const config = { type: "http", url: process.argv[1], headers: { Authorization: `Bearer ${token}` } };
+      process.stdout.write(JSON.stringify(config));
+    ' "$URL/mcp" |
+    claude mcp add-json --scope user cf-memory -
   node cf-memory-agent/scripts/agent.mjs install --client claude-code >/dev/null
   CONNECTED="$CONNECTED claude-code"
 fi
@@ -111,13 +120,14 @@ if [ -n "$CONNECTED" ]; then
   echo "related notes and conversations at the start of every prompt."
 fi
 if [ "$CODEX" = 1 ]; then
+  printf -v QUOTED_SECRETS_FILE '%q' "$PWD/$SECRETS_FILE"
   cat <<DONE
 
 Codex reads the token from the environment. Add these two lines to your shell
 profile, then approve the new hooks once in Codex with /hooks:
 
   export CF_MEMORY_MCP_URL="$URL/mcp"
-  export CF_MEMORY_ACCESS_TOKEN="\$(sed -n 's/^API_TOKEN=//p' "$(pwd)/$SECRETS_FILE")"
+  export CF_MEMORY_ACCESS_TOKEN="\$(sed -n 's/^API_TOKEN=//p' $QUOTED_SECRETS_FILE)"
 DONE
 fi
 echo

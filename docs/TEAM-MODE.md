@@ -1,4 +1,8 @@
-# Team mode
+# Experimental team mode
+
+The initial release supports the single-owner configuration. Team mode is
+experimental. Review the [known security limitations](../SECURITY.md#trust-model)
+before using it.
 
 Single-owner mode needs none of this. Use team mode when several people share
 one instance and each needs their own account and scopes.

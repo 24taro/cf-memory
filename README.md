@@ -14,10 +14,15 @@ back in front of the agent.
 cf-memory is an independent project. It runs on Cloudflare and is not affiliated
 with or endorsed by Cloudflare, Inc.
 
+The initial release supports one owner per instance using a fixed API token.
+[Team mode](docs/TEAM-MODE.md) is experimental.
+
 ## Install
 
-You need a Cloudflare account on the Workers Paid plan, Node.js 22 or newer,
-and Claude Code or Codex.
+You need a Cloudflare account on the Workers Paid plan with R2 enabled, Git,
+Bash, Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. Install Claude Code or
+Codex to connect an agent. Run `./install.sh --no-client` to deploy the Worker
+on its own.
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git
@@ -27,16 +32,24 @@ cd cf-memory
 
 The script logs you in to Cloudflare, creates two D1 databases and an R2 bucket,
 deploys the Worker, generates your API token, checks that the server answers,
-and connects Claude Code and Codex if they are installed. Restart your agent
-when it finishes.
+and connects Claude Code and Codex if they are installed.
 
-Then ask your agent something you discussed in an earlier session, or run:
+If you use Codex, add the two export lines printed by the installer to your
+shell profile and load it before launching Codex. Open `/hooks` and approve
+the four cf-memory hooks. If Codex asks again after an update, review and
+approve the new hooks there.
+
+To verify recording and recall, tell your agent a test fact and ask it to
+repeat the fact in its final reply. Start a new session in the same Git
+repository and ask for that fact. To check the connection and hook status, run:
 
 ```bash
 node cf-memory-agent/scripts/agent.mjs doctor
 ```
 
-Run `./install.sh` again at any time to update. It keeps your data and token.
+To update, pull the latest changes in the same checkout and run `./install.sh`
+again. Use the same Cloudflare account and keep `.cf-memory.secrets` to reuse
+the API token. The databases and bucket are reused.
 
 ## How it works
 
@@ -81,19 +94,38 @@ million, so on the Free plan it can stop answering until the next day.
 
 ## Uninstall
 
+To disconnect your agent, run the commands for the client you installed:
+
 ```bash
-node cf-memory-agent/scripts/agent.mjs uninstall
+node cf-memory-agent/scripts/agent.mjs uninstall --client claude-code
 claude mcp remove cf-memory --scope user
+
+node cf-memory-agent/scripts/agent.mjs uninstall --client codex
+codex mcp remove cf-memory
+```
+
+For Codex, also remove the `CF_MEMORY_MCP_URL` and `CF_MEMORY_ACCESS_TOKEN`
+export lines from your shell profile and open a new shell. The uninstaller
+keeps the local spool and diagnostics in `~/.cf-memory/v3`.
+
+To permanently remove the hosted instance and its data, select its Cloudflare
+account and run:
+
+```bash
 npx wrangler delete
 npx wrangler d1 delete cf-memory
 npx wrangler d1 delete cf-memory-logs
 npx wrangler r2 bucket delete cf-memory-bundles
 ```
 
+Empty the R2 bucket first if it contains objects. If you set up Cloudflare
+Access or a custom domain, remove the associated settings in Cloudflare. Once
+you no longer need the API token, delete `.cf-memory.secrets` from the checkout.
+
 ## More
 
 - [Web pages behind Cloudflare Access](docs/WEB-ACCESS.md): read and edit your notes in a browser.
-- [Team mode](docs/TEAM-MODE.md): several people on one instance, with an OAuth authorization server.
+- [Experimental team mode](docs/TEAM-MODE.md): several people on one instance, with an OAuth authorization server.
 - [The agent plugin](cf-memory-agent/README.md): what each hook does, the local spool, settings.
 - [Security](SECURITY.md): the trust model and how to report a problem.
 
