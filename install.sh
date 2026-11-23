@@ -93,28 +93,49 @@ done
 echo "The server accepts your token."
 
 CONNECTED=""
+CLIENT_FAILED=0
+client_error() {
+  printf 'error: %s\n' "$*" >&2
+  CLIENT_FAILED=1
+}
 if [ "$CLAUDE" = 1 ]; then
   say "Connecting Claude Code"
   claude mcp remove cf-memory --scope user >/dev/null 2>&1 || true
   # add-json accepts stdin, so the credential never appears in a process argument.
-  printf '%s' "$TOKEN" |
+  if printf '%s' "$TOKEN" |
     node -e '
       const token = require("node:fs").readFileSync(0, "utf8");
       const config = { type: "http", url: process.argv[1], headers: { Authorization: "Bearer " + token } };
       process.stdout.write(JSON.stringify(config));
     ' "$URL/mcp" |
-    claude mcp add-json --scope user cf-memory -
-  node cf-memory-agent/scripts/agent.mjs install --client claude-code >/dev/null
-  CONNECTED="$CONNECTED claude-code"
+    claude mcp add-json --scope user cf-memory -; then
+    echo "Claude Code MCP server registered."
+    if node cf-memory-agent/scripts/agent.mjs install --client claude-code >/dev/null; then
+      echo "Claude Code hooks installed."
+      CONNECTED="$CONNECTED claude-code"
+    else
+      client_error "Claude Code hook setup failed. Run 'node cf-memory-agent/scripts/agent.mjs install --client claude-code' for the plugin report."
+    fi
+  else
+    client_error "Claude Code MCP registration failed."
+  fi
 fi
 CODEX=0
 if [ "$CLIENTS" = 1 ] && command -v codex >/dev/null 2>&1; then
   say "Connecting Codex"
   codex mcp remove cf-memory >/dev/null 2>&1 || true
-  codex mcp add cf-memory --url "$URL/mcp" --bearer-token-env-var CF_MEMORY_ACCESS_TOKEN
-  node cf-memory-agent/scripts/agent.mjs install --client codex >/dev/null
-  CONNECTED="$CONNECTED codex"
-  CODEX=1
+  if codex mcp add cf-memory --url "$URL/mcp" --bearer-token-env-var CF_MEMORY_ACCESS_TOKEN; then
+    echo "Codex MCP server registered."
+    CODEX=1
+    if node cf-memory-agent/scripts/agent.mjs install --client codex >/dev/null; then
+      echo "Codex hooks installed."
+      CONNECTED="$CONNECTED codex"
+    else
+      client_error "Codex hook setup failed. Run 'node cf-memory-agent/scripts/agent.mjs install --client codex' for the hook report."
+    fi
+  else
+    client_error "Codex MCP registration failed."
+  fi
 fi
 
 cat <<DONE
@@ -127,7 +148,7 @@ cf-memory is running.
   Connected  ${CONNECTED:- none}
 
 DONE
-if [ -z "$CONNECTED" ] && [ "$CLIENTS" = 1 ]; then
+if [ -z "$CONNECTED" ] && [ "$CLIENTS" = 1 ] && [ "$CLIENT_FAILED" = 0 ]; then
   echo "Neither Claude Code nor Codex was found. Install one and run this script again."
 fi
 if [ -n "$CONNECTED" ]; then
@@ -139,7 +160,7 @@ if [ "$CODEX" = 1 ]; then
   cat <<DONE
 
 Codex reads the token from the environment. Add these two lines to your shell
-profile, then approve the new hooks once in Codex with /hooks:
+profile. After installing the hooks, approve them once in Codex with /hooks:
 
   export CF_MEMORY_MCP_URL="$URL/mcp"
   export CF_MEMORY_ACCESS_TOKEN="\$(sed -n 's/^API_TOKEN=//p' $QUOTED_SECRETS_FILE)"
@@ -147,3 +168,4 @@ DONE
 fi
 echo
 echo "Check any time:  node cf-memory-agent/scripts/agent.mjs doctor"
+exit "$CLIENT_FAILED"

@@ -224,6 +224,47 @@ if [ "$2" = "update" ]; then mkdir -p "$CLAUDE_CONFIG_DIR/plugins"; printf '{"ve
   } finally { dir.cleanup(); }
 });
 
+test('Claude Code install fails if every plugin command fails, even with an old matching registry entry', async () => {
+  const dir = tempDir();
+  try {
+    const home = join(dir.path, 'home'), plugins = join(home, '.claude', 'plugins');
+    mkdirSync(plugins, { recursive: true });
+    const env = testEnv(dir.path, null, { CF_MEMORY_CLAUDE_BIN: '/usr/bin/false' });
+    for (const records of [[], [{ scope: 'user', version: PLUGIN_VERSION }]]) {
+      writeFileSync(join(plugins, 'installed_plugins.json'), JSON.stringify({ plugins: { 'cf-memory-agent@cf-memory': records } }));
+      const result = await run(agent, ['install', '--client', 'claude-code', '--home', home], env);
+      assert.equal(result.code, 1);
+      assert.match(result.stderr, /Could not install cf-memory-agent/);
+      const report = JSON.parse(result.stdout).clients['claude-code'];
+      assert.equal(report.verified, false);
+      assert.ok(report.results.every(item => !item.ok));
+    }
+  } finally { dir.cleanup(); }
+});
+
+test('Claude Code uninstall distinguishes a remaining plugin, an unreadable registry and an already absent plugin', async () => {
+  const dir = tempDir();
+  try {
+    const home = join(dir.path, 'home'), plugins = join(home, '.claude', 'plugins');
+    mkdirSync(plugins, { recursive: true });
+    const file = join(plugins, 'installed_plugins.json');
+    const env = testEnv(dir.path, null, { CF_MEMORY_CLAUDE_BIN: '/usr/bin/false' });
+    const cases = [
+      [JSON.stringify({ plugins: { 'cf-memory-agent@cf-memory': [{ scope: 'user', version: PLUGIN_VERSION }] } }), 1, /still installed/],
+      ['{', 1, /Could not verify/],
+      [JSON.stringify({ plugins: { 'cf-memory-agent@cf-memory': [{ scope: 'project', version: PLUGIN_VERSION }] } }), 0, /^$/],
+    ];
+    for (const [contents, status, message] of cases) {
+      writeFileSync(file, contents);
+      const result = await run(agent, ['uninstall', '--client', 'claude-code', '--home', home], env);
+      assert.equal(result.code, status);
+      assert.match(result.stderr.trim(), message);
+      assert.equal(JSON.parse(result.stdout).clients['claude-code'].verified, status === 0);
+      assert.equal(readFileSync(file, 'utf8'), contents);
+    }
+  } finally { dir.cleanup(); }
+});
+
 // ---- Round 2: uninstall, pruning, the legacy recall hook, old variables ----
 
 function fakeClaude(dir, log) {

@@ -35,6 +35,9 @@ cd cf-memory
 The script logs you in to Cloudflare, creates two D1 databases and an R2 bucket,
 deploys the Worker, generates your API token, checks that the server answers,
 and connects Claude Code and Codex if they are installed.
+It reports MCP registration and hook installation separately. If either step
+fails for one client, setup still runs for the other client and the script exits
+with an error.
 
 If you use Codex, add the two export lines printed by the installer to your
 shell profile and load it before launching Codex. Open `/hooks` and approve
@@ -81,12 +84,36 @@ It works for Japanese and English.
 
 ## Where your data lives
 
-Everything is stored in D1 and R2 in your own Cloudflare account. The only
-network destination is your Worker. The API token is in `.cf-memory.secrets` in
-this checkout (mode 0600, ignored by git) and in your agent's MCP configuration.
+The hooks send conversation data to your Worker. Your Cloudflare account stores
+it in D1, and skill attachments live in R2. The browser UI loads Google Fonts
+and may request external images embedded in notes. The installer stores the API
+token in `.cf-memory.secrets` in this checkout (mode 0600, ignored by Git).
 
-Prompts and final replies are kept until you delete them. Tool-action lines and
-error heads are deleted after 90 days (`LOG_ACTION_RETENTION_DAYS`).
+### Delete conversation logs
+
+Prompts and final replies have no automatic expiry. Daily maintenance removes
+tool-action lines and error excerpts older than `LOG_ACTION_RETENTION_DAYS`
+(90 days by default). Individual log entries are managed in D1.
+
+1. Close the connected clients while you clean up. Review their local queue at
+   `~/.cf-memory/v3/spool/` (or `$CF_MEMORY_AGENT_HOME/spool/`). If you want to
+   discard every queued, held, and rejected entry for both clients in that
+   profile, delete the `spool` directory before restarting either client.
+   Entries still queued locally can be uploaded again. Set
+   `CF_MEMORY_LOG_ENABLED=false` to turn off recording and sending.
+2. Find the entry ID with `log_search`. In Cloudflare, open the D1 console of
+   the database bound as `LOGS` (`cf-memory-logs` by default). Run the `SELECT`
+   first, then replace `123` with the row ID you verified. The database trigger
+   removes the deleted row from the search index.
+
+   ```sql
+   SELECT rowid, user_id, client, kind FROM log_entries WHERE id = '<entry-id>';
+   DELETE FROM log_entries WHERE rowid = 123 AND id = '<entry-id>';
+   ```
+
+   This removes the entry from the active database. Copies may still exist in
+   [D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/),
+   backups, or notes you saved separately.
 
 ## Cost
 
@@ -133,11 +160,33 @@ you no longer need the API token, delete `.cf-memory.secrets` from the checkout.
 
 ## Develop
 
+Initialize both local D1 databases and create a development-only token before
+starting Wrangler:
+
 ```bash
 npm ci
+npm run db:apply:local
+npm run db:logs:apply:local
+if [ ! -e .dev.vars ]; then
+  (umask 077; printf 'API_TOKEN=%s\n' "$(openssl rand -hex 32)" > .dev.vars)
+fi
+npm run dev
+```
+
+In another terminal, register the local instance with the optional CLI. The
+token is read from standard input and saved in the owner-only CLI config:
+
+```bash
+sed -n 's/^API_TOKEN=//p' .dev.vars |
+  npm run --silent cli -- login --url http://localhost:8787 --key-stdin
+npm run --silent cli -- whoami
+```
+
+Run the checks with:
+
+```bash
 npm run typecheck
 npm test -- --maxWorkers=1
-npm run dev
 ```
 
 ## License

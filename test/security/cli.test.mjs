@@ -32,10 +32,11 @@ function cliEnv(s, extra = {}) {
 }
 
 // async spawn (the stub server lives in this process, so we must not block the loop)
-function runCli(args, { env, cwd, umask }) {
+function runCli(args, { env, cwd, umask, stdin }) {
   return new Promise((done) => {
     const quoted = [process.execPath, "--experimental-strip-types", "--no-warnings", CLI, ...args].map((a) => `'${a.replace(/'/g, `'\\''`)}'`).join(" ");
-    const child = spawn("/bin/sh", ["-c", `umask ${umask ?? "022"}; exec ${quoted}`], { env, cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn("/bin/sh", ["-c", `umask ${umask ?? "022"}; exec ${quoted}`], { env, cwd, stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    if (stdin !== undefined) child.stdin.end(stdin);
     let stdout = "", stderr = "";
     child.stdout.on("data", (c) => (stdout += c));
     child.stderr.on("data", (c) => (stderr += c));
@@ -96,7 +97,7 @@ async function pullThenPush(name, notes) {
 }
 
 describe("cli-config-key-file-default-mode", () => {
-  const login = (s, umask) => runCli(["login", "--url", "http://127.0.0.1:9", "--key", DUMMY_KEY, "--handle", "dummy"], { env: cliEnv(s), cwd: s.work, umask });
+  const login = (s, umask) => runCli(["login", "--url", "http://127.0.0.1:9", "--key-stdin", "--handle", "dummy"], { env: cliEnv(s), cwd: s.work, umask, stdin: `${DUMMY_KEY}\n` });
   const dirOf = (s) => join(s.home, ".cf-memory");
   const fileOf = (s) => join(s.home, ".cf-memory", "config.json");
 
@@ -218,14 +219,35 @@ describe("cli-config-key-file-default-mode", () => {
   it("the saved config is still read back: a later command sends the saved key to the saved URL", async () => {
     const s = scratch("mode-readback"), srv = await stub();
     try {
-      const saved = await runCli(["login", "--url", srv.url, "--key", DUMMY_KEY, "--handle", "alice"], { env: cliEnv(s), cwd: s.work });
+      const saved = await runCli(["login", "--url", srv.url, "--key-stdin", "--handle", "alice"], { env: cliEnv(s), cwd: s.work, stdin: `${DUMMY_KEY}\r\n` });
       expect(saved.code).toBe(0);
+      expect(saved.stdout + saved.stderr).not.toContain(DUMMY_KEY);
       const who = await runCli(["whoami"], { env: cliEnv(s), cwd: s.work });
       expect(who.code).toBe(0);
       expect(who.stdout).toContain("@alice");
       expect(srv.requests.every((r) => r.auth === `Bearer ${DUMMY_KEY}`)).toBe(true);
       expect(srv.requests).toHaveLength(2);
     } finally { await srv.close(); }
+  });
+
+  it("rejects a token in argv without echoing it or writing a config", async () => {
+    const s = scratch("mode-reject-argv");
+    for (const args of [["--key", DUMMY_KEY], [`--key=${DUMMY_KEY}`], ["--key-stdin", DUMMY_KEY], [`--key-stdin=${DUMMY_KEY}`]]) {
+      const result = await runCli(["login", ...args], { env: cliEnv(s), cwd: s.work });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("--key-stdin");
+      expect(result.stdout + result.stderr).not.toContain(DUMMY_KEY);
+      expect(existsSync(fileOf(s))).toBe(false);
+    }
+  });
+
+  it.each(["", "first\nsecond\n"])("leaves existing config alone when stdin is not one token (%j)", async stdin => {
+    const s = scratch(`mode-reject-stdin-${stdin.length}`);
+    expect((await login(s, "022")).code).toBe(0);
+    const before = readFileSync(fileOf(s), "utf8");
+    const result = await runCli(["login", "--key-stdin", "--url", "http://127.0.0.1:8"], { env: cliEnv(s), cwd: s.work, stdin });
+    expect(result.code).toBe(1);
+    expect(readFileSync(fileOf(s), "utf8")).toBe(before);
   });
 });
 

@@ -164,7 +164,7 @@ async function api(cfg: Config, method: string, path: string, body?: unknown): P
   if (!res.ok) {
     const hint =
       res.status === 401
-        ? " — no valid write key; run `login --key <key>`, mint a key, or self-host to write (the hosted instance is read-only for non-owners)."
+        ? " — no valid API token. Pass your instance's token on standard input to `login --key-stdin`."
         : res.status === 403
           ? " — your key lacks a scope this command needs (the error above names it: notes:write to write; commands that look a note up first, such as `note rm`, also need notes:read); use a key with that scope or self-host."
           : "";
@@ -289,8 +289,20 @@ async function main() {
 
   switch (key) {
     case "login": {
+      if (Object.hasOwn(flags, "key") || argv.some(arg => arg.startsWith("--key="))) {
+        throw new Error("pass the API token on standard input with `login --key-stdin`");
+      }
+      const keyInput = argv.indexOf("--key-stdin");
+      if (argv.some(arg => arg.startsWith("--key-stdin=")) ||
+          (keyInput >= 0 && argv[keyInput + 1] && !argv[keyInput + 1].startsWith("--"))) {
+        throw new Error("--key-stdin takes no argument");
+      }
+      if (keyInput >= 0) {
+        const key = (await readStdin()).trim();
+        if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new Error("--key-stdin requires a single API token on standard input");
+        cfg.key = key;
+      }
       if (flags.url) cfg.url = flags.url;
-      if (flags.key) cfg.key = flags.key;
       if (flags.handle) cfg.handle = flags.handle;
       saveConfig(cfg);
       console.log(`Saved ${CONFIG_PATH} → ${cfg.url} (@${cfg.handle})`);
@@ -524,13 +536,13 @@ async function main() {
     default:
       console.log(`cf-memory — one substrate, two doors  (run: node --experimental-strip-types cli/cf-memory.ts <cmd>)
 usage:
-  cf-memory login --url <u> --key <k> --handle <h>
+  cf-memory login [--url <u>] [--key-stdin] [--handle <h>]  (token from stdin)
   cf-memory whoami                         show identity + scopes + token status
   cf-memory note new <slug> [--title t] [--tags a,b] [--scope s|--global]   (body from stdin)
   cf-memory note get <slug>
   cf-memory note rm <slug>
   cf-memory note ls [--tag t] [--limit n]
-  cf-memory search <query> [--semantic|--keyword] [--scope notes|skills|all] [--context c|--global]
+  cf-memory search <query> [--scope notes|skills|all] [--context c|--global]
   cf-memory recall <query> [--budget n] [--context c|--global]
   cf-memory links <slug>
   cf-memory mem ls | mem set <label> <value> | mem append <label> <value> | mem replace <label> <find> <replace>

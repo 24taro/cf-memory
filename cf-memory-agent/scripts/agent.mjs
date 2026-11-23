@@ -111,10 +111,15 @@ async function main() {
       const report = await doctor({ refresh: argv.includes('--refresh'), versions: !argv.includes('--no-versions') });
       console.log(JSON.stringify(report, null, 2));
       process.exitCode = report.ok ? 0 : 1;
-    } else if (command === 'install') {
-      console.log(JSON.stringify(await install(parseInstallArgs(argv)), null, 2));
-    } else if (command === 'uninstall') {
-      console.log(JSON.stringify(await uninstall(parseInstallArgs(argv)), null, 2));
+    } else if (command === 'install' || command === 'uninstall') {
+      const operation = command === 'install' ? install : uninstall;
+      const report = await operation(parseInstallArgs(argv));
+      console.log(JSON.stringify(report, null, 2));
+      const claude = report.clients['claude-code'];
+      if (claude?.verified === false) {
+        console.error(claude.next);
+        process.exitCode = 1;
+      }
     } else if (command === 'flush') {
       console.log(JSON.stringify(await flushCommand(argv, process.env), null, 2));
     } else if (command === 'replay-rejected') {

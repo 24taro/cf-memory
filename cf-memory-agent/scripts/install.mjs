@@ -143,12 +143,26 @@ export async function claudePlan(paths, { root = PACKAGE_ROOT, executable } = {}
   };
 }
 
-export async function claudeInstalledVersion(claudeDir) {
+async function claudePluginRecords(claudeDir) {
   try {
     const installed = JSON.parse(await readFile(join(claudeDir, 'plugins', 'installed_plugins.json'), 'utf8'));
-    const records = (installed.plugins || installed)[PLUGIN + '@' + MARKETPLACE];
-    return Array.isArray(records) ? records.find(record => record.scope === 'user')?.version ?? records[0]?.version ?? null : null;
-  } catch { return null; }
+    const plugins = Object.hasOwn(installed, 'plugins') ? installed.plugins : installed;
+    if (!plugins || typeof plugins !== 'object' || Array.isArray(plugins)) return null;
+    const name = PLUGIN + '@' + MARKETPLACE;
+    const records = Object.hasOwn(plugins, name) ? plugins[name] : [];
+    return Array.isArray(records) && records.every(record => record && typeof record === 'object') ? records : null;
+  } catch (error) { return error.code === 'ENOENT' ? [] : null; }
+}
+
+export async function claudeInstalledVersion(claudeDir) {
+  const records = await claudePluginRecords(claudeDir);
+  return records?.find(record => record.scope === 'user')?.version ?? records?.[0]?.version ?? null;
+}
+
+async function claudeUserPlugin(claudeDir) {
+  const records = await claudePluginRecords(claudeDir);
+  if (!records?.every(record => typeof record.scope === 'string')) return undefined;
+  return records.find(record => record.scope === 'user') ?? null;
 }
 
 async function installClaude(paths, options) {
@@ -164,12 +178,17 @@ async function installClaude(paths, options) {
       results.push({ args: command.args, ok: false, status: error.status ?? null });
     }
   }
-  const installed = await claudeInstalledVersion(paths.claudeDir);
+  const plugin = await claudeUserPlugin(paths.claudeDir);
+  const installed = plugin?.version ?? null;
+  const registered = installed === PLUGIN_VERSION && results.some(result => result.ok && result.args[1] !== 'marketplace');
   // Only once the plugin (which recalls) is in place does the old hook go.
-  const legacy = installed === PLUGIN_VERSION ? await cleanLegacyRecall(paths, { write: true, now }) : undefined;
+  const legacy = registered ? await cleanLegacyRecall(paths, { write: true, now }) : undefined;
+  const next = plugin === undefined ? 'Could not verify the Claude Code plugin registry.' : !registered
+    ? 'Could not install cf-memory-agent@cf-memory ' + PLUGIN_VERSION + ' in the Claude Code user scope. Check the plugin command results.'
+    : legacy?.error;
   return {
-    ...plan, dry_run: false, results, installed_version: installed, verified: installed === PLUGIN_VERSION, ...(legacy ? { legacy } : {}),
-    ...(installed === PLUGIN_VERSION ? {} : { next: 'Claude Code does not report cf-memory-agent@cf-memory ' + PLUGIN_VERSION + '. If the "cf-memory" marketplace points at another directory, run: claude plugin marketplace remove cf-memory, then install again.' }),
+    ...plan, dry_run: false, results, installed_version: installed, verified: !next, ...(legacy ? { legacy } : {}),
+    ...(next ? { next } : {}),
   };
 }
 
@@ -282,13 +301,17 @@ async function installCodex(paths, options) {
 async function uninstallClaude(paths, options) {
   const cli = options.executable || process.env.CF_MEMORY_CLAUDE_BIN || 'claude', now = options.now ?? Date.now();
   const command = { executable: cli, args: ['plugin', 'uninstall', PLUGIN + '@' + MARKETPLACE, '--scope', 'user'] };
-  const report = { client: 'claude-code', commands: [command], legacy: await cleanLegacyRecall(paths, { write: !options.dryRun, now }), dry_run: Boolean(options.dryRun) };
-  if (options.dryRun) return report;
+  const report = { client: 'claude-code', commands: [command], dry_run: Boolean(options.dryRun) };
+  if (options.dryRun) return { ...report, legacy: await cleanLegacyRecall(paths, { write: false, now }) };
   const env = { ...process.env, ...(options.home ? { HOME: paths.home, CLAUDE_CONFIG_DIR: paths.claudeDir } : {}) };
   try { execFileSync(cli, command.args, { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, encoding: 'utf8' }); report.results = [{ args: command.args, ok: true }]; }
   catch (error) { report.results = [{ args: command.args, ok: false, status: error.status ?? null }]; }
-  report.installed_version = await claudeInstalledVersion(paths.claudeDir);
-  return report;
+  const plugin = await claudeUserPlugin(paths.claudeDir);
+  const legacy = plugin === null ? await cleanLegacyRecall(paths, { write: true, now }) : undefined;
+  const next = plugin === undefined ? 'Could not verify the Claude Code plugin registry.' : plugin
+    ? 'cf-memory-agent@cf-memory is still installed in the Claude Code user scope. Check the plugin command result.'
+    : legacy?.error;
+  return { ...report, installed_version: plugin?.version ?? null, verified: !next, ...(legacy ? { legacy } : {}), ...(next ? { next } : {}) };
 }
 
 async function uninstallCodex(paths, options) {

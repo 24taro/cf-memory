@@ -29,6 +29,8 @@ cd cf-memory
 - サーバーの応答確認
 - Claude Code と Codex への接続(入っている場合)
 
+インストーラーは MCP 登録とフック導入の結果を個別に表示します。一方のクライアントで失敗しても、もう一方の設定を続けてからエラーで終了します。
+
 Codex を使う場合は、インストーラーが表示する `export` 2 行をシェルの設定ファイルに追加し、反映してから Codex を起動してください。`/hooks` で cf-memory のフック4件を承認します。更新後に再承認を求められた場合も、同じ画面で確認して承認してください。
 
 動作を確認するには、テスト用の情報を伝え、最終回答で復唱させます。同じ Git リポジトリで新しいセッションを開き、その情報を尋ねてください。接続とフックの状態は次のコマンドで確認できます。
@@ -49,9 +51,21 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 ## データの置き場所
 
-すべて自分の Cloudflare アカウントの D1 と R2 に入ります。通信先は自分の Worker だけです。API トークンはこのチェックアウトの `.cf-memory.secrets`(権限 0600、git の対象外)と、エージェントの MCP 設定にあります。
+フックは会話データを自分の Worker に送信します。会話データは自分の Cloudflare アカウントの D1 に、スキルの添付ファイルは R2 に保存されます。Web 画面は Google Fonts を読み込み、ノート内に外部画像があればその配信元にも接続します。インストーラーは API トークンをこのチェックアウトの `.cf-memory.secrets`（権限 `0600`、Git の対象外）に保存します。
 
-発言と最終回答は消すまで残ります。ツール操作の行とエラーの先頭は 90 日で消えます(`LOG_ACTION_RETENTION_DAYS`)。
+### 会話ログを削除する
+
+発言と最終回答に自動削除期限はありません。日次処理は `LOG_ACTION_RETENTION_DAYS`（既定は90日）より古いツール操作とエラーの抜粋を削除します。個別の会話ログは D1 で管理します。
+
+1. 作業中は接続済みのクライアントを終了し、ローカルキューの `~/.cf-memory/v3/spool/`（または `$CF_MEMORY_AGENT_HOME/spool/`）を確認します。このプロファイルの両クライアントについて、送信待ち・保留・拒否済みのログをすべて破棄する場合は、再起動前に `spool` ディレクトリを削除してください。送信待ちのログが残っていると、再びアップロードされることがあります。新規記録と送信を止めるには `CF_MEMORY_LOG_ENABLED=false` を設定します。
+2. `log_search` で対象のエントリIDを確認します。Cloudflare で `LOGS` バインディングの D1 データベース（既定は `cf-memory-logs`）のコンソールを開き、先に `SELECT` を実行します。`123` を確認した行IDに置き換えてから `DELETE` を実行してください。検索インデックスからも該当行が削除されます。
+
+   ```sql
+   SELECT rowid, user_id, client, kind FROM log_entries WHERE id = '<entry-id>';
+   DELETE FROM log_entries WHERE rowid = 123 AND id = '<entry-id>';
+   ```
+
+   この操作の対象は稼働中のデータベースです。[D1 Time Travel](https://developers.cloudflare.com/d1/reference/time-travel/)、バックアップ、別途保存したノートにはコピーが残る場合があります。
 
 ## 費用
 
@@ -88,6 +102,28 @@ R2 バケットにオブジェクトがある場合は、先に空にしてく�
 - [チームで使う（実験的機能）](docs/TEAM-MODE.md)
 - [エージェントプラグイン](cf-memory-agent/README.md)
 - [セキュリティ](SECURITY.md)
+
+## ローカル開発
+
+2つのローカル D1 にマイグレーションを適用し、開発専用トークンを作成してから Wrangler を起動します。
+
+```bash
+npm ci
+npm run db:apply:local
+npm run db:logs:apply:local
+if [ ! -e .dev.vars ]; then
+  (umask 077; printf 'API_TOKEN=%s\n' "$(openssl rand -hex 32)" > .dev.vars)
+fi
+npm run dev
+```
+
+別のターミナルから操作CLIを使う場合は、標準入力でトークンを渡します。トークンは所有者だけが読めるCLI設定に保存されます。
+
+```bash
+sed -n 's/^API_TOKEN=//p' .dev.vars |
+  npm run --silent cli -- login --url http://localhost:8787 --key-stdin
+npm run --silent cli -- whoami
+```
 
 ## ライセンス
 

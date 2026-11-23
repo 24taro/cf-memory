@@ -218,7 +218,8 @@ node cf-memory-agent/scripts/agent.mjs replay-held [--client claude-code|codex] 
 ```
 
 - Claude Code: runs `claude plugin marketplace add <repo>`, `claude plugin install cf-memory-agent@cf-memory`
-  and `claude plugin update …`, then checks the installed version.
+  and `claude plugin update …`, then verifies the installed user-scope version.
+  Install and uninstall return a nonzero status if the requested state cannot be verified.
   Once the plugin is installed it removes the old `~/.claude/hooks/cf-memory-recall.sh` hook from
   `settings.json` (backup `settings.json.cf-memory-backup-<ms>`), so recall is not injected twice. Only
   the groups and events that removal empties go; every other key stays (an empty `"Notification": []`
