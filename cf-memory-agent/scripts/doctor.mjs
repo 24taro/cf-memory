@@ -69,7 +69,7 @@ export async function doctor({ env = process.env, fetcher = fetch, refresh = fal
     const connection = await credentials(env, refresh ? 'force' : false);
     const url = new URL(connection.url);
     Object.assign(report.auth, { configured: true, source: connection.source, server: url.origin + url.pathname });
-    const probe = createMcp({ ...connection, refresh: undefined }, 8000, fetcher);
+    const probe = createMcp(connection, 8000, fetcher);
     for (let attempt = 0; attempt < 2; attempt++) {
       const started = performance.now();
       try {

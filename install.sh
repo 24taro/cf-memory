@@ -59,19 +59,34 @@ fi
 
 # The owner's token. Kept in this checkout, readable only by you, never committed.
 SECRETS_FILE=".cf-memory.secrets"
-if [ ! -s "$SECRETS_FILE" ]; then
-  say "Generating the API token ($SECRETS_FILE)"
-  (umask 077; printf 'API_TOKEN=%s\n' "$(openssl rand -hex 32)" > "$SECRETS_FILE")
+DEPLOY_LOG=$(mktemp)
+trap 'rm -f "$DEPLOY_LOG"' EXIT
+set --
+if secret_list=$(CI=true wrangler secret list --format json 2>"$DEPLOY_LOG"); then
+  if ! printf '%s' "$secret_list" | node -e '
+    const secrets = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
+    process.exit(Array.isArray(secrets) && secrets.some(secret => secret.name === "API_TOKEN") ? 0 : 1);
+  ' 2>/dev/null; then
+    fail "the existing Worker has no verified API_TOKEN secret. Check its name and Cloudflare account before installing"
+  fi
+  [ -s "$SECRETS_FILE" ] || fail "the Worker already exists. Restore $SECRETS_FILE from the original checkout or rotate its API token explicitly (see SECURITY.md)"
+elif grep -Eq 'Worker "[^"]+" not found\.' "$DEPLOY_LOG"; then
+  if [ ! -e "$SECRETS_FILE" ]; then
+    say "Generating the API token ($SECRETS_FILE)"
+    (umask 077; set -C; generated_token=$(openssl rand -hex 32); printf 'API_TOKEN=%s\n' "$generated_token" > "$SECRETS_FILE")
+  fi
+  set -- --secrets-file "$SECRETS_FILE"
+else
+  cat "$DEPLOY_LOG" >&2
+  fail "could not verify whether the Worker already exists"
 fi
 chmod 600 "$SECRETS_FILE"
 TOKEN=$(sed -n 's/^API_TOKEN=//p' "$SECRETS_FILE" | head -n 1)
 export -n TOKEN
-[ "${#TOKEN}" -ge 32 ] || fail "$SECRETS_FILE holds no API_TOKEN of 32 or more characters; delete it and run again"
+[ "${#TOKEN}" -ge 32 ] || fail "$SECRETS_FILE holds no API_TOKEN of 32 or more characters"
 
 say "Deploying the Worker (creates the D1 databases and the R2 bucket on first run)"
-DEPLOY_LOG=$(mktemp)
-trap 'rm -f "$DEPLOY_LOG"' EXIT
-if ! CI=true wrangler deploy --secrets-file "$SECRETS_FILE" \
+if ! CI=true wrangler deploy "$@" \
     --var "BUILD_GIT_SHA:$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
     --var "BUILD_DATE:$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 | tee "$DEPLOY_LOG"; then
   fail "wrangler deploy failed (see the output above)"
@@ -100,15 +115,7 @@ client_error() {
 }
 if [ "$CLAUDE" = 1 ]; then
   say "Connecting Claude Code"
-  claude mcp remove cf-memory --scope user >/dev/null 2>&1 || true
-  # add-json accepts stdin, so the credential never appears in a process argument.
-  if printf '%s' "$TOKEN" |
-    node -e '
-      const token = require("node:fs").readFileSync(0, "utf8");
-      const config = { type: "http", url: process.argv[1], headers: { Authorization: "Bearer " + token } };
-      process.stdout.write(JSON.stringify(config));
-    ' "$URL/mcp" |
-    claude mcp add-json --scope user cf-memory -; then
+  if printf '%s' "$TOKEN" | node scripts/register-claude-mcp.mjs "$URL/mcp"; then
     echo "Claude Code MCP server registered."
     if node cf-memory-agent/scripts/agent.mjs install --client claude-code >/dev/null; then
       echo "Claude Code hooks installed."
@@ -123,7 +130,6 @@ fi
 CODEX=0
 if [ "$CLIENTS" = 1 ] && command -v codex >/dev/null 2>&1; then
   say "Connecting Codex"
-  codex mcp remove cf-memory >/dev/null 2>&1 || true
   if codex mcp add cf-memory --url "$URL/mcp" --bearer-token-env-var CF_MEMORY_ACCESS_TOKEN; then
     echo "Codex MCP server registered."
     CODEX=1

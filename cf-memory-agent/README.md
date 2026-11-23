@@ -181,11 +181,13 @@ server as its origin and shown as described above. A backlog queued for one serv
 Agent and found after the configuration moved to another server is adopted for the new one: the
 old Agent recorded nothing to tell them apart.
 
-Credentials: `CF_MEMORY_ACCESS_TOKEN`, `~/.claude.json` `mcpServers["cf-memory"].headers`, or the macOS
+Credentials: `CF_MEMORY_ACCESS_TOKEN`, Claude's `mcpServers["cf-memory"].headers`, or the macOS
 Keychain item `Claude Code-credentials` (its `cf-memory|…` MCP OAuth entry). Codex uses the same
-sources. A token is sent only to the server it was issued for (the Keychain entry's `serverUrl`,
+sources. The Claude user configuration lives in `~/.claude.json`, or in
+`$CLAUDE_CONFIG_DIR/.claude.json` for a separate profile. `CF_MEMORY_CLAUDE_CONFIG`
+can explicitly select another file. A token is sent only to the server it was issued for (the Keychain entry's `serverUrl`,
 else the `~/.claude.json` url, else the default): `CF_MEMORY_MCP_URL` may name another host only
-together with `CF_MEMORY_ACCESS_TOKEN`, or a loopback address. Only the Stop hook refreshes an
+together with `CF_MEMORY_ACCESS_TOKEN`. Only the Stop hook refreshes an
 expiring token (`claude mcp get cf-memory`), and a refresh that did not take effect is not tried again
 for 10 minutes (`doctor --refresh` always tries). A refresh ends 1 s before the hook's deadline so the
 refreshed entry can be read back; past the deadline the hook reports `budget`, not `no_credentials`.

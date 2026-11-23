@@ -16,6 +16,25 @@ interface Config {
 
 const CONFIG_DIR = join(homedir(), ".cf-memory");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
+const DEFAULT_URL = "http://localhost:8787";
+
+function sameOrigin(left: string, right: string): boolean {
+  try {
+    const origin = new URL(left).origin;
+    return origin !== "null" && origin === new URL(right).origin;
+  } catch { return false; }
+}
+
+function validateServer(value: string, authenticated: boolean): void {
+  let url: URL;
+  try { url = new URL(value); } catch { throw new Error("provide a valid server URL"); }
+  if (url.username || url.password || url.search || url.hash || !["http:", "https:"].includes(url.protocol)) {
+    throw new Error("provide an HTTP or HTTPS server URL without embedded credentials, a query, or a fragment");
+  }
+  if (authenticated && url.protocol !== "https:" && !["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) {
+    throw new Error("a server using an API token must use HTTPS or a loopback address");
+  }
+}
 
 // An older CLI wrote config.json under the umask (0644 in a 0755 directory) and
 // such an install may never run `login` again, so every command that loads the
@@ -41,11 +60,10 @@ function loadConfig(): Config {
   } catch {
     file = {};
   }
-  // Env vars override the config file so CF_MEMORY_* always wins (and isn't silently ignored).
   return {
-    url: process.env.CF_MEMORY_URL ?? file.url ?? "http://localhost:8787",
-    key: process.env.CF_MEMORY_KEY ?? file.key ?? "",
-    handle: process.env.CF_MEMORY_HANDLE ?? file.handle ?? "owner",
+    url: file.url ?? DEFAULT_URL,
+    key: file.key ?? "",
+    handle: file.handle ?? "owner",
   };
 }
 
@@ -144,10 +162,12 @@ function readContext(flags: Record<string, string>): string | undefined {
 }
 
 async function api(cfg: Config, method: string, path: string, body?: unknown): Promise<any> {
+  validateServer(cfg.url, Boolean(cfg.key));
   let res: Response;
   try {
-    res = await fetch(cfg.url + path, {
+    res = await fetch(cfg.url.replace(/\/+$/, "") + path, {
       method,
+      redirect: "error",
       headers: { "content-type": "application/json", ...(cfg.key ? { authorization: `Bearer ${cfg.key}` } : {}) },
       body: body === undefined ? undefined : JSON.stringify(body),
     });
@@ -285,7 +305,18 @@ async function main() {
   const isTwo = TWO_WORD.has(cmd);
   const key = isTwo ? `${cmd} ${argv[1] ?? ""}`.trim() : cmd;
   const { _, flags } = parseFlags(isTwo ? argv.slice(2) : argv.slice(1));
-  const cfg = loadConfig();
+  const saved = loadConfig();
+  const url = process.env.CF_MEMORY_URL ?? saved.url;
+  const keySource = process.env.CF_MEMORY_KEY === undefined ? saved.url : url;
+  const availableKey = process.env.CF_MEMORY_KEY ?? saved.key;
+  if (cmd && cmd !== "login" && cmd !== "--help" && cmd !== "-h" && availableKey && !sameOrigin(url, keySource)) {
+    throw new Error("set both CF_MEMORY_URL and CF_MEMORY_KEY to use another server");
+  }
+  const cfg = {
+    url,
+    key: sameOrigin(url, keySource) ? availableKey : "",
+    handle: process.env.CF_MEMORY_HANDLE ?? saved.handle,
+  };
 
   switch (key) {
     case "login": {
@@ -297,13 +328,17 @@ async function main() {
           (keyInput >= 0 && argv[keyInput + 1] && !argv[keyInput + 1].startsWith("--"))) {
         throw new Error("--key-stdin takes no argument");
       }
+      const target = flags.url ?? cfg.url;
       if (keyInput >= 0) {
         const key = (await readStdin()).trim();
         if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new Error("--key-stdin requires a single API token on standard input");
         cfg.key = key;
+      } else if ((availableKey && !sameOrigin(target, keySource)) || (!availableKey && saved.key && !sameOrigin(target, saved.url))) {
+        throw new Error("changing the server requires its API token on standard input with `login --key-stdin`");
       }
-      if (flags.url) cfg.url = flags.url;
-      if (flags.handle) cfg.handle = flags.handle;
+      validateServer(target, Boolean(cfg.key));
+      cfg.url = target;
+      cfg.handle = flags.handle ?? process.env.CF_MEMORY_HANDLE ?? (sameOrigin(target, saved.url) ? saved.handle : "owner");
       saveConfig(cfg);
       console.log(`Saved ${CONFIG_PATH} → ${cfg.url} (@${cfg.handle})`);
       if (cfg.key) {

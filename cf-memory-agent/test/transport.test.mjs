@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { credentials, failureCode } from '../scripts/transport.mjs';
 import { tempDir, testEnv } from './helpers/fake-server.mjs';
@@ -14,6 +14,21 @@ function withConfig(dir, url) {
 }
 const failure = promise => promise.then(() => 'resolved', error => failureCode(error));
 
+test('uses the active Claude user profile for MCP credentials', async () => {
+  const dir = tempDir();
+  try {
+    const env = testEnv(dir.path, null, { CLAUDE_CONFIG_DIR: join(dir.path, 'claude-profile') });
+    delete env.CF_MEMORY_CLAUDE_CONFIG;
+    mkdirSync(env.CLAUDE_CONFIG_DIR);
+    const url = 'https://profile.example.test/mcp';
+    writeFileSync(join(env.CLAUDE_CONFIG_DIR, '.claude.json'), JSON.stringify({
+      mcpServers: { 'cf-memory': { url, headers: { Authorization: 'Bearer ' + CONFIG_TOKEN } } },
+    }));
+    const connection = await credentials(env, false);
+    assert.deepEqual([connection.url, connection.token], [url, CONFIG_TOKEN]);
+  } finally { dir.cleanup(); }
+});
+
 test('a token from ~/.claude.json goes only to the server it was issued for', async () => {
   const dir = tempDir();
   try {
@@ -21,7 +36,7 @@ test('a token from ~/.claude.json goes only to the server it was issued for', as
     assert.deepEqual(await credentials(env, false).then(c => [c.url, c.token, c.source]), ['https://memory.example.test/mcp', CONFIG_TOKEN, 'claude_config']);
     assert.equal(await failure(credentials({ ...env, CF_MEMORY_MCP_URL: 'https://elsewhere.example.test/mcp' }, false)), 'unsafe_url', 'another host: refused');
     assert.equal((await credentials({ ...env, CF_MEMORY_MCP_URL: 'https://memory.example.test/other' }, false)).url, 'https://memory.example.test/other', 'same server, another path');
-    assert.equal((await credentials({ ...env, CF_MEMORY_MCP_URL: 'http://127.0.0.1:9/mcp' }, false)).url, 'http://127.0.0.1:9/mcp', 'loopback stays allowed (tests)');
+    assert.equal(await failure(credentials({ ...env, CF_MEMORY_MCP_URL: 'http://127.0.0.1:9/mcp' }, false)), 'unsafe_url', 'loopback needs its own credential');
     // CF_MEMORY_ACCESS_TOKEN in the same environment may go to an override host.
     const own = await credentials({ ...env, CF_MEMORY_MCP_URL: 'https://elsewhere.example.test/mcp', CF_MEMORY_ACCESS_TOKEN: 'fixture-env-token' }, false);
     assert.deepEqual([own.url, own.token, own.source], ['https://elsewhere.example.test/mcp', 'fixture-env-token', 'env']);
@@ -33,7 +48,7 @@ test('a token from ~/.claude.json goes only to the server it was issued for', as
 // `claude mcp get` that takes 1 s and refreshes nothing.
 function keychainFixture(dir) {
   const security = join(dir.path, 'security'), claude = join(dir.path, 'claude'), calls = join(dir.path, 'claude-calls');
-  writeFileSync(security, `#!/bin/sh\nnow=$(($(date +%s)*1000))\nprintf '{"mcpOAuth":{"cf-memory|x":{"accessToken":"fixture-access-token-not-a-secret","refreshToken":"r","expiresAt":%s}}}' $((now-1000))\n`);
+  writeFileSync(security, `#!/bin/sh\nnow=$(($(date +%s)*1000))\nprintf '{"mcpOAuth":{"cf-memory|x":{"serverUrl":"http://127.0.0.1:9/mcp","accessToken":"fixture-access-token-not-a-secret","refreshToken":"r","expiresAt":%s}}}' $((now-1000))\n`);
   writeFileSync(claude, `#!/bin/sh\necho call >> '${calls}'\nsleep 1\necho ok\n`);
   chmodSync(security, 0o755); chmodSync(claude, 0o755);
   const env = { ...testEnv(dir.path, null), CF_MEMORY_KEYCHAIN: 'on', CF_MEMORY_CLAUDE_BIN: claude, CF_MEMORY_MCP_URL: 'http://127.0.0.1:9/mcp' };

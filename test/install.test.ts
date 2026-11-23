@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { expect, it } from 'vitest';
@@ -65,34 +65,101 @@ it('continues with Codex alone or when client setup is disabled', () => {
   }
 });
 
-it('reports Claude hook failure separately and still sets up Codex', () => {
+function installFixture({ worker = 'present', savedToken = true, clients = false } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
     mkdirSync(bin);
     copyFileSync('install.sh', join(root, 'install.sh'));
+    mkdirSync(join(root, 'scripts'));
+    copyFileSync('scripts/register-claude-mcp.mjs', join(root, 'scripts/register-claude-mcp.mjs'));
     symlinkSync(resolve('cf-memory-agent'), join(root, 'cf-memory-agent'), 'dir');
     symlinkSync(process.execPath, join(bin, 'node'));
-    writeFileSync(join(root, '.cf-memory.secrets'), `API_TOKEN=${'x'.repeat(32)}\n`, { mode: 0o600 });
+    const tokenFile = join(root, '.cf-memory.secrets');
+    if (savedToken) writeFileSync(tokenFile, `API_TOKEN=${'x'.repeat(32)}\n`, { mode: 0o600 });
+    const trace = join(root, 'wrangler-args');
+    writeFileSync(trace, '');
     const wrangler = join(root, 'node_modules/wrangler/bin/wrangler.js');
     mkdirSync(dirname(wrangler), { recursive: true });
-    writeFileSync(wrangler, `if (process.argv[2] === 'deploy') console.log('https://test.example.workers.dev');\n`);
+    writeFileSync(wrangler, `
+      const args = process.argv.slice(2);
+      require('node:fs').appendFileSync(process.env.TRACE, JSON.stringify(args) + '\\n');
+      if (args[0] === 'secret') {
+        if (process.env.WORKER === 'present') console.log('[{"name":"API_TOKEN","type":"secret_text"}]');
+        else { console.error(process.env.WORKER === 'missing' ? 'Worker "cf-memory" not found.' : 'Could not reach Cloudflare.'); process.exitCode = 1; }
+      }
+      if (args[0] === 'deploy') console.log('https://test.example.workers.dev');
+    `);
     const stub = (name: string, body: string) => writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o700 });
     stub('npm', 'exit 0');
     stub('curl', `cat >/dev/null\nprintf '%s\\n' '{"token_status":"active"}'`);
     stub('codex', 'exit 0');
-    stub('claude', `case "$1 $2" in\n  "--version ") echo '2.1.327 (Claude Code)' ;;\n  'mcp add-json') cat >/dev/null ;;\n  'mcp remove') exit 0 ;;\n  *) exit 1 ;;\nesac`);
-    const result = spawnSync('/bin/bash', ['install.sh'], {
+    stub('claude', `case "$1 $2" in\n  "--version ") echo '2.1.327 (Claude Code)' ;;\n  'mcp add-json') node -e 'require("node:fs").writeFileSync(process.env.HOME + "/.claude.json", JSON.stringify({mcpServers:{"cf-memory":JSON.parse(require("node:fs").readFileSync(0,"utf8"))}}))' ;;\n  *) exit 1 ;;\nesac`);
+    const result = spawnSync('/bin/bash', ['install.sh', ...(clients ? [] : ['--no-client'])], {
       cwd: root,
       encoding: 'utf8',
-      env: { HOME: root, CODEX_HOME: join(root, '.codex'), PATH: `${bin}:/usr/bin:/bin` },
+      env: { HOME: root, CODEX_HOME: join(root, '.codex'), PATH: `${bin}:/usr/bin:/bin`, WORKER: worker, TRACE: trace },
     });
-    expect(result.status).toBe(1);
-    expect(result.stdout).toContain('Claude Code MCP server registered');
-    expect(result.stderr).toContain('Claude Code hook setup failed');
-    expect(result.stdout).toContain('Codex hooks installed');
-    expect(result.stdout).toMatch(/^  Connected +codex$/m);
-    expect(readFileSync(join(root, '.codex', 'hooks.json'), 'utf8')).toContain('cf-memory agent');
+    const deploy = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]).find(args => args[0] === 'deploy');
+    const hooks = join(root, '.codex', 'hooks.json');
+    return { result, deploy, tokenExists: existsSync(tokenFile), codex: existsSync(hooks) ? readFileSync(hooks, 'utf8') : '' };
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+}
+
+it('reports Claude hook failure separately and still sets up Codex', () => {
+  const { result, codex } = installFixture({ clients: true });
+  expect(result.status).toBe(1);
+  expect(result.stdout).toContain('Claude Code MCP server registered');
+  expect(result.stderr).toContain('Claude Code hook setup failed');
+  expect(result.stdout).toContain('Codex hooks installed');
+  expect(result.stdout).toMatch(/^  Connected +codex$/m);
+  expect(codex).toContain('cf-memory agent');
+});
+
+it('deploys a new Worker with a token and preserves the existing secret on update', () => {
+  const created = installFixture({ worker: 'missing', savedToken: false });
+  expect(created.result.status).toBe(0);
+  expect(created.tokenExists).toBe(true);
+  expect(created.deploy?.slice(1, 3)).toEqual(['--secrets-file', '.cf-memory.secrets']);
+  const update = installFixture();
+  expect(update.result.status).toBe(0);
+  expect(update.deploy).toBeDefined();
+  expect(update.deploy).not.toContain('--secrets-file');
+});
+
+it.each(['present', 'unknown'])('does not deploy when the local token is absent and Worker state is %s', worker => {
+  const { result, deploy, tokenExists } = installFixture({ worker, savedToken: false });
+  expect(result.status).toBe(1);
+  expect(deploy).toBeUndefined();
+  expect(tokenExists).toBe(false);
+});
+
+it('replaces only the existing Claude registration and preserves it when atomic writing fails', () => {
+  const root = mkdtempSync(join(tmpdir(), 'cf-memory-claude-registration-'));
+  try {
+    const profile = join(root, 'claude-profile');
+    mkdirSync(profile);
+    const file = join(profile, '.claude.json');
+    const previous = { mcpServers: { 'cf-memory': { url: 'https://old.example.test/mcp' }, another: { command: 'example' } }, projects: {} };
+    const update = () => spawnSync(process.execPath, ['scripts/register-claude-mcp.mjs', 'https://new.example.test/mcp'], {
+      input: 'x'.repeat(32), encoding: 'utf8', env: { HOME: root, CLAUDE_CONFIG_DIR: profile },
+    });
+    writeFileSync(file, JSON.stringify(previous));
+    expect(update().status).toBe(0);
+    const updated = JSON.parse(readFileSync(file, 'utf8'));
+    expect(updated.mcpServers['cf-memory'].url).toBe('https://new.example.test/mcp');
+    expect(updated.mcpServers.another).toEqual(previous.mcpServers.another);
+    expect(updated.projects).toEqual(previous.projects);
+
+    rmSync(file);
+    // A valid target name whose temporary filename would exceed NAME_MAX.
+    const longTarget = join(root, 'a'.repeat(250));
+    writeFileSync(longTarget, JSON.stringify(previous));
+    symlinkSync(longTarget, file);
+    expect(update().status).toBe(1);
+    expect(readFileSync(file, 'utf8')).toBe(JSON.stringify(previous));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

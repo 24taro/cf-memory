@@ -3,6 +3,9 @@ import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 export const CLIENTS = ['claude-code', 'codex'];
+export function claudeUserConfigPath(env = process.env) {
+  return join(env.CLAUDE_CONFIG_DIR || homedir(), '.claude.json');
+}
 export function clientName(env = process.env) {
   if (!env.CF_MEMORY_CLIENT || env.CF_MEMORY_CLIENT === 'claude-code') return 'claude-code';
   if (env.CF_MEMORY_CLIENT === 'codex') return 'codex';

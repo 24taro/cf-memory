@@ -3,11 +3,10 @@
 import { execFile, execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { link, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { responseText } from './bounded.mjs';
-import { agentHome } from './client.mjs';
+import { agentHome, claudeUserConfigPath } from './client.mjs';
 const exec = promisify(execFile);
 // No built-in server: the url comes from CF_MEMORY_MCP_URL or the cf-memory entry
 // in ~/.claude.json. An unconfigured Agent sends nothing anywhere.
@@ -81,32 +80,29 @@ async function noteRefresh(env) {
 }
 
 const origin = value => { try { return new URL(value).origin; } catch { return null; } };
-// ~/.claude.json ({} when missing or unreadable). A hook reads it once: for the
-// destination of what it queues and again for the credentials.
+// Follow the active Claude user profile. An explicit cf-memory override wins.
 export async function claudeConfig(env = process.env, deadline) {
   try {
-    return JSON.parse(await readFile(env.CF_MEMORY_CLAUDE_CONFIG || join(homedir(), '.claude.json'), {
+    return JSON.parse(await readFile(env.CF_MEMORY_CLAUDE_CONFIG || claudeUserConfigPath(env), {
       encoding: 'utf8', ...(deadline === undefined ? {} : { signal: AbortSignal.timeout(remaining(deadline, 1500)) }),
     }));
   } catch { return {}; }
 }
-const loopback = value => { try { return ['127.0.0.1', 'localhost', '[::1]'].includes(new URL(value).hostname); } catch { return false; } };
-
 // Sources, in order: CF_MEMORY_ACCESS_TOKEN, ~/.claude.json mcpServers["cf-memory"]
 // headers, then the macOS Keychain item "Claude Code-credentials" (mcpOAuth
 // entry whose key starts with "cf-memory|"). Codex has no separate cf-memory token:
 // its hooks use the same sources (the previous Codex adapter did the same).
 // A token goes only to the server it was issued for (the Keychain entry's
 // serverUrl, else the ~/.claude.json url, else the default): CF_MEMORY_MCP_URL
-// may point elsewhere only together with CF_MEMORY_ACCESS_TOKEN, or at loopback.
+// may point elsewhere only together with CF_MEMORY_ACCESS_TOKEN.
 // allowRefresh: true (refresh an expiring Keychain token, at most once per
 // 10 minutes), 'force' (doctor --refresh) or false.
 export async function credentials(env = process.env, allowRefresh = true, deadline, config) {
   config ??= await claudeConfig(env, deadline);
   const server = config?.mcpServers?.['cf-memory'], override = env.CF_MEMORY_MCP_URL || '';
-  const issuedTo = issued => !override || origin(override) === origin(issued) || loopback(override);
+  const issuedTo = issued => !override || origin(override) === origin(issued);
   const configUrl = server?.url || DEFAULT_MCP_URL;
-  let url = override || configUrl, token, source = null, keychain = false, elsewhere = false;
+  let url = override || configUrl, token, source = null, elsewhere = false;
   if (env.CF_MEMORY_ACCESS_TOKEN) { token = env.CF_MEMORY_ACCESS_TOKEN; source = 'env'; }
   else if (server?.headers?.Authorization) {
     if (issuedTo(configUrl)) { token = server.headers.Authorization.replace(/^Bearer\s+/i, ''); source = 'claude_config'; } else elsewhere = true;
@@ -132,7 +128,7 @@ export async function credentials(env = process.env, allowRefresh = true, deadli
           }
         }
         token = entry[1].accessToken; url = override || entry[1].serverUrl || configUrl;
-        keychain = Boolean(entry[1].refreshToken); source = token ? 'keychain' : null;
+        source = token ? 'keychain' : null;
       }
     } catch (error) {
       if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') throw new DOMException('Keychain read timed out', 'TimeoutError');
@@ -142,23 +138,18 @@ export async function credentials(env = process.env, allowRefresh = true, deadli
   // `elsewhere`: the only token found was issued for another server.
   if (!token && elsewhere || parsed.username || parsed.password || (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)))) throw Error('unsafe MCP URL');
   if (!token) throw Object.assign(Error('cf-memory OAuth unavailable; run claude mcp login cf-memory'), { code: 'no_credentials' });
-  return { url, token, source, ...(keychain ? { refresh: async () => { await refreshOAuth(env); return credentials(env, false); } } : {}) };
+  return { url, token, source };
 }
 
-export function createMcp({ url, token, refresh }, timeout = 8000, fetcher = fetch, responseLimit = 2000000) {
+export function createMcp({ url, token }, timeout = 8000, fetcher = fetch, responseLimit = 2000000) {
   if (!Number.isSafeInteger(responseLimit) || responseLimit < 1 || responseLimit > 16 * 1048576) throw Error('invalid MCP response limit');
   return async (name, args = {}) => {
     try {
-      const request = () => fetcher(url, {
+      const response = await fetcher(url, {
         method: 'POST', redirect: 'error', signal: AbortSignal.timeout(typeof timeout === 'function' ? timeout() : timeout),
         headers: { Authorization: 'Bearer ' + token, 'content-type': 'application/json', Accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
       });
-      let response = await request();
-      if (response.status === 401 && refresh) {
-        const next = await refresh(); token = next.token; url = next.url;
-        response = await request(); // bounded one retry; revocation remains visible
-      }
       if (!response.ok) throw new McpFailure('http', name, response.status);
       let raw = await responseText(response, responseLimit), parsed, result;
       try {
@@ -186,7 +177,7 @@ export function createDeadlineMcp(connection, deadline, fetcher = fetch, cap = 8
   return (name, args) => {
     let timeout;
     try { timeout = remaining(deadline, cap); } catch { return Promise.reject(new McpFailure('budget', name)); }
-    return createMcp({ ...connection, refresh: undefined }, timeout, fetcher)(name, args);
+    return createMcp(connection, timeout, fetcher)(name, args);
   };
 }
 
@@ -324,7 +315,7 @@ function tokenAtHand(env, config) {
   if (env.CF_MEMORY_ACCESS_TOKEN) return env.CF_MEMORY_ACCESS_TOKEN;
   const server = config?.mcpServers?.['cf-memory'], override = env.CF_MEMORY_MCP_URL || '';
   if (typeof server?.headers?.Authorization !== 'string') return null;
-  if (override && origin(override) !== origin(server.url || DEFAULT_MCP_URL) && !loopback(override)) return null;
+  if (override && origin(override) !== origin(server.url || DEFAULT_MCP_URL)) return null;
   return server.headers.Authorization.replace(/^Bearer\s+/i, '') || null;
 }
 

@@ -41,6 +41,8 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 更新するときは同じチェックアウトで最新の変更を取り込み、`./install.sh` をもう一度実行します。同じ Cloudflare アカウントを使い、`.cf-memory.secrets` を残しておくと、既存のデータベース、バケット、トークンを再利用します。
 
+通常の更新ではデプロイ済みのトークンを保持します。別のチェックアウトに移る場合は、先に元の `.cf-memory.secrets` をコピーしてください。トークンの更新手順は [Security](SECURITY.md) にあります。
+
 ## 仕組み
 
 1. **記録**: フックが発言とエージェントの最終回答を全文で残します。ツール操作は 1 行、失敗した出力は先頭だけ残します。送る前に手元で秘密情報を伏せます。要約はしません。
@@ -117,12 +119,11 @@ fi
 npm run dev
 ```
 
-別のターミナルから操作CLIを使う場合は、標準入力でトークンを渡します。トークンは所有者だけが読めるCLI設定に保存されます。
+別のターミナルから、保存済みのクライアント設定に手を加えずに疎通確認できます。
 
 ```bash
-sed -n 's/^API_TOKEN=//p' .dev.vars |
-  npm run --silent cli -- login --url http://localhost:8787 --key-stdin
-npm run --silent cli -- whoami
+sed -n 's/^API_TOKEN=/Authorization: Bearer /p' .dev.vars |
+  curl -fsS -H @- http://localhost:8787/api/v1/whoami
 ```
 
 ## ライセンス

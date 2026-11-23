@@ -249,6 +249,25 @@ describe("cli-config-key-file-default-mode", () => {
     expect(result.code).toBe(1);
     expect(readFileSync(fileOf(s), "utf8")).toBe(before);
   });
+
+  it("uses a saved credential only at its configured origin", async () => {
+    const s = scratch("mode-server-origin"), old = await stub(), next = await stub();
+    try {
+      const env = cliEnv(s);
+      const call = (args, extra = {}) => runCli(args, { env, cwd: s.work, ...extra });
+      expect((await call(["login", "--url", old.url, "--key-stdin"], { stdin: DUMMY_KEY })).code).toBe(0);
+      const before = readFileSync(fileOf(s), "utf8");
+      const refused = await call(["login", "--url", next.url]);
+      expect(refused.code).toBe(1);
+      expect(readFileSync(fileOf(s), "utf8")).toBe(before);
+      expect(next.requests).toHaveLength(0);
+      expect((await call(["whoami"], { env: { ...env, CF_MEMORY_URL: next.url } })).code).toBe(1);
+      expect(next.requests).toHaveLength(0);
+      const nextKey = "fixture-new-origin-key";
+      expect((await call(["login", "--url", next.url, "--key-stdin"], { stdin: nextKey })).code).toBe(0);
+      expect(next.requests.map(request => request.auth)).toEqual([`Bearer ${nextKey}`]);
+    } finally { await old.close(); await next.close(); }
+  });
 });
 
 describe("cli/cf-memory.ts:pull:unescaped-title-frontmatter", () => {

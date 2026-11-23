@@ -55,6 +55,9 @@ node cf-memory-agent/scripts/agent.mjs doctor
 To update, pull the latest changes in the same checkout and run `./install.sh`
 again. Use the same Cloudflare account and keep `.cf-memory.secrets` to reuse
 the API token. The databases and bucket are reused.
+Regular updates preserve the deployed token. If you move to another checkout,
+copy the original `.cf-memory.secrets` before installing. See [Security](SECURITY.md)
+for token rotation.
 
 ## How it works
 
@@ -173,13 +176,12 @@ fi
 npm run dev
 ```
 
-In another terminal, register the local instance with the optional CLI. The
-token is read from standard input and saved in the owner-only CLI config:
+In another terminal, check the local instance without changing any saved client
+settings:
 
 ```bash
-sed -n 's/^API_TOKEN=//p' .dev.vars |
-  npm run --silent cli -- login --url http://localhost:8787 --key-stdin
-npm run --silent cli -- whoami
+sed -n 's/^API_TOKEN=/Authorization: Bearer /p' .dev.vars |
+  curl -fsS -H @- http://localhost:8787/api/v1/whoami
 ```
 
 Run the checks with:

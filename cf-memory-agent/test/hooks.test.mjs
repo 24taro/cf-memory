@@ -444,7 +444,7 @@ test('flushHealth (hooks and agent.mjs flush): the deadline before the first sen
 function refreshFixture(f, script) {
   const bin = join(f.dir.path, 'bin');
   mkdirSync(bin, { recursive: true });
-  writeFileSync(join(bin, 'security'), `#!/bin/sh\nnow=$(($(date +%s)*1000))\nprintf '{"mcpOAuth":{"cf-memory|x":{"accessToken":"${TEST_TOKEN}","refreshToken":"r","expiresAt":%s}}}' $((now-1000))\n`);
+  writeFileSync(join(bin, 'security'), `#!/bin/sh\nnow=$(($(date +%s)*1000))\nprintf '{"mcpOAuth":{"cf-memory|x":{"serverUrl":"${f.env.CF_MEMORY_MCP_URL}","accessToken":"${TEST_TOKEN}","refreshToken":"r","expiresAt":%s}}}' $((now-1000))\n`);
   writeFileSync(join(bin, 'claude'), '#!/bin/sh\n' + script + '\n');
   chmodSync(join(bin, 'security'), 0o755); chmodSync(join(bin, 'claude'), 0o755);
   rmSync(join(f.home, 'health', 'oauth-refresh.json'), { force: true }); // no 10-minute pause
