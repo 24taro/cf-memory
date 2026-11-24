@@ -9,7 +9,7 @@ import { normalizeScope, normalizeScopes, scopeClause } from "./context";
 import { clampLimit, now, sha256hex, ulid } from "./db";
 import { asStringArray, parseFrontmatter } from "./frontmatter";
 import { parseWikilinks } from "./links";
-import { BlockFullError } from "./memory";
+import { BlockFullError, resolveCharLimit } from "./memory";
 import { slugify, slugifyPath } from "./slug";
 import { resolveShared } from "./spaces";
 import { validityClause } from './search';
@@ -325,7 +325,7 @@ export class NotesRepo {
     if(updateGuard && (typeof input.slug!=='string' || !input.slug.trim() || typeof input.body_md!=='string' ||
       input.title!==undefined && typeof input.title!=='string' || input.createOnly || creationProvenance ||
       (['frontmatter','tags','stage','kind','type','shared','scope','valid_from','valid_until','supersedes','supersedesGuard',
-        'pinned_block_label','char_limit','append_md','expectedContentHash'] as (keyof NoteInput)[]).some(key=>input[key]!==undefined)))
+        'pinned_block_label','char_limit','append_md','expectedContentHash','expectedUpdatedAt'] as (keyof NoteInput)[]).some(key=>input[key]!==undefined)))
       throw new Error('update_guard permits only explicit slug, title and plain body text');
     if (guard && (!input.createOnly || input.supersedes !== guard.id || input.append_md !== undefined || input.kind === 'block' || input.pinned_block_label != null))
       throw new Error('supersedes_guard requires create_only and the explicit target id');
@@ -400,6 +400,10 @@ export class NotesRepo {
     // omitted field applies unchanged. Frontmatter in the body is read the same way.
     const writeThrough = !!existing && existing.user_id !== userId;
     const own: Pick<NoteInput, "kind" | "type" | "shared" | "scope" | "stage" | "valid_from" | "valid_until" | "supersedes" | "pinned_block_label" | "char_limit"> = writeThrough ? {} : input;
+    const blockAppend = input.append_md !== undefined && input.append_separator !== undefined && own.kind === "block";
+    const charLimit = blockAppend
+      ? resolveCharLimit(own.char_limit, existing?.deleted_at ? null : existing)
+      : own.char_limit !== undefined ? own.char_limit : existing?.char_limit ?? null;
     // 付随データ(タグ・リンク・ベクトルのメタデータ)は行の持ち主に紐づける。
     // 編集者に紐づけると、他人の共有ノートを編集しただけで自分のタグが増える。
     const rowOwner = existing?.user_id ?? userId;
@@ -434,6 +438,9 @@ export class NotesRepo {
     // conflict: this write resurrects it, CAS-guarded by its own content_hash below.)
     if (input.createOnly && existing) throw new StaleUpsertError();
     if (input.expectedContentHash === null && existing && !existing.deleted_at) throw new StaleUpsertError();
+    if (input.expectedUpdatedAt !== undefined && (existing?.deleted_at || existing?.updated_at !== input.expectedUpdatedAt)) {
+      throw new StaleUpsertError();
+    }
     // Append contract: recompute the concatenated body from the FRESHLY-read
     // existing row on EVERY attempt so a writer that lost the CAS re-enters the
     // loop and appends onto the winner's body instead of clobbering it. Block
@@ -449,12 +456,11 @@ export class NotesRepo {
       const baseBody = existing && !existing.deleted_at ? existing.body_md : "";
       const hasBase = baseBody.length > 0 || (!blockSep && existing != null && !existing.deleted_at);
       body = (hasBase ? baseBody + sep : "") + input.append_md;
-      const cl = input.char_limit !== undefined ? input.char_limit : (existing?.char_limit ?? null);
       // Forcing-function (P0): a char-limited append (core-memory blocks are the
       // only writers that pass char_limit) that would overflow is REJECTED here at
       // the CAS-safe write point, not silently truncated. Regular notes carry no
       // char_limit (cl=null) so this never fires for them.
-      if (cl != null && cl > 0 && body.length > cl) throw new BlockFullError(body.length, cl);
+      if (charLimit != null && charLimit > 0 && body.length > charLimit) throw new BlockFullError(body.length, charLimit);
     }
     body = inertBody(body);
     if (body.length > MAX_NOTE_BODY_CHARS && body.length > (existing && !existing.deleted_at ? existing.body_md.length : 0)) throw tooLarge();
@@ -493,7 +499,6 @@ export class NotesRepo {
     const wordCount = (body.match(/\S+/g) ?? []).length;
     const ftsTags = tags.join(" ");
     const pinned = own.pinned_block_label !== undefined ? own.pinned_block_label : (existing?.pinned_block_label ?? null);
-    const charLimit = own.char_limit !== undefined ? own.char_limit : (existing?.char_limit ?? null);
     const STAGES = ["seedling", "budding", "evergreen"];
     const stage =
       own.stage && STAGES.includes(own.stage)

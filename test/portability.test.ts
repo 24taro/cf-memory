@@ -159,7 +159,8 @@ it('actual portable pipeline restores private notes/correction/skill bytes, retr
   await services.notes.upsert(source, { slug: 'user-fact', title: 'Preference', type: 'user', append_md: literal });
   const skill = (await services.skills.upsert(source, { slug: 'source-procedure', name: 'Procedure', description: 'Safe export', instructions: 'Use backup then verify.', frontmatter: { custom: 'preserved' } })).skill;
   await call('skills_file_create', { id: skill.id, path: 'references/example.txt', content_type: 'text/plain', content_base64: Buffer.from('Procedure fixture').toString('base64') }, source);
-  await call('memory_set', { label: 'test-operating-rule', value: 'Read current evidence.' }, source);
+  const coreText = 'Read current evidence. '.repeat(180).trim();
+  await call('memory_set', { label: 'test-operating-rule', value: coreText, char_limit: null }, source);
   await services.capture.put(source, { id: hash(600), session_id: hash(601), tool_use_id: hash(600), event_type: 'PostToolUse', tool_name: 'Read', payload_redacted: { output: 'Verified DB correction' }, payload_hash: hash(602), occurred_at: Date.now() - 1000, visibility: 'project', repo_context: ['github.com/example/product'], file_refs: ['src/database.ts'] });
   await services.capture.attach(source, { memory_id: current.id, source_event_ids: [hash(600)] });
   const bridge = (p: typeof source) => (name: string, args: Record<string, unknown>) => call(name, args, p);
@@ -195,7 +196,7 @@ it('actual portable pipeline restores private notes/correction/skill bytes, retr
   expect((await call('notes_get', { id: restored.id }, bob)).found).toBe(false);
   expect((await services.capture.provenance('note', restored.id, bob))).toEqual([]);
   await importArchive(bridge(target), archive, { apply: true, includeCore: true });
-  expect((await services.memory.getBlock(target, 'test-operating-rule'))?.value).toBe('Read current evidence.');
+  expect(await services.memory.getBlock(target, 'test-operating-rule')).toMatchObject({ value: coreText, char_limit: null });
   const corrupt = structuredClone(archive); corrupt.records[0].body_md += 'corrupt';
   await expect(importArchive(bridge(target), corrupt, { apply: true })).rejects.toThrow('checksum');
 }, 20_000); // Ten complete MCP/D1/R2 retries, including integrity reads, on CI.

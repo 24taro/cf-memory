@@ -6,7 +6,7 @@
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { makeServices, type Services } from "../src/services";
 import { principalFixture } from "./helpers";
 
@@ -111,6 +111,24 @@ describe("concurrency — block append (issue #3 acceptance criterion)", () => {
     const blocks = await services.memory.listBlocks(principal);
     const value = blocks.find((b) => b.label === "limited")?.value ?? "";
     expect(value.length).toBeLessThanOrEqual(12);
+  });
+
+  it.each(["append", "replace"] as const)("respects a limit changed before the block %s is written", async op => {
+    const label = `limit-${op}`;
+    await services.memory.setBlock(principal, label, "set", "base", 30);
+    const raw = services.notes.upsert.bind(services.notes);
+    const upsert = vi.spyOn(services.notes, "upsert").mockImplementationOnce(async (caller, input) => {
+      await raw(principal, {
+        slug: input.slug, title: label, kind: "block", pinned_block_label: label, body_md: "base", char_limit: 4,
+      });
+      return raw(caller, input);
+    });
+    try {
+      await expect(services.memory.setBlock(principal, label, op, "longer", undefined, "base")).rejects.toThrow(/4-char limit/);
+      expect(await services.memory.getBlock(principal, label)).toMatchObject({ value: "base", char_limit: 4 });
+    } finally {
+      upsert.mockRestore();
+    }
   });
 });
 

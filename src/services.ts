@@ -378,16 +378,14 @@ export class MemoryService {
     return (res.results ?? []).map((r) => ({ label: r.label, title: r.title, value: r.value, char_limit: r.char_limit }));
   }
 
-  private async getRaw(ownerId: string, label: string): Promise<(BlockView & { content_hash: string | null }) | null> {
-    // Write-base read (setBlock): content_hash is selected so setBlock can bind it
-    // as the upsert CAS token (closing the read-modify-write window, H-1).
-    const r = await this.db
+  private async getRaw(ownerId: string, label: string): Promise<(BlockView & { content_hash: string | null; updated_at: number }) | null> {
+    return this.db
       .prepare(
-        `SELECT pinned_block_label AS label, title, body_md AS value, char_limit, content_hash FROM notes WHERE user_id=? AND pinned_block_label=? AND deleted_at IS NULL`,
+        `SELECT pinned_block_label AS label, title, body_md AS value, char_limit, content_hash, updated_at
+          FROM notes WHERE user_id=? AND pinned_block_label=? AND deleted_at IS NULL`,
       )
       .bind(ownerId, label)
-      .first<{ label: string; title: string; value: string; char_limit: number | null; content_hash: string | null }>();
-    return r ? { label: r.label, title: r.title, value: r.value, char_limit: r.char_limit, content_hash: r.content_hash } : null;
+      .first<BlockView & { content_hash: string | null; updated_at: number }>();
   }
 
   private async getScoped(principal: Principal, label: string): Promise<BlockView | null> {
@@ -417,8 +415,6 @@ export class MemoryService {
     // two concurrent appends can't lose an update. Pass block semantics through
     // (single-newline separator + char_limit) so the result matches applyBlockOp.
     if (op === "append") {
-      const existing = await this.getRaw(principal.userId, label);
-      const limit = resolveCharLimit(charLimit, existing);
       const { note } = await this.notes.upsert(principal, {
         slug,
         title: label,
@@ -426,7 +422,7 @@ export class MemoryService {
         append_separator: "\n",
         kind: "block",
         pinned_block_label: label,
-        char_limit: limit,
+        char_limit: charLimit,
       });
       return { label, title: label, value: note.body_md, char_limit: note.char_limit };
     }
@@ -454,6 +450,7 @@ export class MemoryService {
           // so a concurrent commit landing in this window fails the CAS instead of
           // being silently overwritten by next (computed from the stale base).
           expectedContentHash: existing ? existing.content_hash : null,
+          expectedUpdatedAt: existing?.updated_at,
           bubbleStaleConflict: true,
         });
         return { label, title: label, value: next, char_limit: limit };

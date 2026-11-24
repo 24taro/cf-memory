@@ -188,6 +188,8 @@ export interface NoteInput {
    * window surfaces as a stale conflict. Pair with bubbleStaleConflict so the
    * caller can recompute against the winner's fresh body. */
   expectedContentHash?: string | null;
+  /** Also pin metadata when the transform depended on the base row's limits. */
+  expectedUpdatedAt?: number;
 }
 
 export interface NoteSummary {

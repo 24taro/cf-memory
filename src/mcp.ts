@@ -62,6 +62,8 @@ interface ToolDef {
 }
 
 const str = { type: "string" } as const;
+const blockLimit = { type: ["number", "null"] } as const;
+const blockLimitArg = (value: unknown) => value === null || (typeof value === "number" && Number.isFinite(value)) ? value : undefined;
 const timeZoneParam = {type:'string',minLength:1,maxLength:80,description:'Optional IANA time zone for provenance display, e.g. Asia/Tokyo or America/New_York. Default UTC; original times and source metadata stay unchanged.'};
 const SOURCE_ATTRIBUTION = ' Attribute each claim to its own complete source; verify all/both/every and absence claims independently per record. Check that absence claims do not contradict another selected note or your own explanation. A sufficient condition is not an only-if rule; one branch does not establish all paths. Keep source date/version qualifiers: current means memory lifecycle, not subject freshness. Capture plugin/client versions do not establish source or processing-worker versions. Do not merge historical conditions into a current guarantee without checked source compatibility.';
 const updateGuardParam = {
@@ -704,12 +706,12 @@ const TOOLS: ToolDef[] = [
   },
   {
     name: "memory_set",
-    description: "Set (overwrite) a core-memory block. Rejects with `{ok:false,error:'block_full',length,limit}` if the value exceeds char_limit (NO silent truncation) — keep blocks a distilled current-state; condense or raise char_limit. Needs notes:read as well as notes:write, because the result depends on the stored block.",
-    inputSchema: { type: "object", properties: { label: str, value: str, create_only: {type:"boolean"}, char_limit: { type: "number" } }, required: ["label", "value"] },
+    description: "Set (overwrite) a core-memory block. Rejects with `{ok:false,error:'block_full',length,limit}` if the value exceeds char_limit. Pass null to remove a limit. Callers with notes:read receive the stored text in the result.",
+    inputSchema: { type: "object", properties: { label: str, value: str, create_only: {type:"boolean"}, char_limit: blockLimit }, required: ["label", "value"] },
     scope: "notes:write",
     handler: async (args, ctx) => {
       try {
-        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "set", String(args.value ?? ""), typeof args.char_limit === "number" ? args.char_limit : undefined, undefined, args.create_only === true);
+        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "set", String(args.value ?? ""), blockLimitArg(args.char_limit), undefined, args.create_only === true);
         return { block: blockWriteResult(ctx.principal, b) };
       } catch (e) {
         const bf = blockFull(e, String(args.label));
@@ -721,12 +723,12 @@ const TOOLS: ToolDef[] = [
   {
     name: "memory_append",
     description: "Append a line to a core-memory block. Rejects with `{ok:false,error:'block_full',length,limit}` if it would exceed char_limit (NO silent truncation) — prefer memory_replace to re-derive a compact block, or archive the overflow to a note. Needs notes:read as well as notes:write, because the result depends on the stored block.",
-    inputSchema: { type: "object", properties: { label: str, value: str, char_limit: { type: "number" } }, required: ["label", "value"] },
+    inputSchema: { type: "object", properties: { label: str, value: str, char_limit: blockLimit }, required: ["label", "value"] },
     scope: "notes:write",
     reads: true,
     handler: async (args, ctx) => {
       try {
-        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "append", String(args.value ?? ""), typeof args.char_limit === "number" ? args.char_limit : undefined, undefined);
+        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "append", String(args.value ?? ""), blockLimitArg(args.char_limit), undefined);
         return { block: blockWriteResult(ctx.principal, b) };
       } catch (e) {
         const bf = blockFull(e, String(args.label));
@@ -738,12 +740,12 @@ const TOOLS: ToolDef[] = [
   {
     name: "memory_replace",
     description: "Surgically correct a core-memory block (MemGPT-style core_memory_replace): replace occurrences of `find` with `replace`. No match = silent no-op. Rejects with `{ok:false,error:'block_full',length,limit}` only if the result would exceed char_limit. Needs notes:read as well as notes:write, because the result depends on the stored block.",
-    inputSchema: { type: "object", properties: { label: str, find: str, replace: str, char_limit: { type: "number" } }, required: ["label", "find", "replace"] },
+    inputSchema: { type: "object", properties: { label: str, find: str, replace: str, char_limit: blockLimit }, required: ["label", "find", "replace"] },
     scope: "notes:write",
     reads: true,
     handler: async (args, ctx) => {
       try {
-        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "replace", String(args.replace ?? ""), typeof args.char_limit === "number" ? args.char_limit : undefined, String(args.find ?? ""));
+        const b = await ctx.services.memory.setBlock(ctx.principal, String(args.label), "replace", String(args.replace ?? ""), blockLimitArg(args.char_limit), String(args.find ?? ""));
         return { block: blockWriteResult(ctx.principal, b) };
       } catch (e) {
         const bf = blockFull(e, String(args.label));
