@@ -75,10 +75,10 @@ elif grep -Eq 'Worker "[^"]+" not found\.' "$DEPLOY_LOG"; then
   say "Reserving the Worker name for this first install"
   reservation=$(CI=true node scripts/reserve-worker.mjs "$INSTALL_CLAIM") ||
     fail "the first install did not reserve the Worker; no token was uploaded"
-  read -r account_id worker_name <<< "${reservation##*$'\n'}"
-  [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ ]] ||
+  read -r account_id worker_name api_url <<< "${reservation##*$'\n'}"
+  [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ && -n "$api_url" ]] ||
     fail "could not confirm the reserved Cloudflare account and Worker"
-  export CLOUDFLARE_ACCOUNT_ID="$account_id"
+  export CLOUDFLARE_ACCOUNT_ID="$account_id" CLOUDFLARE_API_BASE_URL="$api_url"
   if [ ! -e "$SECRETS_FILE" ]; then
     say "Generating the API token ($SECRETS_FILE)"
     (umask 077; set -C; generated_token=$(openssl rand -hex 32); printf 'API_TOKEN=%s\n' "$generated_token" > "$SECRETS_FILE")

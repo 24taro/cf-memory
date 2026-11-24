@@ -65,7 +65,7 @@ it('continues with Codex alone or when client setup is disabled', () => {
   }
 });
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false } = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -78,6 +78,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     symlinkSync(process.execPath, join(bin, 'node'));
     const tokenFile = join(root, '.cf-memory.secrets');
     const claimFile = join(root, '.cf-memory.install-claim');
+    if (dotEnv) writeFileSync(join(root, '.env'), dotEnv);
     if (savedToken) writeFileSync(tokenFile, `API_TOKEN=${'x'.repeat(32)}\n`, { mode: 0o600 });
     if (reservation === 'resume' || reservation === 'deployed') writeFileSync(claimFile, 'a'.repeat(32), { mode: 0o600 });
     const trace = join(root, 'wrangler-args');
@@ -86,6 +87,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     mkdirSync(dirname(wrangler), { recursive: true });
     writeFileSync(join(root, 'node_modules/wrangler/index.js'), `
       exports.unstable_readConfig = () => ({ name: 'cf-memory' });
+      exports.unstable_getVarsForDev = require(${JSON.stringify(resolve('node_modules/wrangler/wrangler-dist/cli.js'))}).unstable_getVarsForDev;
     `);
     writeFileSync(wrangler, `
       const args = process.argv.slice(2);
@@ -99,6 +101,11 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
         else { console.error(process.env.WORKER === 'missing' ? 'Worker "cf-memory" not found.' : 'Could not reach Cloudflare.'); process.exitCode = 1; }
       }
       if (args[0] === 'deploy') console.log('https://test.example.workers.dev');
+      if (args[0] === 'deploy' && process.env.CLOUDFLARE_ACCOUNT_ID) {
+        require('node:fs').appendFileSync(process.env.TRACE, JSON.stringify([
+          'deployment-target', process.env.CLOUDFLARE_ACCOUNT_ID, process.env.CLOUDFLARE_API_BASE_URL,
+        ]) + '\\n');
+      }
     `);
     const fetchMock = join(root, 'mock-cloudflare.mjs');
     writeFileSync(fetchMock, `
@@ -180,6 +187,16 @@ it('resumes its own reserved Worker before any version exists', () => {
   expect(calls).toContainEqual(['api', 'GET', `/client/v4/accounts/${'a'.repeat(32)}/workers/workers/cf-memory/versions`]);
   expect(deploy).toContain('--secrets-file');
   expect(claimExists).toBe(false);
+});
+
+it('reserves and deploys to the account selected in Wrangler dotenv', () => {
+  const account = 'b'.repeat(32);
+  const { result, calls } = installFixture({
+    worker: 'missing', savedToken: false, dotEnv: `TARGET_ACCOUNT=${account}\nCLOUDFLARE_ACCOUNT_ID=\${TARGET_ACCOUNT}\n`,
+  });
+  expect(result.status).toBe(0);
+  expect(calls).toContainEqual(['api', 'POST', `/client/v4/accounts/${account}/workers/workers`]);
+  expect(calls).toContainEqual(['deployment-target', account, 'https://api.cloudflare.com/client/v4']);
 });
 
 it.each(['competing', 'deployed', 'unconfirmed'])('uploads no credentials if the first-install reservation is %s', reservation => {
