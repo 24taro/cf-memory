@@ -104,11 +104,11 @@ function cloudflareApi({ domain, account }) {
   };
 }
 
-async function ownsActiveToken(origin, token, ownerHandle) {
+async function ownsActiveToken(origin, token, ownerHandle, timeout = 15_000) {
   try {
     const response = await fetch(`${origin}/api/v1/whoami`, {
       headers: { authorization: `Bearer ${token}` },
-      redirect: 'error', signal: AbortSignal.timeout(15_000),
+      redirect: 'error', signal: AbortSignal.timeout(timeout),
     });
     if (!response.ok) return false;
     const result = await response.json();
@@ -250,9 +250,11 @@ async function rotateToken(bindingFile, secretsFile) {
       throw new Error(`Cloudflare did not confirm the upload. Keep ${pendingFile} and rerun --rotate-token to resume`);
     }
     let verified = false;
-    for (let attempt = 0; attempt < 5 && !verified; attempt++) {
-      if (attempt) await delay(2_000);
-      verified = await ownsActiveToken(origin, pending, ownerHandle);
+    const deadline = Date.now() + 60_000;
+    for (let remaining = deadline - Date.now(); remaining > 0 && !verified; remaining = deadline - Date.now()) {
+      verified = await ownsActiveToken(origin, pending, ownerHandle, Math.min(5_000, remaining));
+      const pause = Math.min(3_000, deadline - Date.now());
+      if (!verified && pause > 0) await delay(pause);
     }
     if (!verified) throw new Error(`the Worker has not accepted the staged token. Keep ${pendingFile} and rerun --rotate-token to resume`);
   }
