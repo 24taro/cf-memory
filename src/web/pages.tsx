@@ -657,7 +657,7 @@ export const NetworkPage: FC<{
     <p class="meta">
       ノート同士がどうつながっているかを図で見られます。線でつながっているノートは書かれたノート、点線・薄い丸はまだ書かれていないノートです。 <a href={`/@${p.handle}/network.md`}>.md</a>
     </p>
-    <canvas id="graph"></canvas>
+    <canvas id="graph" data-handle={p.handle}></canvas>
     <h2>よくつながっているノート</h2>
     <ul class="list">
       {p.topConnected.length === 0 ? <li class="muted">まだつながりがありません。</li> : null}
@@ -678,7 +678,7 @@ export const NetworkPage: FC<{
         </li>
       ))}
     </ul>
-    <script nonce={p.nonce} dangerouslySetInnerHTML={{ __html: graphScriptSrc(p.handle) }} />
+    <script nonce={p.nonce} dangerouslySetInnerHTML={{ __html: graphScriptSrc() }} />
   </Layout>
 );
 
@@ -717,15 +717,16 @@ export const MemoryPage: FC<{ handle: string; sessionHandle?: string; blocks: Bl
 );
 
 // Inlined into the network page as a plain browser string (not TS-checked against DOM libs).
-function graphScriptSrc(handle: string): string {
-  return `(function(handle){
+function graphScriptSrc(): string {
+  return `(function(){
   var cv = document.getElementById("graph"); var ctx = cv.getContext("2d");
+  var handle = encodeURIComponent(cv.dataset.handle);
   var dpr = window.devicePixelRatio || 1;
   function size(){ cv.width = cv.clientWidth*dpr; cv.height = cv.clientHeight*dpr; }
   size(); addEventListener("resize", size);
   fetch("/api/v1/@" + handle + "/graph?depth=2").then(function(r){ return r.json(); }).then(function(g){
     var N = g.nodes.map(function(n){ return { id:n.id, label:n.label, stub:n.stub, x:Math.random()*cv.width, y:Math.random()*cv.height, vx:0, vy:0 }; });
-    var idx = {}; N.forEach(function(n,i){ idx[n.id]=i; });
+    var idx = Object.create(null); N.forEach(function(n,i){ idx[n.id]=i; });
     var E = g.edges.filter(function(e){ return idx[e.source]!=null && idx[e.target]!=null; });
     function step(){
       for (var i=0;i<N.length;i++){ for (var j=i+1;j<N.length;j++){
@@ -757,5 +758,5 @@ function graphScriptSrc(handle: string): string {
     });
     step();
   });
-})(${JSON.stringify(handle)});`;
+})();`;
 }
