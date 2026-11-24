@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "cf-memory-agent",
-  "version": "0.3.3",
+  "version": "0.3.4",
   "description": "Keeps prompts, replies and one-line tool actions in cf-memory for keyword search, and injects recall and session context. No summarization.",
   "author": {
     "name": "24taro"

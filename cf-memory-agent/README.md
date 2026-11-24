@@ -1,4 +1,4 @@
-# cf-memory agent 0.3.3
+# cf-memory agent
 
 A small hook program for Claude Code and Codex. It keeps the conversation itself
 in cf-memory so agents can find it later by keyword.
@@ -164,8 +164,8 @@ takes over from another one or its token is identified. The rest needs the opera
 
 `replay-rejected` keeps each entry's destination.
 
-Agent 0.3.3 holds old entries without an account or token fingerprint. If they
-also lack a server, `doctor` groups them under `--origin none`. Review the
+Starting in Agent 0.3.3, old entries without an account or token fingerprint
+stay on hold. If they also lack a server, `doctor` groups them under `--origin none`. Review the
 entries and use a specific `replay-held` selection with `--to-current` to
 assign them to the configured server and account.
 

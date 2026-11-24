@@ -663,6 +663,9 @@ const ARG = String.raw`"[^"\n]{0,512}"?|'[^'\n]{0,512}'?|(?!\\)[^\s"'|;&<>]{1,51
 // Between a flag and its value: spaces, or a "\" + newline continuation.
 const GAP = String.raw`(?:[ \t]*\\\r?\n)?[ \t]+`;
 const IN_COMMAND = String.raw`(?:[^\n\\]|\\\r?\n|\\(?!\r?\n)){0,240}?[ \t]`;
+// Every password flag of a keytool line can be sensitive. Its lookbehind only
+// has work to do when the case-sensitive command name is present.
+const keytoolPassword = new RegExp(String.raw`((?<=\bkeytool\b(?:[^\n\\]|\\\r?\n|\\(?!\r?\n)){0,400}?)[ \t]-(?:store|key|src(?:store|key)|dest(?:store|key)|new)pass${GAP})(${ARG})`, 'g');
 const commandRules = [
   new RegExp(String.raw`(\b(?:mysql|mariadb)[\w-]*\b${IN_COMMAND}-p)(?=[^\s-])(${ARG})`, 'g'), // -pXXXX; a bare -p prompts
   new RegExp(String.raw`(\bredis-cli\b${IN_COMMAND}(?:-a|--pass)${GAP})(${ARG})`, 'g'),
@@ -678,8 +681,7 @@ const commandRules = [
   new RegExp(String.raw`(\b7za?\b${IN_COMMAND}-p)(?=[^\s-])(${ARG})`, 'g'),
   new RegExp(String.raw`(\bopenssl\b${IN_COMMAND}(?:-k${GAP}|-pass(?:in|out)?${GAP}(?:pass|env):|-passphrase${GAP}))(${ARG})`, 'g'),
   new RegExp(String.raw`(\bsecurity[ \t]+add-(?:generic|internet)-password\b${IN_COMMAND}-w${GAP})(${ARG})`, 'g'),
-  // Every -storepass / -keypass of a keytool line, not only the first.
-  new RegExp(String.raw`((?<=\bkeytool\b(?:[^\n\\]|\\\r?\n|\\(?!\r?\n)){0,400}?)[ \t]-(?:store|key|src(?:store|key)|dest(?:store|key)|new)pass${GAP})(${ARG})`, 'g'),
+  keytoolPassword,
   new RegExp(String.raw`(\bsmbclient\b${IN_COMMAND}(?:-U|--user)(?:[ \t]+|=)(?:\(email omitted\)|[^\s%]{1,128})%)(${ARG})`, 'g'),
   new RegExp(String.raw`(\b(?:mongosh|mongo|mongodump|mongorestore)\b${IN_COMMAND}(?:-p|--password)(?:${GAP}|=)?)(${ARG})`, 'g'),
   new RegExp(String.raw`(\brabbitmqctl[ \t]+(?:add_user|change_password)[ \t]+\S{1,128}[ \t]+)(${ARG})`, 'g'),
@@ -770,12 +772,14 @@ function scrubArgv(text) {
   });
 }
 function scrubCommandLine(text) {
-  for (const rule of commandRules) text = text.replace(rule, keepRedacted);
+  for (const rule of commandRules) {
+    if (rule === keytoolPassword && !text.includes('keytool')) continue;
+    text = text.replace(rule, keepRedacted);
+  }
   return text;
 }
 function scrubCommandSecrets(text) {
-  text = scrubArgv(text);
-  for (const rule of commandRules) text = text.replace(rule, keepRedacted);
+  text = scrubCommandLine(scrubArgv(text));
   for (const rule of codeRules) text = text.replace(rule, keepCode);
   // A here-string on a line that names a secret: wrangler secret put NAME <<< XXXX.
   return text.replace(hereString, (match, head, value, offset, input) => {
