@@ -65,7 +65,18 @@ it('continues with Codex alone or when client setup is disabled', () => {
   }
 });
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, existingUrl = worker === 'present' && savedToken && !bindingPhase ? 'https://cf-memory.test.workers.dev' : '' } = {}) {
+interface InstallFixtureOptions {
+  worker?: string;
+  reservation?: string;
+  savedToken?: boolean;
+  clients?: boolean;
+  dotEnv?: string;
+  bindingPhase?: string;
+  tokenAccepted?: boolean;
+  existingUrl?: string;
+}
+
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, existingUrl = worker === 'present' && savedToken && !bindingPhase ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
