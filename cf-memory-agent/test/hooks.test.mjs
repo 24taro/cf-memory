@@ -35,7 +35,7 @@ for (const client of ['claude-code', 'codex']) {
       assert.deepEqual(output, { hookSpecificOutput: { hookEventName: 'UserPromptSubmit', additionalContext: RECALL_HEADER + '\n\nremembered: the fixture project uses vitest' } });
       assert.deepEqual(f.server.named('recall').map(c => c.args), [{ query: 'Fix the login bug', budget: 10000, core: false, max_chars: RECALL_MAX_CHARS, context: 'git@github.com:example/demo.git' }]);
       const sent = f.server.named('log_append').flatMap(c => c.args.entries);
-      assert.deepEqual(sent.map(e => [e.client, e.kind, e.text, e.repo, e.session_id]), [[client, 'prompt', 'Fix the login bug', 'example/demo', 'session-' + client]]);
+      assert.deepEqual(sent.map(e => [e.client, e.kind, e.text, e.repo, e.session_id]), [[client, 'prompt', 'Fix the login bug', '//github.com/example/demo', 'session-' + client]]);
       assert.equal(sent[0].id, entries[0].id);
       assert.equal((await pendingStats(f.home, client)).bytes, 0);
       assert.equal(f.health(client).last_flush.ok, true);
@@ -51,9 +51,9 @@ for (const client of ['claude-code', 'codex']) {
       const text = output.hookSpecificOutput.additionalContext;
       assert.ok(text.startsWith(SESSION_HEADER));
       assert.match(text, /## core memory\n### persona\nThe owner prefers short answers\./);
-      assert.match(text, /## 前回の続き\(同じリポジトリ example\/demo の別セッションの最後の返答, 2026-10-30 22:10 JST\)\nLast time we finished the spool design\./);
+      assert.match(text, /## 前回の続き\(同じリポジトリ \/\/github\.com\/example\/demo の別セッションの最後の返答, 2026-10-30 22:10 JST\)\nLast time we finished the spool design\./);
       assert.ok(text.endsWith(LOG_HINT));
-      assert.deepEqual(f.server.named('session_context').map(c => c.args), [{ repo: 'example/demo', session_id: 'session-' + client }]);
+      assert.deepEqual(f.server.named('session_context').map(c => c.args), [{ repo: '//github.com/example/demo', session_id: 'session-' + client }]);
     } finally { await f.close(); }
   });
 
@@ -239,8 +239,8 @@ test('session_context gets the session_id and repo exactly as the entries store 
     await f.run('claude-code', 'SessionStart', { session_id: 'plain', cwd: tabbed });
     const { entries } = await f.run('claude-code', 'UserPromptSubmit', { session_id: long, prompt: 'hello' });
     const local = (await f.run('claude-code', 'UserPromptSubmit', { session_id: 'plain', cwd: tabbed, prompt: 'hello' })).entries[0].repo;
-    assert.match(local, /^notes draft#[0-9a-f]{8}$/, 'no remote: the directory name and a hash of its path');
-    assert.deepEqual(f.server.named('session_context').map(c => c.args), [{ repo: 'example/demo', session_id: sessionKey(long) }, { repo: local, session_id: 'plain' }]);
+    assert.match(local, /^notes draft#[0-9a-f]{32}$/, 'no remote: the directory name and a hash of its path');
+    assert.deepEqual(f.server.named('session_context').map(c => c.args), [{ repo: '//github.com/example/demo', session_id: sessionKey(long) }, { repo: local, session_id: 'plain' }]);
     assert.equal(entries[0].session_id, sessionKey(long));
     assert.equal(sessionKey(long).length, 64);
   } finally { await f.close(); }

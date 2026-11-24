@@ -1,26 +1,41 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdirSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { CHILD_SCAN_MS, localRepo, normalizeRemote, resolveRepo, stripUserinfo } from '../scripts/repo.mjs';
 import { tempDir } from './helpers/fake-server.mjs';
 
-test('remotes normalize to owner/name', () => {
+test('network remotes normalize to host and repository path', () => {
   const cases = [
-    ['git@github.com:acme/cf-memory.git', 'acme/cf-memory'],
-    ['https://github.com/acme/cf-memory.git', 'acme/cf-memory'],
-    ['https://github.com/acme/cf-memory', 'acme/cf-memory'],
-    ['https://user:fixture-pass@github.com/acme/cf-memory.git', 'acme/cf-memory'],
-    ['ssh://git@github.com:22/acme/cf-memory.git', 'acme/cf-memory'],
-    ['ssh://git@gitlab.example.com/group/sub/project.git', 'group/sub/project'],
-    ['git@internal:team/tool.git', 'team/tool'],
-    ['/srv/git/local-repo.git', 'local-repo'],
-    ['file:///srv/git/file-repo.git', 'file-repo'],
-    ['https://github.com/acme/cf-memory/', 'acme/cf-memory'],
+    ['git@github.com:acme/cf-memory.git', '//github.com/acme/cf-memory'],
+    ['https://github.com/acme/cf-memory.git', '//github.com/acme/cf-memory'],
+    ['https://GITHUB.com/acme/cf-memory', '//github.com/acme/cf-memory'],
+    ['https://user:fixture-pass@github.com/acme/cf-memory.git', '//github.com/acme/cf-memory'],
+    ['ssh://git@github.com:22/acme/cf-memory.git', '//github.com/acme/cf-memory'],
+    ['https://github.com:22/acme/cf-memory.git', '//github.com:22/acme/cf-memory'],
+    ['ssh://git@gitlab.example.com/group/sub/project.git', '//gitlab.example.com/group/sub/project'],
+    ['ssh://git@gitlab.example.com:2222/group/sub/project.git', '//gitlab.example.com:2222/group/sub/project'],
+    ['git@internal:team/tool.git', '//internal/team/tool'],
+    ['git@[2001:db8::4]:team/tool.git', '//[2001:db8::4]/team/tool'],
+    ['ssh://git@[2001:db8::4]/team/tool.git', '//[2001:db8::4]/team/tool'],
+    ['/srv/git/local-repo.git', ''],
+    ['file:///srv/git/file-repo.git', ''],
+    ['https://github.com/acme/cf-memory/', '//github.com/acme/cf-memory'],
     ['', ''],
   ];
   for (const [input, expected] of cases) assert.equal(normalizeRemote(input), expected, input);
+});
+
+test('long repo keys preserve distinguishing path segments within the protocol limit', () => {
+  const prefix = 'github.com/teams/' + 'archive/'.repeat(130);
+  const a = normalizeRemote(`https://${prefix}one.git`);
+  const b = normalizeRemote(`git@${prefix.replace('/', ':')}two.git`);
+  assert.match(a, /^\/\/github\.com\/.*#[0-9a-f]{32}$/);
+  assert.equal(a.length, 200);
+  assert.equal(b.length, 200);
+  assert.notEqual(a, b);
+  assert.equal(normalizeRemote(`ssh://${prefix}one`), a);
 });
 
 test('userinfo is stripped from URL remotes, scp user is kept', () => {
@@ -28,27 +43,25 @@ test('userinfo is stripped from URL remotes, scp user is kept', () => {
   assert.equal(stripUserinfo('git@github.com:a/b.git'), 'git@github.com:a/b.git');
 });
 
-test('resolveRepo reads the git remote, caches it, and falls back to the cwd name plus a hash of its path', () => {
+test('resolveRepo immediately tracks origin changes and falls back to the checkout path', () => {
   const dir = tempDir();
   try {
     const repoDir = join(dir.path, 'checkout');
     mkdirSync(repoDir);
     execFileSync('git', ['-C', repoDir, 'init', '-q']);
-    execFileSync('git', ['-C', repoDir, 'remote', 'add', 'origin', 'https://user:fixture-pass@github.com/example/demo.git']);
+    execFileSync('git', ['-C', repoDir, 'remote', 'add', 'origin', 'https://user:fixture-pass@github.com/example/demo.git?access_token=fixture-query']);
     const home = join(dir.path, 'home');
     const first = resolveRepo(repoDir, { home, now: 1000 });
-    assert.deepEqual(first, { repo: 'example/demo', remote: 'https://github.com/example/demo.git', contexts: ['https://github.com/example/demo.git'] });
-    assert.ok(!readFileSync(join(home, 'repo-cache.json'), 'utf8').includes('fixture-pass'), 'credentials never reach the cache');
-    let calls = 0;
-    const git = () => { calls++; throw Error('not called while cached'); };
-    assert.equal(resolveRepo(repoDir, { home, now: 2000, git }).repo, 'example/demo');
-    assert.equal(calls, 0);
-    resolveRepo(repoDir, { home, now: 1000 + 11 * 60 * 1000, git });
-    assert.equal(calls, 1, 'expired cache asks git again');
+    assert.deepEqual(first, { repo: '//github.com/example/demo', remote: 'https://github.com/example/demo.git', contexts: ['https://github.com/example/demo.git'] });
+    assert.ok(!existsSync(join(home, 'repo-cache.json')), 'the current origin is read directly');
+    execFileSync('git', ['-C', repoDir, 'remote', 'set-url', 'origin', 'ssh://git@git.example.com/example/demo.git']);
+    assert.equal(resolveRepo(repoDir, { home, now: 2000 }).repo, '//git.example.com/example/demo');
+    execFileSync('git', ['-C', repoDir, 'remote', 'set-url', 'origin', 'file:///srv/git/example/demo.git']);
+    assert.equal(resolveRepo(repoDir, { home, now: 3000 }).repo, localRepo(repoDir));
     const plain = join(dir.path, 'plain-folder');
     mkdirSync(plain);
     const local = resolveRepo(plain, { home, now: 5000 }).repo;
-    assert.match(local, /^plain-folder#[0-9a-f]{8}$/);
+    assert.match(local, /^plain-folder#[0-9a-f]{32}$/);
     assert.equal(local, localRepo(plain));
     const twin = join(dir.path, 'elsewhere', 'plain-folder');
     mkdirSync(twin, { recursive: true });
@@ -66,7 +79,7 @@ test('a parent of several checkouts gives their remotes as Recall contexts', () 
       execFileSync('git', ['-C', path, 'remote', 'add', 'origin', remote]);
     }
     const result = resolveRepo(join(dir.path, 'parent'), { home: join(dir.path, 'home'), now: 1, children: true });
-    assert.match(result.repo, /^parent#[0-9a-f]{8}$/);
+    assert.match(result.repo, /^parent#[0-9a-f]{32}$/);
     assert.deepEqual(result.contexts, ['git@github.com:org/a.git', 'git@github.com:org/b.git']);
   } finally { dir.cleanup(); }
 });

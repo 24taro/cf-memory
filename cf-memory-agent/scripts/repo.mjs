@@ -1,6 +1,5 @@
-// Repository identity for log entries ("owner/name", or "<dir>#<hash>" without
-// a remote) and Recall context (the raw git remote, which the server
-// normalizes itself). Cached per cwd.
+// Repository identity for log entries and handoff, plus the separate Git
+// remote used by Recall to match notes. Only child-directory scans are cached.
 import { execFileSync } from 'node:child_process';
 import { readFileSync, readdirSync, renameSync, writeFileSync, mkdirSync } from 'node:fs';
 import { basename, join, resolve } from 'node:path';
@@ -16,34 +15,49 @@ const CACHE_TTL_MS = 10 * 60 * 1000, CACHE_MAX = 200, GIT_TIMEOUT_MS = 1500;
 // ("git@host:owner/name") keep their user: it is not a credential.
 export function stripUserinfo(remote) {
   const s = String(remote ?? '').trim();
-  return s.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/@]*@/i, '$1');
+  return s.replace(/^([a-z][a-z0-9+.-]*:\/\/)[^/?#]*@/i, '$1');
 }
 
-// "owner/name" for hosted remotes (full path for nested groups), the last path
-// segment for local or file remotes, '' when nothing usable.
+const networkProtocols = new Set(['http:', 'https:', 'git:', 'ssh:', 'git+ssh:', 'ssh+git:']);
+
+// Equivalent HTTPS and SSH remotes share //host/path. The leading slashes
+// separate these keys from legacy path-only keys, which stripped all leading
+// slashes. A nondefault port can identify a different Git service.
 export function normalizeRemote(remote) {
   const s = stripUserinfo(remote);
-  if (!s) return '';
-  let path;
-  const url = s.match(/^([a-z][a-z0-9+.-]*):\/\/([^/]*)(\/.*)?$/i);
-  if (url) {
-    path = url[1].toLowerCase() === 'file' || !url[2] ? basename((url[3] || '').replace(/\/+$/, '')) : (url[3] || '');
+  let host, path;
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(s)) {
+    try {
+      const url = new URL(s);
+      if (!networkProtocols.has(url.protocol)) return '';
+      const defaultPort = url.protocol === 'git:' ? '9418' : ['ssh:', 'git+ssh:', 'ssh+git:'].includes(url.protocol) ? '22' : '';
+      const port = url.port && url.port !== defaultPort ? ':' + url.port : '';
+      host = url.hostname.toLowerCase() + port;
+      path = url.pathname;
+    } catch { return ''; }
   } else {
-    const scp = s.match(/^(?:[^/@\s]+@)?([^/:\s]+):(?!\/\/)(.+)$/);
-    path = scp && !/^[A-Za-z]$/.test(scp[1]) ? scp[2] : basename(s.replace(/[\\/]+$/, ''));
+    const scp = s.match(/^(?:([^/@\s]+)@)?(\[[\da-f:.]+\]|[^/:\s\\]+):(.+)$/i);
+    if (!scp || (!scp[1] && /^[a-z]$/i.test(scp[2]))) return '';
+    host = scp[2].toLowerCase();
+    path = scp[3];
   }
-  path = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '').replace(/^~/, '');
-  return path.slice(0, 200);
+  path = path.replace(/^\/+|\/+$/g, '').replace(/\.git$/i, '');
+  if (!host || !path) return '';
+  const key = `//${host}/${path}`;
+  if (scrubEntryText(key) !== key) return '';
+  if (key.length <= 200) return key;
+  return key.slice(0, 167).replace(/[\uD800-\uDBFF]$/, '') + '#' + createHash('sha256').update(key).digest('hex').slice(0, 32);
 }
 
 // The remote, null without one, undefined when git ran out of time.
 function gitRemote(dir, git, timeout = GIT_TIMEOUT_MS) {
   try {
     const out = git('git', ['-C', dir, 'config', '--get', 'remote.origin.url'], {
-      encoding: 'utf8', timeout, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
+      encoding: 'utf8', timeout, maxBuffer: 65536, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, GIT_TERMINAL_PROMPT: '0' },
     });
-    const remote = stripUserinfo(String(out).trim());
-    return remote ? remote.slice(0, 1000) : null;
+    let remote = stripUserinfo(out);
+    if (/^[a-z][a-z0-9+.-]*:\/\//i.test(remote)) remote = remote.replace(/[?#].*$/, '');
+    return remote && !/[\u0000-\u001f\u007f]/.test(remote) && scrubEntryText(remote) === remote ? remote : null;
   } catch (error) { return error?.code === 'ETIMEDOUT' ? undefined : null; }
 }
 
@@ -67,7 +81,7 @@ function writeCache(path, cache) {
 // Without a usable remote: the directory name and a short hash of its full
 // path, so unrelated directories with the same name (app, tmp) never share a
 // session_context handoff.
-export const localRepo = dir => basename(dir).slice(0, 190).replace(/[\uD800-\uDBFF]$/, '') + '#' + createHash('sha256').update(resolve(dir)).digest('hex').slice(0, 8);
+export const localRepo = dir => scrubEntryText(basename(dir)).slice(0, 167).replace(/[\uD800-\uDBFF]$/, '') + '#' + createHash('sha256').update(resolve(dir)).digest('hex').slice(0, 32);
 
 /**
  * { repo, remote, contexts } for a cwd. `contexts` (Recall) is the cwd's own
@@ -78,12 +92,15 @@ export const localRepo = dir => basename(dir).slice(0, 190).replace(/[\uD800-\uD
  */
 export function resolveRepo(cwd, { home, now = Date.now(), git = execFileSync, children = false } = {}) {
   const dir = String(cwd || process.cwd());
+  const remote = gitRemote(dir, git) ?? null;
+  const repo = (remote && normalizeRemote(remote)) || localRepo(dir);
+  if (remote || !children) return { repo, remote, contexts: remote ? [remote] : [] };
+
   const cachePath = home ? join(home, 'repo-cache.json') : null;
   const cache = cachePath ? readCache(cachePath) : { entries: {} };
   let entry = cache.entries[dir];
-  let dirty = false;
-  if (!entry || !(now - entry.at < CACHE_TTL_MS) || entry.at > now) { entry = { remote: gitRemote(dir, git) ?? null, at: now }; dirty = true; }
-  if (children && !entry.remote && (!Array.isArray(entry.children) || typeof entry.scan_after === 'string')) {
+  if (!entry || entry.version !== 2 || !(now - entry.at < CACHE_TTL_MS) || entry.at > now) entry = { version: 2, at: now };
+  if (!Array.isArray(entry.children) || typeof entry.scan_after === 'string') {
     const found = new Set(Array.isArray(entry.children) ? entry.children : []), stop = performance.now() + CHILD_SCAN_MS;
     let after = typeof entry.scan_after === 'string' ? entry.scan_after : null, cut = false, cutAt = null;
     try {
@@ -101,9 +118,7 @@ export function resolveRepo(cwd, { home, now = Date.now(), git = execFileSync, c
     } catch {}
     const { scan_after, cut_at, ...rest } = entry;
     entry = { ...rest, children: [...found].sort(), ...(cut ? { scan_after: after ?? '', cut_at: cutAt } : {}) };
-    dirty = true;
+    if (cachePath) { cache.entries[dir] = entry; writeCache(cachePath, cache); }
   }
-  if (dirty && cachePath) { cache.entries[dir] = entry; writeCache(cachePath, cache); }
-  const repo = scrubEntryText(entry.remote && normalizeRemote(entry.remote) || localRepo(dir)).slice(0, 200);
-  return { repo, remote: entry.remote, contexts: entry.remote ? [entry.remote] : entry.children || [] };
+  return { repo, remote, contexts: entry.children };
 }

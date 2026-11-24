@@ -25,9 +25,11 @@ Entries: `{ id, session_id, client, repo, ts, kind, text }`.
 - Not kept: tool output, file contents, MCP results, agent-to-agent tools and wait/clock tools
   (`send_message`, `spawn_agent`, `wait_agent`, `sleep`, `curr_time`, Claude `SendMessage`/`Agent`/`Task`, …).
 - `id` = sha256 over client, session id, ts, kind and text (the server ignores ids it already has).
-- `repo` = the cwd's git remote as `owner/name`; without one, the directory name plus a short hash
-  of its full path (`app#1a2b3c4d`), so unrelated directories with the same name never share a
-  handoff. `session_context` gets the same `repo` and `session_id` as the entries.
+- `repo` = the current Git origin as `//host/owner/name`, with a port for nondefault services. HTTPS
+  and SSH clones of the same hosted repository share a handoff. Local and file-path origins use
+  the directory name plus a hash of its full path. `session_context` uses the same `repo` and
+  `session_id` as the entries. Logs recorded under the earlier keys remain available through
+  `log_search` and `log_sessions`. Automatic handoff uses replies recorded with the current key.
 - Everything passes `scrubText` and the free-text secret scrubber (`パスワードは xxxx`,
   `password is xxxx`, `pw: xxxx`, `暗証番号 1234`) before it is written anywhere.
 - A tool call whose input names a credential file (`DEFAULT_DENY_PATHS`: `.env`, `.env.*`, `*.pem`,
