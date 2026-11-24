@@ -5,7 +5,7 @@ import { protectedResourceMetadata, unauthorizedChallenge } from "./rs-introspec
 import { estimateTokens, now, parseValidTs, storageErrorDetails, ulid } from "./db";
 import { isNoteKind, isNoteType } from "./spaces";
 import { BlockFullError } from "./memory";
-import { parseWikilinks, uniqueTargets } from "./links";
+import { parseWikilinks, type WikilinkMatch } from "./links";
 import { renderMarkdown, type WikiResolver } from "./markdown";
 import { handleMcp, MCP_TOOL_NAMES, storedTitle } from "./mcp";
 import { NoteInputError, StaleUpsertError, storedAs } from "./notes";
@@ -322,29 +322,33 @@ app.notFound((c) => {
   );
 });
 
-async function resolveWiki(db: D1Database, viewerId: string, handle: string, body: string): Promise<WikiResolver> {
-  const targets = uniqueTargets(parseWikilinks(body));
-  const existing = new Map<string, string>();
-  const wikiVis = readableSqlFor("", viewerId);
-  if (targets.length) {
-    const ph = targets.map(() => "?").join(",");
-    const res = await db
-      // 2026-08-22: 独自の述語を手書きし user_id を二重に束縛していた(庭の主と
-      // 閲覧者の両方)。結果は正しいが、共有ノートへの [[wikilink]] が解決されず
-      // 「まだ書かれていない」と描かれる —— あるものを無いと言う形。
-      //
-      // 庭の主で絞らないのは、共有ノートが庭を跨ぐから。誰の庭を見ていても、
-      // 閲覧者が読める行なら解決してよい。読める範囲は readableSql が唯一の定義。
-      .prepare(
-        `SELECT slug, title FROM notes WHERE deleted_at IS NULL AND ${wikiVis.sql} AND slug IN (${ph})`,
-      )
-      .bind(...wikiVis.args, ...targets)
-      .all<{ slug: string; title: string }>();
-    for (const r of res.results ?? []) existing.set(r.slug, r.title);
+async function resolveWiki(db: D1Database, viewerId: string, handle: string, links: WikilinkMatch[]): Promise<WikiResolver> {
+  const targetKey = (owner: string | null, slug: string) => JSON.stringify([owner, slug]);
+  const keys = [...new Set(links.map(link => targetKey(link.targetHandle, link.targetSlug)))];
+  const matches = new Map<string, { handle: string; title: string }>();
+  if (keys.length) {
+    const access = readableSqlFor("n", viewerId);
+    // Prefer the source namespace for an unqualified link, then use the same
+    // oldest-first order as the stored link index. Qualified links match just
+    // the requested handle. Use one bound JSON value for link-heavy notes.
+    const res = await db.prepare(`WITH targets AS (
+        SELECT value AS target_key, json_extract(value,'$[0]') AS owner, json_extract(value,'$[1]') AS slug
+        FROM json_each(?)
+      ), ranked AS (
+        SELECT targets.target_key, u.handle, n.title,
+          ROW_NUMBER() OVER (PARTITION BY targets.target_key ORDER BY (u.handle=?) DESC, n.created_at, n.id) AS priority
+        FROM targets JOIN notes n ON n.slug=targets.slug JOIN users u ON u.id=n.user_id
+        WHERE ((targets.owner IS NULL AND (u.handle=? OR n.shared=1)) OR u.handle=targets.owner)
+          AND n.deleted_at IS NULL AND ${access.sql}
+      ) SELECT target_key, handle, title FROM ranked WHERE priority=1`)
+      .bind(JSON.stringify(keys), handle, handle, ...access.args)
+      .all<{ target_key: string; handle: string; title: string }>();
+    for (const row of res.results) matches.set(row.target_key, row);
   }
-  return (slugText, h) => {
-    const s = slugifyPath(slugText);
-    return { href: `/@${h ?? handle}/n/${s}`, exists: existing.has(s), title: existing.get(s) };
+  return (slugText, owner) => {
+    const slug = slugifyPath(slugText);
+    const match = matches.get(targetKey(owner, slug));
+    return { href: `/@${encodeURIComponent(match?.handle ?? owner ?? handle)}/n/${slug}`, exists: Boolean(match), title: match?.title };
   };
 }
 
@@ -900,12 +904,16 @@ async function noteGet(c: AppCtx, handle: string, rawSlug: string): Promise<Resp
     return c.html(<MissingNotePage handle={handle} sessionHandle={sessionHandle(c)} slug={slug} backlinks={backlinks} canEdit={canEdit} />, 404);
   }
   await services.notes.incrementView(note.id);
-  const [tags, backlinks, outgoing, resolver] = await Promise.all([
+  const links = parseWikilinks(note.body_md);
+  const [tags, backlinks, resolver] = await Promise.all([
     services.notes.tagsFor(note.id, principal.userId),
     services.notes.backlinks(note.id, principal.userId),
-    services.notes.outgoing(note.id, principal.userId),
-    resolveWiki(c.env.DB, principal.userId, handle, note.body_md),
+    resolveWiki(c.env.DB, principal.userId, handle, links),
   ]);
+  const outgoing = [...new Map(links.map(link => {
+    const resolution = resolver(link.rawTarget, link.targetHandle);
+    return [resolution.href, { ...resolution, slug: link.targetSlug }] as const;
+  })).values()];
   const bodyHtml = renderMarkdown(note.body_md, resolver);
   return c.html(
     <NotePage handle={handle} sessionHandle={sessionHandle(c)} slug={note.slug} title={note.title} stage={note.stage} scope={note.scope} updatedAt={note.updated_at} tags={tags} bodyHtml={bodyHtml} backlinks={backlinks} outgoing={outgoing} canEdit={canEdit} provenanceUrl={'/provenance/note/' + note.id} />,

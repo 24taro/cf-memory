@@ -1,7 +1,8 @@
 import type { FC } from "hono/jsx";
 import { Layout } from "./layout";
 import type { NoteSummary, SearchHit } from "../types";
-import type { OutgoingLink } from "../notes";
+import type { Backlink } from "../notes";
+import type { WikiResolution } from "../markdown";
 import type { BlockView } from "../services";
 import type { SkillSummary } from "../skills";
 import type { RecallSection } from "./recall-sections";
@@ -434,8 +435,8 @@ export const NotePage: FC<{
   updatedAt: number;
   tags: string[];
   bodyHtml: string;
-  backlinks: NoteSummary[];
-  outgoing: OutgoingLink[];
+  backlinks: Backlink[];
+  outgoing: Array<WikiResolution & { slug: string }>;
   canEdit: boolean;
 }> = (p) => (
   <Layout title={p.title} handle={p.handle} sessionHandle={p.sessionHandle}>
@@ -465,7 +466,7 @@ export const NotePage: FC<{
           <ul>
             {p.backlinks.length === 0 ? <li class="muted">まだありません。</li> : null}
             {p.backlinks.map((b) => (
-              <li><a href={`/@${p.handle}/n/${b.slug}`}>{b.title}</a></li>
+              <li><a href={`/@${b.owner_handle}/n/${b.slug}`}>{b.title}</a></li>
             ))}
           </ul>
         </div>
@@ -474,11 +475,11 @@ export const NotePage: FC<{
           <ul>
             {p.outgoing.length === 0 ? <li class="muted">まだありません。</li> : null}
             {p.outgoing.map((l) =>
-              l.resolved ? (
-                <li><a href={`/@${p.handle}/n/${l.target_slug}`}>{l.target_title ?? l.target_slug}</a></li>
+              l.exists ? (
+                <li><a href={l.href}>{l.title ?? l.slug}</a></li>
               ) : (
                 <li>
-                  <a class="wikilink stub" href={`/@${p.handle}/n/${l.target_slug}`}>{l.target_slug}</a>{" "}
+                  <a class="wikilink stub" href={l.href}>{l.slug}</a>{" "}
                   <span class="li-meta" style="display:inline">← 未執筆</span>
                 </li>
               ),
@@ -495,7 +496,7 @@ export const NotePage: FC<{
   </Layout>
 );
 
-export const MissingNotePage: FC<{ handle: string; sessionHandle?: string; slug: string; backlinks: NoteSummary[]; canEdit: boolean }> = (p) => (
+export const MissingNotePage: FC<{ handle: string; sessionHandle?: string; slug: string; backlinks: Backlink[]; canEdit: boolean }> = (p) => (
   <Layout title={p.slug} handle={p.handle} sessionHandle={p.sessionHandle}>
     <h1 class="muted">{p.slug}</h1>
     <p class="meta">このノートはまだ書かれていません。</p>
@@ -505,7 +506,7 @@ export const MissingNotePage: FC<{ handle: string; sessionHandle?: string; slug:
         <h3>← {p.backlinks.length}件のノートからリンクされています</h3>
         <ul class="list">
           {p.backlinks.map((b) => (
-            <li><a href={`/@${p.handle}/n/${b.slug}`}>{b.title}</a></li>
+            <li><a href={`/@${b.owner_handle}/n/${b.slug}`}>{b.title}</a></li>
           ))}
         </ul>
       </div>

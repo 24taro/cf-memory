@@ -555,6 +555,39 @@ describe("共有ノートは検索結果の slug でそのまま開ける", () =
     expect((back.backlinks ?? []).map((b) => b.slug)).toContain("bob-links-in");
   });
 
+  it("uses owner-specific browser links for shared notes and backlinks", async () => {
+    expect((await put(aliceToken, { slug: "wiki-shared", title: "Team guide", body_md: "Shared contents", shared: true })).ok).toBe(true);
+    expect((await put(aliceToken, { slug: "wiki-fallback", title: "Team checklist", body_md: "Shared checklist", shared: true })).ok).toBe(true);
+    expect((await put(aliceToken, { slug: "wiki-personal", title: "Personal title", body_md: "Private" })).ok).toBe(true);
+    expect((await put(bobToken, { slug: "wiki-shared", title: "My guide", body_md: "Personal contents" })).ok).toBe(true);
+    const made = await put(bobToken, {
+      slug: "wiki-directory", title: "Guide directory", shared: true,
+      body_md: "[[wiki-fallback]] [[wiki-shared]] [[@alice/wiki-shared]] [[@alice/wiki-personal|restricted reference]]",
+    });
+    expect(made.ok).toBe(true);
+
+    const page = await req("/@bob/n/wiki-directory", bobToken);
+    expect(page.ok).toBe(true);
+    const html = await page.text();
+    expect(html).toContain('class="wikilink" href="/@alice/n/wiki-fallback">Team checklist</a>');
+    expect(html).toContain('class="wikilink" href="/@bob/n/wiki-shared">My guide</a>');
+    expect(html).toContain('class="wikilink" href="/@alice/n/wiki-shared">Team guide</a>');
+    expect(html).toContain('class="wikilink stub" href="/@alice/n/wiki-personal"');
+    expect(html).not.toContain("Personal title");
+    expect(html).toContain('<li><a href="/@alice/n/wiki-shared">Team guide</a></li>');
+
+    const destination = await req("/@alice/n/wiki-fallback", aliceToken);
+    expect(await destination.text()).toContain('<li><a href="/@bob/n/wiki-directory">Guide directory</a></li>');
+  });
+
+  it("renders a note with over one hundred distinct wikilinks", async () => {
+    const body_md = Array.from({ length: 125 }, (_, index) => `[[release-step-${index + 1}]]`).join("\n");
+    expect((await put(aliceToken, { slug: "wiki-checklist", body_md })).ok).toBe(true);
+    const page = await req("/@alice/n/wiki-checklist", aliceToken);
+    expect(page.ok).toBe(true);
+    expect(await page.text()).toContain('href="/@alice/n/release-step-125"');
+  });
+
   it("個人ノートからのリンクは相手の backlinks に出ない", async () => {
     // 対照であり、漏洩の検査でもある。target_note_id が他人の行を指せるように
     // なった以上、リンク元の可視性を見落とすと「誰が何を参照しているか」が漏れる。

@@ -109,6 +109,10 @@ export interface OutgoingLink {
   position: number;
 }
 
+export interface Backlink extends NoteSummary {
+  owner_handle: string;
+}
+
 /** Caller input the repository refuses outright. Never retried by upsert's
  * conflict loop; the REST door answers with `status`, the MCP door with the message. */
 export class NoteInputError extends Error {
@@ -1039,21 +1043,18 @@ export class NotesRepo {
   // リンク行は作られる(upsert は kind を問わずリンクを更新する)ので、
   // 条件が無いとブロックの slug と title がバックリンク一覧に出る。一覧と検索は
   // ブロックを除くのに、ここだけが露出口になっていた。
-  async backlinks(noteId: string, viewerId: string): Promise<NoteSummary[]> {
+  async backlinks(noteId: string, viewerId: string): Promise<Backlink[]> {
     const vis = readableSqlFor("n", viewerId);
-    const access = vis.sql;
-    const anon = vis.args.length === 0;
-    const args: unknown[] = [noteId, ...vis.args];
     const res = await this.db
       .prepare(
         `SELECT DISTINCT n.id AS id, n.slug AS slug, n.title AS title,
-           n.kind AS kind, n.updated_at AS updated_at, n.created_at AS created_at
-         FROM links l JOIN notes n ON n.id=l.src_note_id
-         WHERE l.target_note_id=? AND n.deleted_at IS NULL AND n.kind != 'block' AND (${access})
+           n.kind AS kind, n.updated_at AS updated_at, n.created_at AS created_at, u.handle AS owner_handle
+         FROM links l JOIN notes n ON n.id=l.src_note_id JOIN users u ON u.id=n.user_id
+         WHERE l.target_note_id=? AND n.deleted_at IS NULL AND n.kind != 'block' AND ${vis.sql}
          ORDER BY n.updated_at DESC`,
       )
-      .bind(...args)
-      .all<Omit<NoteSummary, "tags">>();
+      .bind(noteId, ...vis.args)
+      .all<Omit<Backlink, "tags">>();
     return (res.results ?? []).map((r) => ({ ...r, tags: [] }));
   }
 
@@ -1075,21 +1076,18 @@ export class NotesRepo {
 
   /** Inbound links to a slug, including dangling ones from notes that reference a
    * not-yet-written target (the "what to write next" signal). Owner-only. */
-  async backlinksBySlug(slug: string, viewerId: string): Promise<NoteSummary[]> {
+  async backlinksBySlug(slug: string, viewerId: string): Promise<Backlink[]> {
     const vis = readableSqlFor("n", viewerId);
-    const access = vis.sql;
-    const anon = vis.args.length === 0;
-    const args: unknown[] = [slug, ...vis.args];
     const res = await this.db
       .prepare(
         `SELECT DISTINCT n.id AS id, n.slug AS slug, n.title AS title,
-           n.kind AS kind, n.updated_at AS updated_at, n.created_at AS created_at
-         FROM links l JOIN notes n ON n.id=l.src_note_id
-         WHERE l.target_slug=? AND n.deleted_at IS NULL AND n.kind != 'block' AND (${access})
+           n.kind AS kind, n.updated_at AS updated_at, n.created_at AS created_at, u.handle AS owner_handle
+         FROM links l JOIN notes n ON n.id=l.src_note_id JOIN users u ON u.id=n.user_id
+         WHERE l.target_slug=? AND n.deleted_at IS NULL AND n.kind != 'block' AND ${vis.sql}
          ORDER BY n.updated_at DESC`,
       )
-      .bind(...args)
-      .all<Omit<NoteSummary, "tags">>();
+      .bind(slug, ...vis.args)
+      .all<Omit<Backlink, "tags">>();
     return (res.results ?? []).map((r) => ({ ...r, tags: [] }));
   }
 
