@@ -49,7 +49,7 @@ separate sessions.
 | Session | Prompt |
 | --- | --- |
 | First | Our smoke test is called Blue Lantern. Repeat that name in your final reply. |
-| Next | What did we call our smoke test? |
+| Next | What did we call our smoke test? Answer without using tools. |
 
 Close the first session after its reply. Open the next one in the same
 repository. The SessionStart hook brings in the previous reply, so the agent

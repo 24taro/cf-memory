@@ -182,8 +182,8 @@ if [ -z "$CONNECTED" ] && [ "$CLIENTS" = 1 ] && [ "$CLIENT_FAILED" = 0 ]; then
   echo "Neither Claude Code nor Codex was found. Install one and run this script again."
 fi
 if [ -n "$CONNECTED" ]; then
-  echo "Restart your agent. It now keeps each prompt and final reply, and recalls"
-  echo "related notes and conversations at the start of every prompt."
+  echo "Restart your agent to record prompts and replies and recall related notes."
+  echo "A new session also receives the previous session's last reply for this Git repository."
 fi
 if [ "$CODEX" = 1 ]; then
   printf -v QUOTED_SECRETS_FILE '%q' "$PWD/$SECRETS_FILE"
