@@ -2,11 +2,12 @@
 // cf-memory CLI — the third door over the same store. Thin wrapper over the REST
 // API. Run: `node --experimental-strip-types cli/cf-memory.ts <cmd> …`
 import type { Dirent } from "node:fs";
-import { closeSync, constants, fstatSync, openSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, chmodSync, renameSync, rmSync, statSync, lstatSync, realpathSync, readlinkSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, readSync, writeFileSync, mkdirSync, readdirSync, existsSync, chmodSync, renameSync, rmSync, statSync, lstatSync, realpathSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { responseText } from "../cf-memory-agent/scripts/bounded.mjs";
 
 interface Config {
   url: string;
@@ -17,6 +18,9 @@ interface Config {
 const CONFIG_DIR = join(homedir(), ".cf-memory");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
 const DEFAULT_URL = "http://localhost:8787";
+const MAX_REQUEST_BYTES = 8 * 1024 * 1024;
+const MAX_RESPONSE_BYTES = 64 * 1024 * 1024;
+const MAX_ERROR_BYTES = 64 * 1024;
 
 function sameOrigin(left: string, right: string): boolean {
   try {
@@ -163,18 +167,28 @@ function readContext(flags: Record<string, string>): string | undefined {
 
 async function api(cfg: Config, method: string, path: string, body?: unknown): Promise<any> {
   validateServer(cfg.url, Boolean(cfg.key));
+  const requestBody = body === undefined ? undefined : JSON.stringify(body);
+  if (requestBody !== undefined && Buffer.byteLength(requestBody) > MAX_REQUEST_BYTES) {
+    throw new Error("request exceeds the 8 MiB body limit");
+  }
   let res: Response;
   try {
     res = await fetch(cfg.url.replace(/\/+$/, "") + path, {
       method,
       redirect: "error",
+      signal: AbortSignal.timeout(30_000),
       headers: { "content-type": "application/json", ...(cfg.key ? { authorization: `Bearer ${cfg.key}` } : {}) },
-      body: body === undefined ? undefined : JSON.stringify(body),
+      body: requestBody,
     });
   } catch (e) {
     throw new Error(`could not reach ${cfg.url} (${path}): ${e instanceof Error ? e.message : e} — set CF_MEMORY_URL=<url> or run 'login --url <url>' to change the target.`);
   }
-  const text = await res.text();
+  let text: string;
+  try {
+    text = await responseText(res, res.ok ? MAX_RESPONSE_BYTES : MAX_ERROR_BYTES);
+  } catch (e) {
+    throw new Error(`could not read the response for ${path}: ${e instanceof Error ? e.message : "response unavailable"}`);
+  }
   let json: any;
   try {
     json = text ? JSON.parse(text) : {};
@@ -267,7 +281,7 @@ function checkDirectories(root: string, directory: string, create: boolean): voi
     current = join(current, component);
     if (!lstatSync(current, { throwIfNoEntry: false })) {
       if (!create) return;
-      try { mkdirSync(current); } catch (error) {
+      try { mkdirSync(current, { mode: 0o700 }); } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
       }
     }
@@ -286,7 +300,7 @@ function transferRoot(dir: string, create: boolean): string {
   // The operator chose a destination outside this checkout. Resolve its
   // parent so ordinary system aliases such as macOS /tmp keep working.
   const parent = dirname(absolute);
-  if (create) mkdirSync(parent, { recursive: true });
+  if (create) mkdirSync(parent, { recursive: true, mode: 0o700 });
   const anchor = realpathSync(parent);
   const target = join(anchor, relative(parent, absolute));
   checkDirectories(anchor, target, create);
@@ -304,7 +318,7 @@ function writeTransferFile(root: string, target: string, contents: string): void
   const existing = checkOutputFile(root, target, true);
   const temporary = join(dirname(target), `.cf-memory-${randomUUID()}.tmp`);
   try {
-    writeFileSync(temporary, contents, { flag: "wx", mode: existing ? existing.mode & 0o777 : 0o666 });
+    writeFileSync(temporary, contents, { flag: "wx", mode: existing ? existing.mode & 0o777 : 0o600 });
     if (existing) chmodSync(temporary, existing.mode & 0o777);
     // Rename replaces the directory entry instead of writing through a link.
     renameSync(temporary, target);
@@ -315,10 +329,24 @@ function writeTransferFile(root: string, target: string, contents: string): void
 
 function readTransferFile(root: string, target: string): string {
   if (!checkOutputFile(root, target)) throw new Error(`file disappeared: ${target}`);
-  const file = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  return readMarkdownFile(target, true);
+}
+
+function readMarkdownFile(target: string, noFollow = false): string {
+  const file = openSync(target, constants.O_RDONLY | constants.O_NONBLOCK | (noFollow ? constants.O_NOFOLLOW : 0));
   try {
-    if (!fstatSync(file).isFile()) throw new Error(`expected a regular input file: ${target}`);
-    return readFileSync(file, "utf8");
+    const stat = fstatSync(file);
+    if (!stat.isFile()) throw new Error(`expected a regular input file: ${target}`);
+    if (stat.size > MAX_REQUEST_BYTES) throw new Error(`input exceeds the 8 MiB file limit: ${target}`);
+    const contents = Buffer.alloc(stat.size + 1);
+    let read = 0;
+    while (read < contents.length) {
+      const count = readSync(file, contents, read, contents.length - read, read);
+      if (!count) break;
+      read += count;
+    }
+    if (read !== stat.size) throw new Error(`input file size changed while reading: ${target}`);
+    return contents.toString("utf8", 0, read);
   } finally {
     closeSync(file);
   }
@@ -348,14 +376,16 @@ function blockLength(block: { value?: string; length?: number }): number | strin
   return block.length ?? block.value?.length ?? "?";
 }
 
-function readStdin(): Promise<string> {
-  return new Promise((resolve) => {
-    let data = "";
-    if (process.stdin.isTTY) return resolve("");
-    process.stdin.setEncoding("utf8");
-    process.stdin.on("data", (c) => (data += c));
-    process.stdin.on("end", () => resolve(data));
-  });
+async function readStdin(maxBytes = MAX_REQUEST_BYTES): Promise<string> {
+  if (process.stdin.isTTY) return "";
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of process.stdin) {
+    size += chunk.length;
+    if (size > maxBytes) throw new Error(`standard input exceeds the ${maxBytes} byte limit`);
+    chunks.push(chunk);
+  }
+  return Buffer.concat(chunks, size).toString("utf8");
 }
 
 async function main() {
@@ -392,7 +422,7 @@ async function main() {
       }
       const target = flags.url ?? cfg.url;
       if (keyInput >= 0) {
-        const key = (await readStdin()).trim();
+        const key = (await readStdin(8192)).trim();
         if (!key || /[\s\x00-\x1f\x7f]/.test(key)) throw new Error("--key-stdin requires a single API token on standard input");
         cfg.key = key;
       } else if ((availableKey && !sameOrigin(target, keySource)) || (!availableKey && saved.key && !sameOrigin(target, saved.url))) {
@@ -568,7 +598,7 @@ async function main() {
     case "skill push": {
       const file = _[0];
       if (!file) throw new Error("usage: cf-memory skill push <path-to-SKILL.md> [--slug s]");
-      const skill_md = readFileSync(file, "utf8");
+      const skill_md = readMarkdownFile(file);
       const out = await api(cfg, "POST", "/api/v1/skills", { slug: flags.slug, skill_md, scope: writeScope(flags) });
       console.log(`pushed skill ${out.slug} v${out.version}`);
       break;

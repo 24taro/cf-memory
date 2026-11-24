@@ -4,7 +4,7 @@
 import { describe, it, expect, beforeAll, afterAll } from "vitest";
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, lstatSync, symlinkSync, writeFileSync, chmodSync, realpathSync, existsSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, lstatSync, symlinkSync, truncateSync, writeFileSync, chmodSync, realpathSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { noteMd } from "../../src/serialize.ts";
@@ -59,7 +59,7 @@ function tree(dir, prefix = "") {
 }
 
 // Loopback stub. `notes` = the caller's notes ({slug,title,stage,body_md}), `bundle` = the skill-install bundle.
-async function stub({ notes = [], bundle } = {}) {
+async function stub({ notes = [], bundle, responseLength } = {}) {
   const requests = [];
   const server = createServer((req, res) => {
     const chunks = [];
@@ -68,7 +68,13 @@ async function stub({ notes = [], bundle } = {}) {
       const raw = Buffer.concat(chunks).toString("utf8");
       requests.push({ method: req.method, url: req.url, auth: req.headers.authorization, raw });
       const json = (status, body) => { res.writeHead(status, { "content-type": "application/json" }); res.end(JSON.stringify(body)); };
-      if (req.method === "GET" && req.url === "/api/v1/whoami") return json(200, { handle: "alice", actor: "user", scopes: ["notes:read"], token_status: "active" });
+      if (req.method === "GET" && req.url === "/api/v1/whoami") {
+        if (responseLength !== undefined) {
+          res.writeHead(200, { "content-type": "application/json", "content-length": String(responseLength) });
+          return res.end();
+        }
+        return json(200, { handle: "alice", actor: "user", scopes: ["notes:read"], token_status: "active" });
+      }
       if (req.method === "GET" && req.url === "/api/v1/notes?limit=200") return json(200, { notes: notes.map((n) => ({ slug: n.slug })) });
       const note = notes.find((n) => req.method === "GET" && req.url === `/api/v1/@alice/n/${n.slug.split("/").map(encodeURIComponent).join("/")}`);
       if (note) return json(200, note);
@@ -95,6 +101,40 @@ async function pullThenPush(name, notes) {
     return { pull, push, files, posts };
   } finally { await srv.close(); }
 }
+
+describe("CLI transfer limits and private output", () => {
+  it("does not read more server data than the CLI response limit", async () => {
+    const s = scratch("response-size"), srv = await stub({ responseLength: 64 * 1024 * 1024 + 1 });
+    try {
+      const result = await runCli(["whoami"], { env: serverEnv(s, srv), cwd: s.work });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("response exceeds limit");
+    } finally { await srv.close(); }
+  });
+
+  it("refuses to upload a Markdown file larger than the configured request limit", async () => {
+    const s = scratch("file-size"), srv = await stub();
+    try {
+      const file = join(s.work, "oversized.md");
+      writeFileSync(file, "");
+      truncateSync(file, 8 * 1024 * 1024 + 1);
+      const result = await runCli(["skill", "push", file], { env: serverEnv(s, srv), cwd: s.work });
+      expect(result.code).toBe(1);
+      expect(result.stderr).toContain("input exceeds the 8 MiB file limit");
+      expect(srv.requests).toHaveLength(0);
+    } finally { await srv.close(); }
+  });
+
+  it("writes pulled notes and their new directory with owner-only permissions", async () => {
+    const s = scratch("private-output"), srv = await stub({ notes: [{ slug: "draft", title: "Draft", body_md: "draft" }] });
+    try {
+      const result = await runCli(["pull", "garden"], { env: serverEnv(s, srv), cwd: s.work, umask: "000" });
+      expect(result.code, result.stderr).toBe(0);
+      expect(mode(join(s.work, "garden"))).toBe("0700");
+      expect(mode(join(s.work, "garden", "draft.md"))).toBe("0600");
+    } finally { await srv.close(); }
+  });
+});
 
 describe("cli-config-key-file-default-mode", () => {
   const login = (s, umask) => runCli(["login", "--url", "http://127.0.0.1:9", "--key-stdin", "--handle", "dummy"], { env: cliEnv(s), cwd: s.work, umask, stdin: `${DUMMY_KEY}\n` });

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { constants } from 'node:fs';
 import { open, link, unlink, lstat } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -175,7 +176,7 @@ export async function writeArchive(filename, archive) {
   finally { await out.close().catch(() => {}); await unlink(temporary).catch(() => {}); }
 }
 export async function readArchive(filename) {
-  const file = await open(filename, 'r');
+  const file = await open(filename, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const stat = await file.stat(); if (!stat.isFile() || stat.size > MAX_ARCHIVE) fail('portable archive exceeds limits');
     const pieces = []; let size = 0;

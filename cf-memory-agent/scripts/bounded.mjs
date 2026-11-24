@@ -1,6 +1,10 @@
 // Bound streamed input before allocating the whole response. Never include raw
 // payloads or provider error bodies in exceptions.
 export async function responseText(response, limit) {
+  if (Number(response.headers?.get('content-length')) > limit) {
+    void response.body?.cancel().catch(() => {});
+    throw Error('response exceeds limit');
+  }
   const reader = response.body?.getReader();
   if (!reader) return '';
   let size = 0;
@@ -10,7 +14,7 @@ export async function responseText(response, limit) {
       const { value, done } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > limit) { await reader.cancel(); throw Error('response exceeds limit'); }
+      if (size > limit) { void reader.cancel().catch(() => {}); throw Error('response exceeds limit'); }
       chunks.push(value);
     }
   } finally { reader.releaseLock(); }

@@ -11,3 +11,6 @@ declare module '*novelty-target.mjs' {
     body_md: string; content_hash: string; scope: string; shared: boolean;
   } | null;
 }
+declare module '*cf-memory-agent/scripts/bounded.mjs' {
+  export function responseText(response: Response, limit: number): Promise<string>;
+}
