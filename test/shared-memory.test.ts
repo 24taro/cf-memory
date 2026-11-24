@@ -595,8 +595,12 @@ describe("共有ノートは検索結果の slug でそのまま開ける", () =
       expect((await put(token, { slug, body_md: title, shared: true })).ok).toBe(true);
     }
     expect((await put(aliceToken, { slug: "graph-alice-source", body_md: `[[${slug}]]`, shared: true })).ok).toBe(true);
-    const many = Array.from({ length: 170 }, (_, i) => `[[graph-check-${i + 1}]]`).join(" ");
+    const many = Array.from({ length: 1_005 }, (_, i) => `[[graph-check-${i + 1}]]`).join(" ");
     expect((await put(bobToken, { slug: "graph-bob-source", body_md: `[[${slug}]] ${many}` })).ok).toBe(true);
+    await db.prepare(`WITH RECURSIVE fixture(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM fixture WHERE i<510)
+      INSERT INTO notes(id,user_id,slug,title,body_md,content_hash,created_at,updated_at)
+      SELECT 'preview-unlinked-'||i, ?, 'preview-unlinked-'||i, 'Unlinked note '||i, 'Reference', '', ?, ? FROM fixture`)
+      .bind(BOB.id, Date.now() + 10_000, Date.now() + 10_000).run();
 
     const response = await req("/api/v1/@bob/graph", bobToken);
     expect(response.ok).toBe(true);
@@ -606,7 +610,8 @@ describe("共有ノートは検索結果の slug でそのまま開ける", () =
     expect(graph.nodes).toContainEqual({ id: `@alice/${slug}`, label: "Alice graph target", href: `/@alice/n/${slug}`, stub: false });
     expect(graph.edges).toContainEqual({ source: "graph-bob-source", target: slug });
     expect(graph.edges).toContainEqual({ source: "graph-alice-source", target: `@alice/${slug}` });
-    expect(graph.nodes.length).toBeGreaterThan(170);
+    expect(graph.nodes.length).toBeGreaterThan(1_500);
+    expect(graph.edges.length).toBeGreaterThan(1_005);
 
     const web = await req("/@bob/network", bobToken);
     expect(web.ok).toBe(true);
@@ -616,6 +621,7 @@ describe("共有ノートは検索結果の slug でそのまま開ける", () =
     const preview = JSON.parse(payload!.replaceAll("&quot;", '"')) as import("../src/serialize").GraphData;
     expect(preview.nodes.length).toBe(150);
     expect(preview.edges.length).toBeLessThanOrEqual(300);
+    expect(preview.edges).toContainEqual({ source: "graph-alice-source", target: `@alice/${slug}` });
   });
 
   it("個人ノートからのリンクは相手の backlinks に出ない", async () => {

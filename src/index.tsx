@@ -359,21 +359,30 @@ async function resolveWiki(db: D1Database, viewerId: string, handle: string, lin
 
 // A caller's own graph includes notes they can read, including shared notes.
 // Keep simple slugs for unique nodes and qualify collisions by their owner.
-async function buildGraph(db: D1Database, userId: string, isOwner: boolean): Promise<GraphData> {
+const WEB_GRAPH_NOTE_LIMIT = 500;
+const WEB_GRAPH_EDGE_LIMIT = 1000;
+async function buildGraph(db: D1Database, userId: string, isOwner: boolean, mode: "full" | "preview" = "full"): Promise<GraphData> {
   if (!isOwner) return { nodes: [], edges: [] };
-  type GraphNote = { id: string; user_id: string; handle: string; slug: string; title: string; shared: number };
+  const preview = mode === "preview";
+  type GraphNote = { id: string; user_id: string; handle: string; slug: string; title: string; shared: number; created_at: number };
   const vis = readableSqlFor("n", userId);
+  const connectedFirst = `((EXISTS(SELECT 1 FROM links WHERE src_note_id=n.id AND kind='wikilink'))
+    OR (EXISTS(SELECT 1 FROM links WHERE target_note_id=n.id AND kind='wikilink'))) DESC,`;
   const notesRes = await db
-    .prepare(`SELECT n.id,n.user_id,u.handle,n.slug,n.title,n.shared FROM notes n JOIN users u ON u.id=n.user_id
+    .prepare(`SELECT n.id,n.user_id,u.handle,n.slug,n.title,n.shared,n.created_at FROM notes n JOIN users u ON u.id=n.user_id
       WHERE ${vis.sql} AND n.deleted_at IS NULL AND n.kind!='block'
-      ORDER BY (n.user_id=?) DESC,n.created_at,n.id`)
-    .bind(...vis.args, userId)
+      ORDER BY ${preview ? connectedFirst : ""}(n.user_id=?) DESC,${preview ? "n.updated_at DESC" : "n.created_at"},n.id
+      ${preview ? "LIMIT ?" : ""}`)
+    .bind(...vis.args, userId, ...(preview ? [WEB_GRAPH_NOTE_LIMIT + 1] : []))
     .all<GraphNote>();
+  const noteRows = preview ? notesRes.results.slice(0, WEB_GRAPH_NOTE_LIMIT).sort((a, b) =>
+    Number(b.user_id === userId) - Number(a.user_id === userId) || a.created_at - b.created_at || a.id.localeCompare(b.id)) : notesRes.results;
+  const noteLimitReached = noteRows.length < notesRes.results.length;
   const nodes: GraphNode[] = [];
   const displayId = new Map<string, string>();
   const bySlug = new Map<string, GraphNote[]>();
   const owners = new Map<string, string>();
-  for (const note of notesRes.results) {
+  for (const note of noteRows) {
     const existing = bySlug.get(note.slug) ?? [];
     const id = existing.length ? `@${note.handle}/${note.slug}` : note.slug;
     existing.push(note);
@@ -387,17 +396,22 @@ async function buildGraph(db: D1Database, userId: string, isOwner: boolean): Pro
     .prepare(`SELECT s.id AS source_id,s.user_id AS source_owner,l.target_slug,l.target_note_id
       FROM links l JOIN notes s ON s.id=l.src_note_id
       WHERE ${srcVis.sql} AND s.deleted_at IS NULL AND s.kind!='block' AND l.kind='wikilink'
-      ORDER BY s.created_at,l.position,l.id`)
-    .bind(...srcVis.args)
+        ${preview ? "AND s.id IN (SELECT value FROM json_each(?))" : ""}
+      ORDER BY s.created_at,l.position,l.id ${preview ? "LIMIT ?" : ""}`)
+    .bind(...srcVis.args, ...(preview ? [JSON.stringify(noteRows.map(note => note.id)), WEB_GRAPH_EDGE_LIMIT + 1] : []))
     .all<{ source_id: string; source_owner: string; target_slug: string; target_note_id: string | null }>();
+  const edgeRows = preview ? edgesRes.results.slice(0, WEB_GRAPH_EDGE_LIMIT) : edgesRes.results;
   const edges: GraphData["edges"] = [];
   const stubSeen = new Set<string>();
-  for (const edge of edgesRes.results) {
+  for (const edge of edgeRows) {
     const source = displayId.get(edge.source_id);
     if (!source) continue;
     // Stored IDs keep a renamed target connected. Resolve older and dangling
     // links against the visible rows using the source owner's namespace first.
     let target = edge.target_note_id ? displayId.get(edge.target_note_id) : undefined;
+    // The target may have been omitted by the note limit. Leave the edge out
+    // of the preview so an existing destination is never depicted as unwritten.
+    if (noteLimitReached && edge.target_note_id && !target) continue;
     if (!target) {
       const candidates = bySlug.get(edge.target_slug);
       const found = candidates?.find(note => note.user_id === edge.source_owner) ?? candidates?.find(note => note.shared === 1);
@@ -412,7 +426,8 @@ async function buildGraph(db: D1Database, userId: string, isOwner: boolean): Pro
     }
     edges.push({ source, target });
   }
-  return { nodes, edges };
+  const partial = noteLimitReached || edgeRows.length < edgesRes.results.length;
+  return { nodes, edges, ...(partial ? { partial: true } : {}) };
 }
 
 // ---------------------------------------------------------------- web (human)
@@ -576,7 +591,7 @@ app.get(`${H}/network`, async (c) => {
   const handle = c.req.param("h").slice(1);
   const user = await getUserByHandle(c.env.DB, handle);
   if (!user) return c.notFound();
-  const g = await buildGraph(c.env.DB, user.id, principal.userId === user.id);
+  const g = await buildGraph(c.env.DB, user.id, principal.userId === user.id, "preview");
   // Seed every node at degree 0 FIRST (issue #33) — building `deg` from
   // g.edges alone never registers a node with zero in/out links, so an
   // orphan silently never appears in topConnected even though it's counted
@@ -596,7 +611,7 @@ app.get(`${H}/network`, async (c) => {
   const ids = new Set(graphNodes.map(node => node.id));
   const graphEdges = g.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).slice(0, 300);
   const graph = { nodes: graphNodes, edges: graphEdges };
-  const partial = graphNodes.length < g.nodes.length || graphEdges.length < g.edges.length;
+  const partial = g.partial || graphNodes.length < g.nodes.length || graphEdges.length < g.edges.length;
   return c.html(<NetworkPage handle={handle} sessionHandle={sessionHandle(c)} graph={graph} partial={partial} topConnected={topConnected} edges={edges} nonce={c.var.cspNonce} />);
 });
 

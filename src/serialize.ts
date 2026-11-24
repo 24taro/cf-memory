@@ -26,6 +26,7 @@ export interface GraphNode {
 export interface GraphData {
   nodes: GraphNode[];
   edges: Array<{ source: string; target: string }>;
+  partial?: boolean;
 }
 
 function iso(ms: number): string {
