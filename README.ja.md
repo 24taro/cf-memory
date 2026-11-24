@@ -153,6 +153,13 @@ sed -n 's/^API_TOKEN=/Authorization: Bearer /p' .dev.vars |
   curl -fsS -H @- http://localhost:8787/api/v1/whoami
 ```
 
+依存関係の導入後、型チェックとテストを実行できます。
+
+```bash
+npm run typecheck
+npm test -- --maxWorkers=1
+```
+
 ## ライセンス
 
 [MIT](LICENSE)

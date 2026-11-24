@@ -192,16 +192,15 @@ you created for the instance. Delete `.cf-memory.secrets` and
 
 ## More
 
-- [Web pages behind Cloudflare Access](docs/WEB-ACCESS.md): read and edit your notes in a browser.
-- [Experimental team mode](docs/TEAM-MODE.md): several people on one instance, with an OAuth authorization server.
-- [The agent plugin](cf-memory-agent/README.md): what each hook does, the local spool, settings.
-- [Back up and restore memory](cf-memory-agent/README.md#back-up-and-restore-memory): move notes and skills with their attachments and provenance.
-- [Security](SECURITY.md): the trust model and how to report a problem.
+- Read and edit notes in a browser. [Cloudflare Access setup](docs/WEB-ACCESS.md)
+- Share an instance with invited members using an OAuth authorization server. [Experimental team mode](docs/TEAM-MODE.md)
+- Configure hooks and the local queue. [Agent plugin](cf-memory-agent/README.md)
+- Move notes, skills, attachments, and provenance. [Back up and restore memory](cf-memory-agent/README.md#back-up-and-restore-memory)
+- Review the trust model and report a problem. [Security policy](SECURITY.md)
 
 ## Develop
 
-Initialize both local D1 databases and create a development-only token before
-starting Wrangler:
+The local Worker uses both D1 databases and a development-only token.
 
 ```bash
 npm ci
@@ -213,15 +212,14 @@ fi
 npm run dev
 ```
 
-In another terminal, check the local instance without changing any saved client
-settings:
+From another terminal, check the local instance with the development token.
 
 ```bash
 sed -n 's/^API_TOKEN=/Authorization: Bearer /p' .dev.vars |
   curl -fsS -H @- http://localhost:8787/api/v1/whoami
 ```
 
-Run the checks with:
+Run the type check and the test suite after installing dependencies.
 
 ```bash
 npm run typecheck
