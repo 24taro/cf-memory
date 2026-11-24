@@ -1,5 +1,7 @@
 # cf-memory
 
+[![CI](https://github.com/24taro/cf-memory/actions/workflows/ci.yml/badge.svg)](https://github.com/24taro/cf-memory/actions/workflows/ci.yml) · [MIT License](LICENSE)
+
 **Give Claude Code and Codex a memory that lives in your Cloudflare account.**
 Resume a repository in a new session with yesterday's decisions, search the
 conversation that justified them, and keep the useful parts as notes.
@@ -41,14 +43,29 @@ it finds. Use `./install.sh --no-client` for the Worker alone.
 
 ### Try a handoff
 
-In a Git repository, ask your agent to reply with a test fact such as
-“Our smoke test is called Blue Lantern.” Open a fresh session in the same
-repository and ask “What did we call our smoke test?” Keep the name out of
-the second prompt. If the fact is missing, check the hooks and connection:
+Open Claude Code or Codex in a Git repository and use these two prompts in
+separate sessions.
+
+| Session | Prompt |
+| --- | --- |
+| First | Our smoke test is called Blue Lantern. Repeat that name in your final reply. |
+| Next | What did we call our smoke test? |
+
+Close the first session after its reply. Open the next one in the same
+repository. The SessionStart hook brings in the previous reply, so the agent
+can answer **Blue Lantern** from that context. Both clients can use the same
+handoff when they connect to the same instance.
+
+If the new session misses the fact, check the hooks and connection from the
+cf-memory checkout.
 
 ```bash
 node cf-memory-agent/scripts/agent.mjs doctor
 ```
+
+For older conversations, ask the agent to search the log by keyword, such as
+`log_search` for `Blue Lantern`. Save a decision as a note when you want it to
+surface in future keyword Recall.
 
 ### Update or resume setup
 
@@ -161,20 +178,13 @@ For Codex, also remove the `CF_MEMORY_MCP_URL` and `CF_MEMORY_ACCESS_TOKEN`
 export lines from your shell profile and open a new shell. The uninstaller
 keeps the local spool and diagnostics in `~/.cf-memory/v3`.
 
-To permanently remove the hosted instance and its data, select its Cloudflare
-account and run:
-
-```bash
-npx wrangler delete
-npx wrangler d1 delete cf-memory
-npx wrangler d1 delete cf-memory-logs
-npx wrangler r2 bucket delete cf-memory-bundles
-```
-
-Empty the R2 bucket first if it contains objects. If you set up Cloudflare
-Access or a custom domain, remove the associated settings in Cloudflare. Once
-you no longer need the API token, delete `.cf-memory.secrets` and
-`.cf-memory.deployment.json` from the checkout.
+To remove the hosted instance, open its original account in Cloudflare and
+match the Worker name and account against `.cf-memory.deployment.json` before
+deleting it. To also remove its data, match both D1 database IDs and the R2
+bucket in that file. Delete the databases and empty and delete the bucket.
+Remove any associated Cloudflare Access or custom-domain configuration that
+you created for the instance. Delete `.cf-memory.secrets` and
+`.cf-memory.deployment.json` from the checkout when you finish.
 
 ## More
 
