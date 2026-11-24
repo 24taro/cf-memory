@@ -901,6 +901,9 @@ describe("tool errors (review 2)", () => {
     const logged: string[] = [];
     toolErrorText("notes_put", new SyntaxError(`Unexpected token 'p', "private body" is not valid JSON`), l => logged.push(l));
     expect(logged[0]).not.toContain("private body");
+    toolErrorText("notes_put", new TypeError("Temporary private contents"), l => logged.push(l));
+    expect(logged[1]).not.toContain("Temporary private contents");
+    expect(logged[1]).toContain('"error":"TypeError"');
   });
 
   it("server_status hides an engine error from a non-log tool too", async () => {

@@ -234,6 +234,19 @@ describe("監査が見つけた穴（2026-08-21）", () => {
     expect(ownHits.map((h) => h.slug)).toContain("syn-target");
   });
 
+  it("searches a bounded set of aliases from a larger saved dictionary", async () => {
+    const aliases = Array.from({ length: 12 }, (_, index) => `syn-fixture-${String(index).padStart(2, "0")}`);
+    await db.batch(aliases.map(alias => db.prepare("INSERT INTO synonyms (id,user_id,term,synonym) VALUES (?,?,?,?)")
+      .bind(crypto.randomUUID(), ALICE.id, "boundedlookup", alias)));
+    await put(aliceToken, { slug: "syn-recent-alias", body_md: aliases[0] });
+    await put(aliceToken, { slug: "syn-excess-alias", body_md: aliases.at(-1) });
+    const response = await req("/api/v1/search?q=boundedlookup&mode=keyword", aliceToken);
+    const { hits } = await response.json() as { hits: Array<{ slug: string }> };
+    const selected = hits.map(hit => hit.slug);
+    expect(selected).toContain("syn-recent-alias");
+    expect(selected).not.toContain("syn-excess-alias");
+  });
+
   it("共有ノートへの追記が、影の個人コピーを作らない", async () => {
     // 読みは「自分の行 → 共有行」で解決するのに、書きは自分の名前空間に固定
     // されていた。共有ノートに書くと同じ slug の別の行ができ、以後その人には

@@ -21,6 +21,19 @@ export function now(): number {
   return Date.now();
 }
 
+/** Keep engine diagnostics while leaving exception messages out of runtime logs. */
+export function storageErrorDetails(error: unknown) {
+  const name = error instanceof Error ? error.name : "Error";
+  const message = error instanceof Error ? error.message : "";
+  const codes = [...new Set(message.match(/\b(?:D1_(?:[A-Z]+_)*ERROR|SQLITE_[A-Z0-9_]+)\b/g) ?? [])].slice(0, 3);
+  const missing = codes.length ? /\bno such (?:table|column|function|index): ([a-z_][a-z0-9_.]{0,79})(?=:|\s|$)/i.exec(message)?.[1] : undefined;
+  return {
+    error: /^[a-z][a-z0-9_]{0,47}$/i.test(name) ? name : "Error",
+    ...(codes.length ? { engine_codes: codes } : {}),
+    ...(missing ? { missing_schema_identifier: missing } : {}),
+  };
+}
+
 /** decision 10: parse a bi-temporal validity value into a ms epoch. Accepts a
  * ms-epoch number (or all-digit string) or an ISO/date string (via Date.parse).
  * Returns undefined for absent/unparseable input so the write path PRESERVES the

@@ -290,10 +290,12 @@ export function shortTerms(q: string): string[] {
   return [...new Set(words)].slice(0, 4);
 }
 
+export const MAX_SYNONYM_CHARS = 160;
+export const MAX_SYNONYMS_PER_REQUEST = 50;
+const MAX_SYNONYM_TERMS = 32;
+const MAX_EXPANSIONS_PER_TERM = 8;
+
 export class SearchService {
-  /** 閲覧者ごとのキャッシュ。1つの Map を使い回すと、最初に検索した人の
-   * 同義語が以後の全員に効いてしまう。 */
-  private synCache = new Map<string, Map<string, string[]>>();
   constructor(private db: D1Database) {}
 
   /** 同義語は書いた人の設定。
@@ -302,24 +304,23 @@ export class SearchService {
    * 記録しているのに読み取りで無視していたので、他人が登録した同義語が自分の
    * 検索語を勝手に広げていた —— 結果が静かに変わるだけで、気づく手段が無い。
    * 共有ノートと違い、同義語に「共有」の概念は無い(誰の語彙かで意味が変わる)。 */
-  private async synonymsFor(viewerId: string): Promise<Map<string, string[]>> {
-    const cached = this.synCache.get(viewerId);
-    if (cached) return cached;
+  private async synonymsFor(viewerId: string, terms: string[]): Promise<Map<string, string[]>> {
+    const termsToExpand = terms.filter(term => term.length <= MAX_SYNONYM_CHARS).slice(0, MAX_SYNONYM_TERMS);
+    if (!viewerId || !termsToExpand.length) return new Map();
     const started = Date.now();
     try {
       const res = await this.db
-        .prepare("SELECT term, synonym FROM synonyms WHERE user_id = ?")
-        .bind(viewerId)
-        .all<{ term: string; synonym: string }>();
-      const m = new Map<string, string[]>();
-      for (const r of res.results ?? []) {
-        const k = r.term.toLowerCase();
-        const a = m.get(k) ?? [];
-        a.push(r.synonym.toLowerCase());
-        m.set(k, a);
-      }
-      this.synCache.set(viewerId, m);
-      return m;
+        .prepare(`SELECT word.value AS term, (
+          SELECT json_group_array(synonym) FROM (
+            SELECT substr(synonym,1,?) AS synonym FROM synonyms
+            WHERE user_id=? AND term=word.value ORDER BY synonyms.synonym LIMIT ?
+          )
+        ) AS aliases FROM json_each(?) word`)
+        .bind(MAX_SYNONYM_CHARS + 1, viewerId, MAX_EXPANSIONS_PER_TERM, JSON.stringify(termsToExpand))
+        .all<{ term: string; aliases: string }>();
+      return new Map(res.results.map(row => [
+        row.term, (JSON.parse(row.aliases) as string[]).filter(alias => alias.length > 0 && alias.length <= MAX_SYNONYM_CHARS).map(alias => alias.toLowerCase()),
+      ]));
     } finally { logSlowRead('search_synonyms', started); }
   }
 
@@ -390,13 +391,12 @@ export class SearchService {
       const nowMs = now();
 
       type Lane = { ids: string[]; weight?: number; rankConstant?: number };
-      // Prime the existing caller-specific cache once, before parallel FTS
-      // lanes would otherwise repeat the same synonyms query. No global state.
-      await this.synonymsFor(principal.anonymous ? '' : principal.userId);
+      const focus = opts.focusFirstQuestion ? leadingQuestion(q) : null;
+      const terms = [...new Set([...lexicalTokens(q), ...(focus ? lexicalTokens(focus) : [])])];
+      const synonyms = await this.synonymsFor(principal.anonymous ? '' : principal.userId, terms);
       const lexicalLanes = new Map<Kind, Lane[]>();
       for (const kind of kinds) {
         const specs: Array<{ query: string; match?: string; weight?: number; rankConstant?: number }> = [];
-        const focus = opts.focusFirstQuestion ? leadingQuestion(q) : null;
         if (focus) specs.push({ query: focus, rankConstant: 5 });
         const japanese = opts.focusJapaneseProse ? japaneseProseMatch(q) : null;
         if (japanese) specs.push({ query: q, match: japanese, rankConstant: 5 });
@@ -410,7 +410,7 @@ export class SearchService {
         // ACL/scope/lifecycle SQL. Promise.all observes every failure and retains
         // input order even when the exact/focused/OR lanes finish out of order.
         lexicalLanes.set(kind, await Promise.all(specs.map(async spec => ({
-          ids: (await this.fts(kind, principal, spec.query, limit * 3, context, excludeArchived, nowMs, filters, spec.match)).map(id => `${kind}:${id}`),
+          ids: (await this.fts(kind, principal, spec.query, limit * 3, context, excludeArchived, nowMs, filters, synonyms, spec.match)).map(id => `${kind}:${id}`),
           weight: spec.weight, rankConstant: spec.rankConstant,
         }))));
       }
@@ -431,8 +431,8 @@ export class SearchService {
     } finally { logSlowRead('search', started); }
   }
 
-  private async fts(kind: Kind, principal: Principal, q: string, k: number, context: string[], excludeArchived: boolean, nowMs: number, filters: SearchFilters, matchOverride?: string): Promise<string[]> {
-    const match = matchOverride ?? expandedMatch(q, await this.synonymsFor(principal.anonymous ? "" : principal.userId));
+  private async fts(kind: Kind, principal: Principal, q: string, k: number, context: string[], excludeArchived: boolean, nowMs: number, filters: SearchFilters, synonyms: Map<string, string[]>, matchOverride?: string): Promise<string[]> {
+    const match = matchOverride ?? expandedMatch(q, synonyms);
     if (!match) return [];
     const t = TABLE[kind];
     const vis = this.accessClause(kind, principal, context);

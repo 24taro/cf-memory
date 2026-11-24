@@ -2,14 +2,14 @@ import { Hono, type Context } from "hono";
 import type { FC } from "hono/jsx";
 import { allows, callerIsAdmin, effectiveScopes } from "./auth";
 import { protectedResourceMetadata, unauthorizedChallenge } from "./rs-introspect";
-import { estimateTokens, now, parseValidTs, ulid } from "./db";
+import { estimateTokens, now, parseValidTs, storageErrorDetails, ulid } from "./db";
 import { isNoteKind, isNoteType } from "./spaces";
 import { BlockFullError } from "./memory";
 import { parseWikilinks, uniqueTargets } from "./links";
 import { renderMarkdown, type WikiResolver } from "./markdown";
 import { handleMcp, MCP_TOOL_NAMES, storedTitle } from "./mcp";
 import { NoteInputError, StaleUpsertError, storedAs } from "./notes";
-import { searchFilters, SearchInputError, standaloneSearch } from "./search";
+import { MAX_SYNONYM_CHARS, MAX_SYNONYMS_PER_REQUEST, searchFilters, SearchInputError, standaloneSearch } from "./search";
 import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData } from "./serialize";
 import { blockWriteResult, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
 import { attachmentDisposition, BundleQuotaError, BundlesUnconfiguredError, MAX_BUNDLE_FILE_BYTES, resolveServeContentType, validateBundlePath } from "./bundle";
@@ -35,6 +35,25 @@ type Vars = {
   // slipped an inline <script> past the sanitizer still can't execute.
   cspNonce: string;
 };
+
+class JsonInputError extends Error {}
+
+async function jsonObject<T extends object>(request: { text(): Promise<string> }, optional = false): Promise<T> {
+  const text = await request.text();
+  if (optional && !text.trim()) return {} as T;
+  let body: unknown;
+  try { body = JSON.parse(text); }
+  catch { throw new JsonInputError("invalid JSON body"); }
+  if (!body || typeof body !== "object" || Array.isArray(body)) throw new JsonInputError("expected a JSON object");
+  return body as T;
+}
+
+function requireStringFields(body: object, ...fields: string[]): void {
+  for (const name of fields) {
+    const value = (body as Record<string, unknown>)[name];
+    if (value != null && typeof value !== "string") throw new JsonInputError(`${name} must be a string`);
+  }
+}
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 const OAUTH_METADATA_PATH = "/.well-known/oauth-protected-resource/mcp";
@@ -272,14 +291,16 @@ app.get(OAUTH_METADATA_PATH, (c) => {
 // retryable toolError, so this only shapes the REST/web responses.)
 app.onError((err, c) => {
   if (err instanceof RequestBodyTooLargeError) return c.json({ error: err.message }, 413);
+  if (err instanceof JsonInputError) return c.json({ error: err.message }, 400);
   if (err instanceof StaleUpsertError) {
     return c.json({ error: "conflict", message: "write conflict under concurrent updates; retry the request" }, 409, { "Retry-After": "1" });
   }
   // Input the note repository refuses (an over-long body, an unknown kind) is the
   // caller's to fix, not a 500.
   if (err instanceof NoteInputError) return c.json({ error: err.message }, err.status);
-  console.error(err);
-  return c.json({ error: "internal", message: "internal server error" }, 500);
+  const code = crypto.randomUUID().slice(0, 8);
+  console.error("[http] request_error", JSON.stringify({ code, ...storageErrorDetails(err) }));
+  return c.json({ error: "internal", message: "internal server error", code }, 500);
 });
 
 // Every c.notFound() call on the human/web door (unknown handle, note, skill,
@@ -980,7 +1001,8 @@ api.post("/notes", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
   const { services, principal } = c.var;
-  const b = await c.req.json<{ slug?: string; title?: string; body_md: string; tags?: string[]; kind?: "note" | "journal" | "observation"; type?: "user" | "feedback" | "project" | "reference"; shared?: boolean; scope?: string; valid_from?: number | string; valid_until?: number | string; supersedes?: string }>();
+  const b = await jsonObject<{ slug?: string; title?: string; body_md: string; tags?: string[]; kind?: "note" | "journal" | "observation"; type?: "user" | "feedback" | "project" | "reference"; shared?: boolean; scope?: string; valid_from?: number | string; valid_until?: number | string; supersedes?: string }>(c.req);
+  requireStringFields(b, "slug", "title", "body_md");
   if (!b.slug?.trim() && !b.title?.trim() && !b.body_md?.trim()) return c.json({ error: "empty note: provide at least a slug, title, or body_md" }, 400);
   if (b.type !== undefined && !isNoteType(b.type)) {
     return c.json({ error: "type must be one of user, feedback, project, reference" }, 400);
@@ -1025,7 +1047,8 @@ api.post("/notes", async (c) => {
 api.post("/notes/:slug/rename", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
-  const b = await c.req.json<{ new_slug?: string }>().catch((): { new_slug?: string } => ({}));
+  const b = await jsonObject<{ new_slug?: string }>(c.req, true);
+  requireStringFields(b, "new_slug");
   if (!b.new_slug?.trim()) return c.json({ ok: false, reason: "provide new_slug" }, 400);
   const r = await c.var.services.notes.rename(c.var.principal, c.req.param("slug"), b.new_slug);
   return r.ok ? c.json({ ok: true, slug: r.note.slug }) : c.json({ ok: false, reason: r.reason }, 400);
@@ -1058,7 +1081,9 @@ api.patch("/notes/:id", async (c) => {
   // the upsert below, which resolves by slug, found no live own row and could
   // write the tombstone's text into whatever else answers to that slug.
   if (!note || note.user_id !== principal.userId || note.deleted_at) return c.json({ error: "not found" }, 404);
-  const b = await c.req.json<Partial<{ title: string; body_md: string; tags: string[]; scope: string; valid_from: number | string; valid_until: number | string; supersedes: string }>>();
+  const b = await jsonObject<Partial<{ title: string; body_md: string; tags: string[]; scope: string; valid_from: number | string; valid_until: number | string; supersedes: string }>>(c.req);
+  requireStringFields(b, "title", "body_md");
+  if (b.tags != null && !Array.isArray(b.tags)) throw new JsonInputError("tags must be an array");
   const { note: updated } = await services.notes.upsert(principal, {
     slug: note.slug,
     // Bind the write to the row authorised above: upsert refuses (404) unless the
@@ -1159,7 +1184,12 @@ api.get("/skills", async (c) => {
 api.post("/skills", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
-  const b = await c.req.json<SkillInput>();
+  const b = await jsonObject<SkillInput>(c.req);
+  requireStringFields(b, "slug", "name", "description", "instructions", "skill_md", "version", "scope");
+  if (b.createOnly != null && typeof b.createOnly !== "boolean") throw new JsonInputError("createOnly must be a boolean");
+  if (b.frontmatter != null && (typeof b.frontmatter !== "object" || Array.isArray(b.frontmatter))) {
+    throw new JsonInputError("frontmatter must be an object");
+  }
   const { skill, created } = await c.var.services.skills.upsert(c.var.principal, b);
   const { principal } = c.var;
   return c.json({ id: skill.id, slug: skill.slug, ...(allows(principal, "notes:read") ? { name: skill.name, version: skill.version } : {}), created }, created ? 201 : 200);
@@ -1184,7 +1214,7 @@ api.post("/skills/:slug/log-use", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
   const { services, principal } = c.var;
-  const b = await c.req.json<{ outcome?: string; note?: string }>().catch(() => ({}) as { outcome?: string; note?: string });
+  const b = await jsonObject<{ outcome?: string; note?: string }>(c.req, true);
   if (b.outcome !== "success" && b.outcome !== "partial" && b.outcome !== "failure") return c.json({ error: "outcome must be success | partial | failure" }, 400);
   const s = await services.skills.getBySlug(principal.userId, slugify(c.req.param("slug")));
   const res = s ? await services.skills.logUse(principal, s.id, b.outcome, typeof b.note === "string" ? b.note : undefined) : null;
@@ -1252,7 +1282,9 @@ api.post("/recall", async (c) => {
   const denied = requireRead(c);
   if (denied) return denied;
   const { services, principal, budget } = c.var;
-  const b = await c.req.json<{ query?: string; budget?: number; context?: string }>().catch(() => ({}) as { query?: string; budget?: number; context?: string });
+  const b = await jsonObject<{ query?: string; budget?: number; context?: string }>(c.req, true);
+  requireStringFields(b, "query");
+  if (b.budget != null && !Number.isFinite(b.budget)) throw new JsonInputError("budget must be numeric");
   // #117: `context` (caller's current project) narrows the note-backed tiers to
   // that scope + globals. Passed RAW as recall()'s 5th arg (null → cross-scope).
   const pack = await services.recall.recall(principal, b.query ?? "", b.budget ?? budget, undefined, typeof b.context === "string" ? b.context : null);
@@ -1268,7 +1300,9 @@ api.post("/prompt", async (c) => {
   const denied = requireRead(c);
   if (denied) return denied;
   const { services, principal, budget } = c.var;
-  const b = await c.req.json<{ query?: string; budget?: number; context?: string }>().catch(() => ({}) as { query?: string; budget?: number; context?: string });
+  const b = await jsonObject<{ query?: string; budget?: number; context?: string }>(c.req, true);
+  requireStringFields(b, "query");
+  if (b.budget != null && !Number.isFinite(b.budget)) throw new JsonInputError("budget must be numeric");
   const query = b.query ?? "";
   const reqBudget = b.budget ?? budget;
   const overhead = estimateTokens(buildPrompt(principal.handle, query, ""));
@@ -1286,9 +1320,7 @@ api.get("/memory/blocks", async (c) => {
 api.patch("/memory/blocks/:label", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
-  const body: unknown = await c.req.json().catch(() => null);
-  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "expected a JSON object" }, 400);
-  const { value, char_limit, replace, op: requestedOp } = body as Record<string, unknown>;
+  const { value, char_limit, replace, op: requestedOp } = await jsonObject<Record<string, unknown>>(c.req);
   const op = requestedOp ?? "set";
   if (op !== "set" && op !== "append" && op !== "replace") return c.json({ error: "invalid block operation" }, 400);
   // append/replace answer according to the stored block (length, block_full, a
@@ -1328,7 +1360,8 @@ api.post(`/:h{@[^/]+}/skills/:slug/fork`, async (c) => {
   if (!user) return c.json({ error: "not found" }, 404);
   const src = await services.skills.getBySlug(user.id, slugify(c.req.param("slug")));
   if (!src || !isReadable(src, principal)) return c.json({ error: "not found" }, 404);
-  const b = await c.req.json<{ new_slug?: string }>().catch(() => ({}) as { new_slug?: string });
+  const b = await jsonObject<{ new_slug?: string }>(c.req, true);
+  requireStringFields(b, "new_slug");
   const { skill } = await services.skills.fork(principal, src, b.new_slug);
   return c.json({ id: skill.id, slug: skill.slug, parent: src.slug }, 201);
 });
@@ -1337,11 +1370,21 @@ api.post(`/:h{@[^/]+}/skills/:slug/fork`, async (c) => {
 api.post("/synonyms", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
-  const b = await c.req.json<{ term: string; synonyms: string[] }>().catch(() => ({ term: "", synonyms: [] }) as { term: string; synonyms: string[] });
+  const b = await jsonObject<{ term: string; synonyms: string[] }>(c.req, true);
+  requireStringFields(b, "term");
   const term = (b.term ?? "").toLowerCase().trim();
   if (!term) return c.json({ error: "term required" }, 400);
-  for (const syn of b.synonyms ?? []) {
-    await c.env.DB.prepare("INSERT OR IGNORE INTO synonyms (id,user_id,term,synonym) VALUES (?,?,?,?)").bind(crypto.randomUUID(), c.var.principal.userId, term, String(syn).toLowerCase().trim()).run();
+  if (term.length > MAX_SYNONYM_CHARS) return c.json({ error: "term is too long" }, 400);
+  const items = b.synonyms ?? [];
+  if (!Array.isArray(items) || items.length > MAX_SYNONYMS_PER_REQUEST ||
+      items.some(item => typeof item !== "string" || item.trim().length > MAX_SYNONYM_CHARS)) {
+    return c.json({ error: "synonyms must be a bounded array of strings" }, 400);
+  }
+  const aliases = [...new Set(items.map(item => item.toLowerCase().trim()).filter(Boolean))];
+  if (aliases.length) {
+    await c.env.DB.batch(aliases.map(alias =>
+      c.env.DB.prepare("INSERT OR IGNORE INTO synonyms (id,user_id,term,synonym) VALUES (?,?,?,?)")
+        .bind(crypto.randomUUID(), c.var.principal.userId, term, alias)));
   }
   return c.json({ ok: true, term });
 });
@@ -1396,7 +1439,8 @@ api.get("/admin/members", async (c) => {
 api.post("/admin/members", async (c) => {
   const denied = ownerOnly(c);
   if (denied) return denied;
-  const body = await c.req.json<{ email?: string }>().catch(() => ({}) as { email?: string });
+  const body = await jsonObject<{ email?: string }>(c.req, true);
+  requireStringFields(body, "email");
   const email = body.email?.trim().toLowerCase();
   if (!email || !email.includes("@")) return c.json({ error: "email is required" }, 400);
 
@@ -1576,9 +1620,6 @@ export default Object.assign(app, {
     if (!env.LOGS) return;
     ctx.waitUntil(pruneLogs(env.LOGS, logSettings(env)).then(result => {
       console.info(JSON.stringify({ event: 'cf_memory_log_prune', ...result }));
-    }).catch((error: unknown) => console.error('[logs] prune failed; resumes next run', {
-      // The cause, with quoted fragments removed (D1 messages carry no bound values).
-      name: (error as Error)?.name, message: String((error as Error)?.message ?? error).replace(/'[^']*'|"[^"]*"/g, '…').slice(0, 300),
-    })));
+    }).catch((error: unknown) => console.error('[logs] prune failed; resumes next run', storageErrorDetails(error))));
   },
 });

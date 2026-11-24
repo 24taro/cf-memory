@@ -5,7 +5,7 @@ import { boundedJson } from './bounded-body';
 
 import { allows, effectiveScopes, type Scope } from "./auth";
 import { isNoteKind, isNoteType } from "./spaces";
-import { estimateTokens, parseValidTs } from "./db";
+import { estimateTokens, parseValidTs, storageErrorDetails } from "./db";
 import { buildPrompt } from "./serialize";
 import { base64FromBytes, encodeBundlePath, isInlineTextType, validateBundlePath, MAX_BUNDLE_FILE_BYTES } from "./bundle";
 import { BlockFullError } from "./memory";
@@ -956,9 +956,7 @@ const INTERNAL_ERROR = /\bD1_[A-Z_]*ERROR\b|SQLITE_|D1 DB\b|no such (?:table|col
  * validation, missing configuration, conflicts) pass unchanged — the Agent
  * parses `entries[i].…`, `log_append: …` and `entries must be …`. A log tool
  * passes only its own input/configuration errors; any tool hides D1/SQLite
- * and engine errors. Hidden errors get a short code, logged here with the
- * error class and its message minus quoted fragments (D1 never echoes bound
- * values), never the arguments. */
+ * and engine errors. Hidden errors get a short code and structured diagnostics. */
 export function toolErrorText(tool: string, e: unknown, log: (line: string) => void = line => console.error(line)): string {
   const message = e instanceof Error ? e.message : String(e);
   if (e instanceof LogInputError || e instanceof LogsUnavailableError) return message;
@@ -966,7 +964,7 @@ export function toolErrorText(tool: string, e: unknown, log: (line: string) => v
     || INTERNAL_ERROR.test(message) || LOG_TOOL_NAMES.has(tool) && !/^(?:log_append conflicted with concurrent writes|authentication required)/.test(message);
   if (!internal) return message;
   const code = crypto.randomUUID().slice(0, 8);
-  log(`[mcp] tool_error ${JSON.stringify({ code, tool, error: e instanceof Error ? e.name : typeof e, message: message.replace(/"[^"]*"|'[^']*'|`[^`]*`/g, '…').slice(0, 300) })}`);
+  log(`[mcp] tool_error ${JSON.stringify({ code, tool, ...storageErrorDetails(e) })}`);
   return `Internal error in ${tool} (code ${code}). Retry later; if it keeps failing, report the code.`;
 }
 function json(body: unknown, status = 200): Response {

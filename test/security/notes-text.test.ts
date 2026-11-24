@@ -25,6 +25,23 @@ const recallText = async (token: string, query: string) =>
 const liftable = (body: string) => Object.keys(parseFrontmatter(body).data);
 const CONTROL = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
 
+it("REST rejects malformed memory payloads without storing them", async () => {
+  const payloads = [
+    ["/api/v1/notes", '{"slug":"invalid-fixture",'],
+    ["/api/v1/notes", '{"slug":"invalid-fixture","body_md":{}}'],
+    ["/api/v1/skills", '{"slug":"invalid-fixture","skill_md":7}'],
+    ["/api/v1/recall", '{"query":["invalid fixture"]}'],
+    ["/api/v1/prompt", '{"budget":"2000"}'],
+  ];
+  for (const [url, body] of payloads) {
+    const response = await f.req(url, f.aliceToken, { method: "POST", headers: json, body });
+    expect(response.status, url).toBe(400);
+    expect(await response.text()).not.toContain("invalid-fixture");
+  }
+  expect(await one("invalid-fixture")).toBeNull();
+  expect(await f.services.skills.getBySlug(ALICE.id, "invalid-fixture")).toBeNull();
+});
+
 describe("stored body text is stable under re-submission", () => {
   it("a stacked second block is not stored as liftable frontmatter, and the owner's later saves apply nothing from it", async () => {
     await f.put(f.aliceToken, { slug: "relift-private", body_md: "zebrafixture alice private relift text" });
