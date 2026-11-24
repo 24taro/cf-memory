@@ -21,8 +21,6 @@ function maskCode(body: string): string {
     .replace(/`[^`\n]*`/g, (m) => " ".repeat(m.length));
 }
 
-const WIKILINK = /(!?)\[\[([^\]\n]+?)\]\]/g;
-
 function splitAnchor(inner: string): [string, string | null] {
   const i = inner.indexOf("|");
   if (i === -1) return [inner.trim(), null];
@@ -42,23 +40,35 @@ function splitHandle(target: string): { handle: string | null; slugText: string 
 export function parseWikilinks(body: string): WikilinkMatch[] {
   const masked = maskCode(body);
   const out: WikilinkMatch[] = [];
-  let m: RegExpExecArray | null;
-  let pos = 0;
-  WIKILINK.lastIndex = 0;
-  while ((m = WIKILINK.exec(masked)) !== null) {
-    const isEmbed = m[1] === "!";
-    const [targetPart, anchorPart] = splitAnchor(m[2].trim());
+  let cursor = 0;
+  while (cursor < masked.length) {
+    const open = masked.indexOf("[[", cursor);
+    if (open === -1) break;
+    const isEmbed = open > cursor && masked[open - 1] === "!";
+    const start = isEmbed ? open - 1 : open;
+    const inner = open + 2;
+    let close = inner;
+    while (close < masked.length && masked[close] !== "]" && masked[close] !== "\n") close++;
+    // No opener in this run of characters can cross the same closing character
+    // or newline. Advance once without rescanning the run for every opener.
+    if (close === masked.length) break;
+    if (close === inner || masked[close] !== "]" || masked[close + 1] !== "]") {
+      cursor = close + 1;
+      continue;
+    }
+    cursor = close + 2;
+    const [targetPart, anchorPart] = splitAnchor(masked.slice(inner, close).trim());
     const { handle, slugText } = splitHandle(targetPart);
     const targetSlug = slugifyPath(slugText);
     if (!slugText || targetSlug === "untitled") continue;
     out.push({
-      raw: m[0],
+      raw: masked.slice(start, cursor),
       targetHandle: handle,
       targetSlug,
       rawTarget: slugText,
       anchorText: anchorPart,
       kind: isEmbed ? "embed" : "wikilink",
-      position: pos++,
+      position: out.length,
     });
   }
   return out;

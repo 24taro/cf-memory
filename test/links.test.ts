@@ -34,6 +34,15 @@ describe("parseWikilinks", () => {
     expect(slugs).toEqual(["a", "d"]);
   });
 
+  it("resumes scanning after incomplete links and preserves adjacent embeds", () => {
+    const matches = parseWikilinks("Unfinished [[one\n[[]] [[two]]![[three|label]] [[four] [[five]]");
+    expect(matches.map(({ raw, targetSlug, kind, position }) => ({ raw, targetSlug, kind, position }))).toEqual([
+      { raw: "[[two]]", targetSlug: "two", kind: "wikilink", position: 0 },
+      { raw: "![[three|label]]", targetSlug: "three", kind: "embed", position: 1 },
+      { raw: "[[five]]", targetSlug: "five", kind: "wikilink", position: 2 },
+    ]);
+  });
+
   it("assigns increasing positions and dedupes targets in order", () => {
     const m = parseWikilinks("[[a]] [[b]] [[a]]");
     expect(m.map((x) => x.position)).toEqual([0, 1, 2]);
