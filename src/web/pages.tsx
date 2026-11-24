@@ -314,7 +314,7 @@ export const SkillPage: FC<{
         <summary>🗑 削除する</summary>
         <p class="muted">本当に削除しますか？この操作は取り消せません。</p>
         <form method="post" action={`/@${p.handle}/skills/${p.slug}/delete`}>
-          <button type="submit" style="background:var(--stub);border-color:var(--stub)">本当に削除しますか？</button>
+          <button type="submit" style="background:var(--stub);border-color:var(--stub);color:var(--stub-on)">本当に削除しますか？</button>
         </form>
       </details>
     ) : null}
@@ -349,14 +349,14 @@ export const SkillEditPage: FC<{ handle: string; sessionHandle?: string; slug: s
   <Layout title={`edit ${p.slug}`} handle={p.handle} sessionHandle={p.sessionHandle}>
     <h1>『{p.name}』を編集中</h1>
     <form method="post" action={`/@${p.handle}/skills/${p.slug}/edit`} class="cols">
-      <input class="full" name="name" placeholder="名前" value={p.name} />
-      <input class="full" name="description" placeholder="説明" value={p.description} />
+      <label>名前<input class="full" name="name" value={p.name} /></label>
+      <label>説明<input class="full" name="description" value={p.description} /></label>
       {/* Optional: blank submit keeps the auto-patch-bump (existing behavior);
           a filled value sets that exact version. */}
-      <input class="full" name="version" placeholder={`バージョン（現在 v${p.version}・空欄で自動採番）`} value="" />
+      <label>バージョン（現在 v{p.version}・空欄で自動採番）<input class="full" name="version" value="" /></label>
       {/* A browser drops one line break right after the textarea tag; emit one so
           that it is ours and not the first line break of the stored text. */}
-      <textarea name="instructions" placeholder="スキルの手順をここに書いてください。">{"\n"}{p.instructions}</textarea>
+      <label>スキルの手順<textarea name="instructions">{"\n"}{p.instructions}</textarea></label>
       <div><button type="submit">保存</button> <a class="muted" href={`/@${p.handle}/skills/${p.slug}`}>キャンセル</a></div>
     </form>
   </Layout>
@@ -518,11 +518,12 @@ export const EditPage: FC<{ handle: string; sessionHandle?: string; slug: string
   <Layout title={`edit ${p.slug}`} handle={p.handle} sessionHandle={p.sessionHandle}>
     <h1>{p.isNew ? "新しいノート" : `『${p.slug}』を編集中`}</h1>
     <form method="post" action={`/@${p.handle}/n/${p.slug}/edit`} class="cols">
-      <input class="full" name="title" placeholder="タイトル" value={p.title} />
-      <input class="full" name="tags" placeholder="タグ（カンマ区切り）" value={p.tags.join(", ")} />
+      <label>タイトル<input class="full" name="title" value={p.title} /></label>
+      <label>タグ（カンマ区切り）<input class="full" name="tags" value={p.tags.join(", ")} /></label>
       {/* A browser drops one line break right after the textarea tag; emit one so
           that it is ours and the stored body comes back exactly as stored. */}
-      <textarea name="body_md" placeholder="ここに書いてください。[[ノート名]]と書くと他のノートにつながります。">{"\n"}{p.body}</textarea>
+      <label>本文（Markdown）<textarea name="body_md" aria-describedby="note-link-help">{"\n"}{p.body}</textarea></label>
+      <p id="note-link-help" class="muted">他のノートへリンクするには <code>[[ノート名]]</code> と入力します。</p>
       <div><button type="submit">保存</button> <a class="muted" href={`/@${p.handle}/n/${p.slug}`}>キャンセル</a></div>
     </form>
   </Layout>
