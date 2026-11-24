@@ -201,16 +201,11 @@ test('install --home writes the Codex package and hooks, keeps other hooks, repl
   } finally { dir.cleanup(); }
 });
 
-test('install --home for Claude Code runs the plugin CLI inside that home and verifies the version', async () => {
+test('install --home for Claude Code verifies the marketplace, version and files in that home', async () => {
   const dir = tempDir();
   try {
     const home = join(dir.path, 'home'), log = join(dir.path, 'claude-calls.log');
-    const fake = join(dir.path, 'fake-claude');
-    writeFileSync(fake, `#!/bin/sh
-echo "$HOME|$CLAUDE_CONFIG_DIR|$*" >> '${log}'
-if [ "$2" = "update" ]; then mkdir -p "$CLAUDE_CONFIG_DIR/plugins"; printf '{"version":2,"plugins":{"cf-memory-agent@cf-memory":[{"scope":"user","version":"${PLUGIN_VERSION}"}]}}' > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"; fi
-`);
-    chmodSync(fake, 0o755);
+    const fake = fakeClaude(dir, log, { includeHome: true });
     const result = await run(agent, ['install', '--client', 'claude-code', '--home', home], testEnv(dir.path, null, { CF_MEMORY_CLAUDE_BIN: fake }));
     assert.equal(result.code, 0, result.stderr);
     const report = JSON.parse(result.stdout).clients['claude-code'];
@@ -234,7 +229,7 @@ test('Claude Code install fails if every plugin command fails, even with an old 
       writeFileSync(join(plugins, 'installed_plugins.json'), JSON.stringify({ plugins: { 'cf-memory-agent@cf-memory': records } }));
       const result = await run(agent, ['install', '--client', 'claude-code', '--home', home], env);
       assert.equal(result.code, 1);
-      assert.match(result.stderr, /Could not install cf-memory-agent/);
+      assert.match(result.stderr, /Could not verify the cf-memory Claude marketplace/);
       const report = JSON.parse(result.stdout).clients['claude-code'];
       assert.equal(report.verified, false);
       assert.ok(report.results.every(item => !item.ok));
@@ -267,12 +262,32 @@ test('Claude Code uninstall distinguishes a remaining plugin, an unreadable regi
 
 // ---- Round 2: uninstall, pruning, the legacy recall hook, old variables ----
 
-function fakeClaude(dir, log) {
-  const fake = join(dir.path, 'fake-claude');
-  writeFileSync(fake, `#!/bin/sh
-echo "$*" >> '${log}'
-if [ "$2" = "update" ]; then mkdir -p "$CLAUDE_CONFIG_DIR/plugins"; printf '{"version":2,"plugins":{"cf-memory-agent@cf-memory":[{"scope":"user","version":"${PLUGIN_VERSION}"}]}}' > "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"; fi
-if [ "$2" = "uninstall" ]; then rm -f "$CLAUDE_CONFIG_DIR/plugins/installed_plugins.json"; fi
+function fakeClaude(dir, log, { includeHome = false, corruptCache = false } = {}) {
+  const fake = join(dir.path, 'fake-claude.cjs');
+  writeFileSync(fake, `#!${process.execPath}
+const fs = require('node:fs');
+const { join } = require('node:path');
+const args = process.argv.slice(2);
+const config = process.env.CLAUDE_CONFIG_DIR;
+const prefix = ${includeHome} ? process.env.HOME + '|' + config + '|' : '';
+fs.appendFileSync(${JSON.stringify(log)}, prefix + args.join(' ') + '\\n');
+const plugins = join(config, 'plugins');
+const markets = join(plugins, 'known_marketplaces.json');
+const installed = join(plugins, 'installed_plugins.json');
+if (args[1] === 'marketplace' && args[2] === 'add') {
+  const path = args[3];
+  fs.mkdirSync(plugins, { recursive: true });
+  fs.writeFileSync(markets, JSON.stringify({ 'cf-memory': { source: { source: 'directory', path }, installLocation: path } }));
+}
+if (args[1] === 'update') {
+  const registry = JSON.parse(fs.readFileSync(markets, 'utf8'));
+  const version = ${JSON.stringify(PLUGIN_VERSION)};
+  const installPath = join(plugins, 'cache', 'cf-memory', 'cf-memory-agent', version);
+  fs.cpSync(join(registry['cf-memory'].installLocation, 'cf-memory-agent'), installPath, { recursive: true });
+  if (${corruptCache}) fs.appendFileSync(join(installPath, 'README.md'), '\\nDifferent cached bytes.\\n');
+  fs.writeFileSync(installed, JSON.stringify({ version: 2, plugins: { 'cf-memory-agent@cf-memory': [{ scope: 'user', version, installPath }] } }));
+}
+if (args[1] === 'uninstall') fs.rmSync(installed, { force: true });
 `);
   chmodSync(fake, 0o755);
   return fake;
@@ -282,6 +297,56 @@ const legacySettings = { env: { KEEP: '1' }, hooks: {
   SessionStart: [{ hooks: [{ type: 'command', command: '~/.claude/hooks/cf-memory-recall.sh --start' }] }],
   Stop: [{ hooks: [{ type: 'command', command: 'other-stop' }] }],
 } };
+
+test('a different registered Claude marketplace is preserved and blocks installation', async () => {
+  const dir = tempDir();
+  try {
+    const home = join(dir.path, 'home'), plugins = join(home, '.claude', 'plugins'), log = join(dir.path, 'calls.log');
+    const other = join(dir.path, 'another-checkout');
+    mkdirSync(other);
+    mkdirSync(plugins, { recursive: true });
+    const marketplace = join(plugins, 'known_marketplaces.json');
+    const existing = JSON.stringify({ 'cf-memory': { source: { source: 'directory', path: other }, installLocation: other } });
+    writeFileSync(marketplace, existing);
+    const env = testEnv(dir.path, null, { CF_MEMORY_CLAUDE_BIN: fakeClaude(dir, log) });
+    const result = await run(agent, ['install', '--client', 'claude-code', '--home', home], env);
+    assert.equal(result.code, 1, result.stderr);
+    assert.match(result.stderr, /verify the cf-memory Claude marketplace/);
+    assert.equal(existsSync(log), false);
+    assert.equal(readFileSync(marketplace, 'utf8'), existing);
+  } finally { dir.cleanup(); }
+});
+
+test('Claude setup leaves the legacy hook when installed package bytes do not match', async () => {
+  const dir = tempDir();
+  try {
+    const home = join(dir.path, 'home'), settings = join(home, '.claude', 'settings.json');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(settings, JSON.stringify(legacySettings));
+    const env = testEnv(dir.path, null, { CF_MEMORY_CLAUDE_BIN: fakeClaude(dir, join(dir.path, 'calls.log'), { corruptCache: true }) });
+    const result = await run(agent, ['install', '--client', 'claude-code', '--home', home], env);
+    assert.equal(result.code, 1, result.stderr);
+    assert.equal(JSON.parse(result.stdout).clients['claude-code'].verified, false);
+    assert.deepEqual(JSON.parse(readFileSync(settings, 'utf8')), legacySettings);
+  } finally { dir.cleanup(); }
+});
+
+test('Codex setup refuses a modified cache without changing its hooks', async () => {
+  const dir = tempDir();
+  try {
+    const home = join(dir.path, 'home'), env = testEnv(dir.path, null);
+    const args = ['install', '--client', 'codex', '--home', home];
+    const first = await run(agent, args, env);
+    assert.equal(first.code, 0, first.stderr);
+    const report = JSON.parse(first.stdout).clients.codex;
+    const hooks = readFileSync(report.hooks_file, 'utf8');
+    writeFileSync(join(report.package_dir, 'README.md'), 'Outdated copy');
+    const second = await run(agent, args, env);
+    assert.equal(second.code, 1, second.stderr);
+    assert.match(second.stderr, /refusing an existing Codex Agent package/);
+    assert.equal(readFileSync(report.hooks_file, 'utf8'), hooks);
+  } finally { dir.cleanup(); }
+});
 
 test('install removes the old cf-memory-recall.sh hook once the plugin is in place (backed up); dry-run only reports it', async () => {
   const dir = tempDir();

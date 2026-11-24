@@ -1,4 +1,4 @@
-# cf-memory agent 0.3.1
+# cf-memory agent 0.3.2
 
 A small hook program for Claude Code and Codex. It keeps the conversation itself
 in cf-memory so agents can find it later by keyword.
@@ -221,8 +221,9 @@ node cf-memory-agent/scripts/agent.mjs replay-held [--client claude-code|codex] 
                                                      # queue held entries again, all or a selection (--to-current: the selected ones, for the server and account configured now)
 ```
 
-- Claude Code: runs `claude plugin marketplace add <repo>`, `claude plugin install cf-memory-agent@cf-memory`
-  and `claude plugin update …`, then verifies the installed user-scope version.
+- Claude Code: adds the marketplace when needed and verifies that its registered source is this
+  checkout. Runs `claude plugin install cf-memory-agent@cf-memory` and `claude plugin update …`,
+  then verifies the user-scope version, cache location and package file digests.
   Install and uninstall return a nonzero status if the requested state cannot be verified.
   Once the plugin is installed it removes the old `~/.claude/hooks/cf-memory-recall.sh` hook from
   `settings.json` (backup `settings.json.cf-memory-backup-<ms>`), so recall is not injected twice. Only

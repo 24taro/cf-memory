@@ -8,7 +8,8 @@
 // copies; the Agent's own data (spool, health) stays.
 import { execFileSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, readFile, readdir, realpath, rename, rm, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -120,6 +121,38 @@ export async function packageFiles(root = PACKAGE_ROOT, dirs = ['.claude-plugin'
 export const fingerprint = files => sha256(JSON.stringify(files.map(file => [file.path, sha256(file.bytes)])));
 const describe = (path, bytes) => ({ path, bytes: bytes.length, sha256: sha256(bytes) });
 
+async function packageMatches(root, files) {
+  root = resolve(root);
+  const verifiedDirs = new Set();
+  const checkDirectory = async dir => {
+    if (verifiedDirs.has(dir)) return true;
+    if (dir !== root && (dir === dirname(dir) || !await checkDirectory(dirname(dir)))) return false;
+    if (!(await lstat(dir)).isDirectory()) return false;
+    verifiedDirs.add(dir);
+    return true;
+  };
+  try {
+    for (const entry of files) {
+      const path = resolve(entry.path);
+      if (!await checkDirectory(dirname(path)) || !(await lstat(path)).isFile()) return false;
+      const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      try {
+        const info = await file.stat();
+        if (!info.isFile() || info.size !== entry.bytes) return false;
+        const contents = Buffer.alloc(entry.bytes + 1);
+        let offset = 0;
+        while (offset < contents.length) {
+          const read = await file.read(contents, offset, contents.length - offset, offset);
+          if (read.bytesRead === 0) break;
+          offset += read.bytesRead;
+        }
+        if (offset !== entry.bytes || sha256(contents.subarray(0, offset)) !== entry.sha256) return false;
+      } finally { await file.close(); }
+    }
+    return true;
+  } catch { return false; }
+}
+
 // ---- Claude Code --------------------------------------------------------------
 
 export async function claudePlan(paths, { root = PACKAGE_ROOT, executable } = {}) {
@@ -132,6 +165,7 @@ export async function claudePlan(paths, { root = PACKAGE_ROOT, executable } = {}
   const cli = executable || process.env.CF_MEMORY_CLAUDE_BIN || 'claude';
   return {
     client: 'claude-code', version: PLUGIN_VERSION, marketplace: { name: MARKETPLACE, path: marketplace },
+    package_dir: cache,
     commands: [
       { executable: cli, args: ['plugin', 'marketplace', 'add', marketplace] },
       { executable: cli, args: ['plugin', 'install', PLUGIN + '@' + MARKETPLACE, '--scope', 'user'] },
@@ -165,22 +199,54 @@ async function claudeUserPlugin(claudeDir) {
   return records.find(record => record.scope === 'user') ?? null;
 }
 
+async function sameLocation(actual, expected) {
+  if (typeof actual !== 'string') return false;
+  try { return await realpath(actual) === await realpath(expected); }
+  catch { return false; }
+}
+
+async function claudeMarketplaceMatches(claudeDir, expected) {
+  try {
+    const markets = JSON.parse(await readFile(join(claudeDir, 'plugins', 'known_marketplaces.json'), 'utf8'));
+    if (!markets || typeof markets !== 'object' || Array.isArray(markets)) return false;
+    if (!Object.hasOwn(markets, MARKETPLACE)) return null;
+    const market = markets[MARKETPLACE];
+    return market?.source?.source === 'directory' && await sameLocation(market.source.path, expected) && await sameLocation(market.installLocation, expected);
+  } catch (error) { return error.code === 'ENOENT' ? null : false; }
+}
+
 async function installClaude(paths, options) {
   const plan = await claudePlan(paths, options), now = options.now ?? Date.now();
   if (options.dryRun) return { ...plan, dry_run: true, legacy: await cleanLegacyRecall(paths, { write: false, now }) };
   const env = { ...process.env, ...(options.home ? { HOME: paths.home, CLAUDE_CONFIG_DIR: paths.claudeDir } : {}) };
   const results = [];
-  for (const command of plan.commands) {
+  const run = command => {
     try {
       execFileSync(command.executable, command.args, { env, stdio: ['ignore', 'pipe', 'pipe'], timeout: 120000, encoding: 'utf8' });
       results.push({ args: command.args, ok: true });
     } catch (error) {
       results.push({ args: command.args, ok: false, status: error.status ?? null });
     }
+  };
+  const marketPath = plan.marketplace.path;
+  let marketMatches = await claudeMarketplaceMatches(paths.claudeDir, marketPath);
+  if (marketMatches === null) {
+    run(plan.commands[0]);
+    marketMatches = await claudeMarketplaceMatches(paths.claudeDir, marketPath);
+  }
+  if (!marketMatches) {
+    return { ...plan, dry_run: false, results, installed_version: await claudeInstalledVersion(paths.claudeDir), verified: false,
+      next: 'Could not verify the cf-memory Claude marketplace from this checkout. Review its registered source before retrying.' };
+  }
+  for (const command of plan.commands.slice(1)) {
+    if (!await claudeMarketplaceMatches(paths.claudeDir, marketPath)) break;
+    run(command);
   }
   const plugin = await claudeUserPlugin(paths.claudeDir);
   const installed = plugin?.version ?? null;
-  const registered = installed === PLUGIN_VERSION && results.some(result => result.ok && result.args[1] !== 'marketplace');
+  const registered = installed === PLUGIN_VERSION && results.some(result => result.ok && result.args[1] !== 'marketplace') &&
+    await claudeMarketplaceMatches(paths.claudeDir, marketPath) && await sameLocation(plugin.installPath, plan.package_dir) &&
+    await packageMatches(plan.package_dir, plan.files);
   // Only once the plugin (which recalls) is in place does the old hook go.
   const legacy = registered ? await cleanLegacyRecall(paths, { write: true, now }) : undefined;
   const next = plugin === undefined ? 'Could not verify the Claude Code plugin registry.' : !registered
@@ -232,9 +298,13 @@ export async function codexPlan(paths, { root = PACKAGE_ROOT, executable = proce
   const changed = JSON.stringify(current) !== JSON.stringify(next);
   const hooksBytes = Buffer.from(JSON.stringify(next, null, 2) + '\n');
   const record = join(paths.agentHome, 'install-codex.json');
-  const packageExists = Boolean(await lstat(packageDir).catch(() => null));
+  const packageExists = Boolean(await lstat(packageDir).catch(error => { if (error.code === 'ENOENT') return null; throw error; }));
+  const packagePlan = files.map(file => describe(join(packageDir, file.path), file.bytes));
+  if (packageExists && !await packageMatches(packageDir, packagePlan)) {
+    throw Error('refusing an existing Codex Agent package that differs from this checkout. Move aside ' + packageDir + ' before retrying.');
+  }
   const written = [
-    ...(packageExists ? [] : files.map(file => describe(join(packageDir, file.path), file.bytes))),
+    ...(packageExists ? [] : packagePlan),
     ...(changed ? [describe(hooksFile, hooksBytes)] : []),
     ...(changed && status ? [{ path: hooksFile + '.cf-memory-backup-' + now, bytes: status.size, copy_of: hooksFile }] : []),
     { path: record, bytes: null, note: 'install record (version, package path, hook hash)' },
