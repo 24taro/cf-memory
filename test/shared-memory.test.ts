@@ -159,6 +159,25 @@ describe("個人の記憶は漏れない ← 本命", () => {
     expect(hits.length).toBeGreaterThan(0);
   });
 
+  it("links browser search hits to the person who owns each result", async () => {
+    expect((await put(aliceToken, { slug: "search-namespace", title: "Orion shared", body_md: "Team handbook", shared: true })).ok).toBe(true);
+    expect((await put(bobToken, { slug: "search-namespace", title: "Orion personal", body_md: "My checklist" })).ok).toBe(true);
+    const skill = await req("/api/v1/skills", bobToken, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ slug: "search-orion", name: "Orion skill", instructions: "Check readiness" }),
+    });
+    expect(skill.ok).toBe(true);
+
+    const response = await req("/search?q=orion", bobToken);
+    expect(response.ok).toBe(true);
+    const html = await response.text();
+    expect(html).toContain('href="/@bob">ホーム</a>');
+    expect(html).toContain('href="/@alice/n/search-namespace">Orion shared</a>');
+    expect(html).toContain('href="/@bob/n/search-namespace">Orion personal</a>');
+    expect(html).toContain('href="/@bob/skills/search-orion">Orion skill</a>');
+  });
+
   it("id を直接指定しても読めない", async () => {
     const row = await db.prepare("SELECT id FROM notes WHERE slug='alice-untyped'").first<{ id: string }>();
     expect((await req(`/api/v1/notes/${row?.id}`, bobToken)).status).toBe(404);

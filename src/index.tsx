@@ -488,7 +488,8 @@ app.get("/search", async (c) => {
   try {
     const filters = searchQueryFilters(c.req.query(), true);
     const result = q ? await standaloneSearch(services.search, principal, q, { ...filters, scope, context, limit: 30 }) : null;
-    return c.html(<SearchPage handle={c.env.OWNER_HANDLE || "owner"} sessionHandle={sessionHandle(c)} q={q} scope={scope} scopes={scopes} context={context} filters={filters} hits={result?.hits ?? []} />);
+    const hits = await services.search.withOwnerHandles(principal, result?.hits ?? []);
+    return c.html(<SearchPage handle={principal.handle} sessionHandle={sessionHandle(c)} q={q} scope={scope} scopes={scopes} context={context} filters={filters} hits={hits} />);
   } catch (error) {
     if (error instanceof SearchInputError) return c.text(error.message, 400);
     throw error;

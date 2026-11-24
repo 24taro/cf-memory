@@ -527,7 +527,7 @@ export const EditPage: FC<{ handle: string; sessionHandle?: string; slug: string
   </Layout>
 );
 
-export const SearchPage: FC<{ handle: string; sessionHandle?: string; q: string; scope: string; scopes: string[]; context: string | null; filters?: SearchFilters; hits: SearchHit[] }> = (p) => {
+export const SearchPage: FC<{ handle: string; sessionHandle?: string; q: string; scope: string; scopes: string[]; context: string | null; filters?: SearchFilters; hits: Array<SearchHit & { ownerHandle: string }> }> = (p) => {
   const filters = p.filters ?? {};
   return (
   <Layout title={p.q ? `検索: ${p.q}` : "検索"} handle={p.handle} sessionHandle={p.sessionHandle}>
@@ -578,7 +578,7 @@ export const SearchPage: FC<{ handle: string; sessionHandle?: string; q: string;
     {p.hits.length === 0 && p.q ? <p class="muted">該当する結果が見つかりませんでした。</p> : null}
     {p.hits.map((h) => (
       <div class="res">
-        <a href={h.type === "skill" ? `/@${p.handle}/skills/${h.slug}` : `/@${p.handle}/n/${h.slug}`}>{h.title}</a> <span class="pill">{hitTypeLabel(h.type)}</span>
+        <a href={`/@${h.ownerHandle}/${h.type === "skill" ? "skills" : "n"}/${h.slug}`}>{h.title}</a> <span class="pill">{hitTypeLabel(h.type)}</span>
         <div class="sn">{h.snippet}</div>
       </div>
     ))}

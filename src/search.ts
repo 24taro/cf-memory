@@ -361,6 +361,29 @@ export class SearchService {
     return (res.results ?? []).map((r) => r.scope);
   }
 
+  async withOwnerHandles(principal: Principal, hits: SearchHit[]): Promise<Array<SearchHit & { ownerHandle: string }>> {
+    if (!hits.length) return [];
+    const access = readableSql('n', principal);
+    const wanted = JSON.stringify(hits.map(({ type, id }) => [type, id]));
+    const rows = await this.db.prepare(`WITH hits AS (
+        SELECT json_extract(value, '$[0]') AS type, json_extract(value, '$[1]') AS id FROM json_each(?)
+      )
+      SELECT hits.type, hits.id, u.handle FROM hits
+        JOIN notes n ON hits.type='note' AND n.id=hits.id JOIN users u ON u.id=n.user_id
+        WHERE n.deleted_at IS NULL AND ${access.sql}
+      UNION ALL
+      SELECT hits.type, hits.id, u.handle FROM hits
+        JOIN skills n ON hits.type='skill' AND n.id=hits.id JOIN users u ON u.id=n.user_id
+        WHERE n.deleted_at IS NULL AND ${access.sql}`)
+      .bind(wanted, ...access.args, ...access.args)
+      .all<{ type: Kind; id: string; handle: string }>();
+    const handles = new Map(rows.results.map(row => [`${row.type}/${row.id}`, row.handle]));
+    return hits.flatMap(hit => {
+      const ownerHandle = handles.get(`${hit.type}/${hit.id}`);
+      return ownerHandle ? [{ ...hit, ownerHandle }] : [];
+    });
+  }
+
   async hybrid(
     principal: Principal,
     q: string,
