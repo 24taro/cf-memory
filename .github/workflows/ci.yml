@@ -32,7 +32,9 @@ jobs:
       - run: npm run test:migrations
       - name: Authentication, data isolation, and installer tests
         if: github.event_name != 'workflow_dispatch' || !inputs.full
-        run: npx vitest run test/security test/access.test.ts test/agent-door.test.ts test/install.test.ts --maxWorkers=2
+        run: >-
+          npx vitest run test/security test/access.test.ts test/agent-door.test.ts
+          test/owner-only-isolation.test.ts test/shared-memory.test.ts test/install.test.ts --maxWorkers=2
         env:
           CF_MEMORY_TEST_TIME_SCALE: '10'
       - name: Install script syntax and lint

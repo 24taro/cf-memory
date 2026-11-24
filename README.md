@@ -25,7 +25,8 @@ The initial release supports one owner per instance using a fixed API token.
 
 **Requirements.** Cloudflare Workers Paid with R2 enabled, Git, Bash,
 Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. Use Claude Code
-2.1.327 or later, or Codex. Update an older Claude Code installation first.
+2.1.327 or later, or the Codex CLI with `/hooks` support. The handoff below
+has been verified on Codex CLI 0.170.0 and 0.172.0.
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git
@@ -121,9 +122,11 @@ It works for Japanese and English.
 ## Where your data lives
 
 The hooks send conversation data to your Worker. Your Cloudflare account stores
-it in D1, and skill attachments live in R2. The browser UI loads Google Fonts
-and may request external images embedded in notes. The installer stores the API
-token in `.cf-memory.secrets` in this checkout (mode 0600, ignored by Git).
+it in D1, and skill attachments live in R2. Recalled text becomes part of the
+coding client's context and follows that client's model and data settings.
+The browser UI loads Google Fonts and may request external images embedded in
+notes. The installer stores the API token in `.cf-memory.secrets` in this
+checkout (mode 0600, ignored by Git).
 
 ### Delete conversation logs
 
