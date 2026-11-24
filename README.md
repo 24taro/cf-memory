@@ -1,30 +1,29 @@
 # cf-memory
 
-Memory for your coding agents, in your own Cloudflare account. Every prompt and
-final reply is kept word for word and found again by keyword. No vector
-database, no model calls.
+**Give Claude Code and Codex a memory that lives in your Cloudflare account.**
+Resume a repository in a new session with yesterday's decisions, search the
+conversation that justified them, and keep the useful parts as notes.
 
-[日本語](README.ja.md)
+[Quick start](#quick-start) · [How it works](#how-it-works) · [Data and retention](#where-your-data-lives) · [日本語](README.ja.md)
 
-Claude Code and Codex forget what you worked out yesterday. cf-memory is a
-Cloudflare Worker plus a small hook plugin: the hooks record each turn, and at
-the start of every prompt they put the related notes and past conversations
-back in front of the agent.
+| When you… | cf-memory… |
+| --- | --- |
+| Open a new session in a repository | Brings in your core memory and the previous session's last reply. |
+| Ask about a past decision | Recalls related notes, and lets your agent search the stored conversation by keyword. |
+| Switch between Claude Code and Codex | Gives both clients the same notes and conversation history when they connect to the same instance. |
 
-cf-memory is an independent project. It runs on Cloudflare and is not affiliated
-with or endorsed by Cloudflare, Inc.
+One Worker, two D1 databases, and an R2 bucket. Search uses SQLite FTS5, works
+in Japanese and English, and makes zero embedding or model calls. cf-memory
+is an independent, MIT-licensed project.
 
 The initial release supports one owner per instance using a fixed API token.
 [Team mode](docs/TEAM-MODE.md) is experimental.
 
-## Install
+## Quick start
 
-You need a Cloudflare account on the Workers Paid plan with R2 enabled, Git,
-Bash, Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. To connect an
-agent, install Claude Code 2.1.327 or later, or Codex. If an older Claude Code
-version is installed, update it before running the installer. The installer
-checks the Claude Code version before deploying or changing any client settings.
-Run `./install.sh --no-client` to deploy the Worker on its own.
+**Requirements.** Cloudflare Workers Paid with R2 enabled, Git, Bash,
+Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. Use Claude Code
+2.1.327 or later, or Codex. Update an older Claude Code installation first.
 
 ```bash
 git clone https://github.com/24taro/cf-memory.git
@@ -32,30 +31,26 @@ cd cf-memory
 ./install.sh
 ```
 
-The script logs you in to Cloudflare, creates two D1 databases and an R2 bucket,
-deploys the Worker, generates your API token, checks that the server answers,
-and connects Claude Code and Codex if they are installed.
-It reports MCP registration and hook installation separately. If either step
-fails for one client, setup still runs for the other client and the script exits
-with an error.
+Approve the Cloudflare login when prompted. The installer provisions the
+storage, deploys the Worker, saves the API token, and connects the clients
+it finds. Use `./install.sh --no-client` for the Worker alone.
 
-The first install reserves the Worker name in your Cloudflare account. If it
-is interrupted, rerun it from the same checkout and keep
-`.cf-memory.install-claim` and `.cf-memory.secrets` if present. The installer
-removes the claim file once it verifies the connection.
+- **Claude Code.** Restart it after installation.
+- **Codex.** Load the two printed `export` lines in your shell before
+  launching Codex. Run `/hooks` and approve the four cf-memory hooks.
 
-If you use Codex, add the two export lines printed by the installer to your
-shell profile and load it before launching Codex. Open `/hooks` and approve
-the four cf-memory hooks. If Codex asks again after an update, review and
-approve the new hooks there.
+### Try a handoff
 
-To verify recording and recall, tell your agent a test fact and ask it to
-repeat the fact in its final reply. Start a new session in the same Git
-repository and ask for that fact. To check the connection and hook status, run:
+In a Git repository, ask your agent to reply with a test fact such as
+“Our smoke test is called Blue Lantern.” Open a fresh session in the same
+repository and ask “What did we call our smoke test?” Keep the name out of
+the second prompt. If the fact is missing, check the hooks and connection:
 
 ```bash
 node cf-memory-agent/scripts/agent.mjs doctor
 ```
+
+### Update or resume setup
 
 To update, pull the latest changes in the same checkout and run `./install.sh`
 again. Use the same Cloudflare account and keep `.cf-memory.secrets` to reuse
@@ -64,13 +59,18 @@ Regular updates preserve the deployed token. If you move to another checkout,
 copy the original `.cf-memory.secrets` before installing. See [Security](SECURITY.md)
 for token rotation.
 
+If the first install is interrupted, keep `.cf-memory.install-claim` and
+`.cf-memory.secrets` if present, then rerun from that checkout. The installer
+reports MCP and hook status separately for each client. If Codex prompts again
+after an update, review the hooks in `/hooks`.
+
 ## How it works
 
-1. **Record.** Hooks keep each prompt and the agent's final reply in full, plus
-   one line per tool action and the head of failed output. Text is scrubbed for
-   secrets on your machine before it is sent. Nothing is summarized.
+1. **Record.** Hooks keep prompt and reply text within per-entry size limits,
+   plus one line per tool action and an excerpt of failed output. Text is
+   scrubbed locally for common secret formats before it is sent.
 2. **Recall.** On every prompt the hook searches your notes and skills by
-   keyword and injects the matches. At session start it injects your core memory
+   keyword and injects relevant matches. At session start it injects your core memory
    and the last reply of the previous session in the same repository.
 3. **Search.** When the agent needs older context it searches the kept
    conversation itself (`log_search`, `log_read`) and saves what is worth
@@ -103,6 +103,11 @@ Prompts and final replies have no automatic expiry. Daily maintenance removes
 tool-action lines and error excerpts older than `LOG_ACTION_RETENTION_DAYS`
 (90 days by default). Individual log entries are managed in D1.
 
+The separate Capture API stores short-lived source events when a client
+explicitly sends them. The default retention is seven days from receipt.
+Expired events are excluded from reads immediately and removed by daily
+maintenance. Saved provenance can outlive its source event.
+
 1. Close the connected clients while you clean up. Review their local queue at
    `~/.cf-memory/v3/spool/` (or `$CF_MEMORY_AGENT_HOME/spool/`). If you want to
    discard every queued, held, and rejected entry for both clients in that
@@ -125,9 +130,10 @@ tool-action lines and error excerpts older than `LOG_ACTION_RETENTION_DAYS`
 
 ## Cost
 
-cf-memory is built for the Workers Paid plan. The Free plan allows 5 million D1
-rows read per day, and one heavy day of the author's own use read about 8
-million, so on the Free plan it can stop answering until the next day.
+Use the Workers Paid plan. Requests, D1 rows read and written, and R2 storage
+and operations depend on your usage. Cloudflare publishes the included usage
+and additional charges for each service.
+[Workers pricing](https://developers.cloudflare.com/workers/platform/pricing/) · [D1 pricing](https://developers.cloudflare.com/d1/platform/pricing/) · [R2 pricing](https://developers.cloudflare.com/r2/pricing/)
 
 ## Uninstall
 
