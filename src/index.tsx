@@ -1160,7 +1160,7 @@ api.post("/skills", async (c) => {
   const b = await c.req.json<SkillInput>();
   const { skill, created } = await c.var.services.skills.upsert(c.var.principal, b);
   const { principal } = c.var;
-  return c.json({ id: skill.id, slug: skill.slug, ...(allows(principal, "notes:read") ? { name: skill.name } : {}), version: skill.version, created }, created ? 201 : 200);
+  return c.json({ id: skill.id, slug: skill.slug, ...(allows(principal, "notes:read") ? { name: skill.name, version: skill.version } : {}), created }, created ? 201 : 200);
 });
 
 // issue #36: soft-delete, own-skill only (mirrors DELETE /notes/:id). Slug-
@@ -1186,7 +1186,7 @@ api.post("/skills/:slug/log-use", async (c) => {
   if (b.outcome !== "success" && b.outcome !== "partial" && b.outcome !== "failure") return c.json({ error: "outcome must be success | partial | failure" }, 400);
   const s = await services.skills.getBySlug(principal.userId, slugify(c.req.param("slug")));
   const res = s ? await services.skills.logUse(principal, s.id, b.outcome, typeof b.note === "string" ? b.note : undefined) : null;
-  return res ? c.json({ ok: true, slug: s?.slug, outcome: b.outcome, ...res }) : c.json({ error: "not found" }, 404);
+  return res ? c.json({ ok: true, slug: s?.slug, outcome: b.outcome, ...(allows(principal, "notes:read") ? res : {}) }) : c.json({ error: "not found" }, 404);
 });
 
 api.get(`/:h{@[^/]+}/skills/:slug`, async (c) => {

@@ -31,14 +31,6 @@ export interface IntrospectConfig {
   audience: string;
 }
 
-interface IntrospectionResponse {
-  active: boolean;
-  sub?: string;
-  scope?: string;
-  aud?: string | string[];
-  email?: string;
-}
-
 /** Validate a Bearer token. Returns null on ANY failure — including the
  * authorization server being unreachable, which must read as "not authorised"
  * rather than as an exception that 500s the request. */
@@ -65,24 +57,28 @@ export async function introspectToken(
   }
   if (!res.ok) return null;
 
-  let body: IntrospectionResponse;
+  let body: unknown;
   try {
-    body = (await res.json()) as IntrospectionResponse;
+    body = await res.json();
   } catch {
     return null;
   }
-  if (!body.active || !body.sub) return null;
+  if (!body || typeof body !== "object" || Array.isArray(body)) return null;
+  const { active, sub, scope, aud, email } = body as Record<string, unknown>;
+  if (active !== true || typeof sub !== "string" || !sub.trim()) return null;
+  if (scope !== undefined && typeof scope !== "string") return null;
+  if (email !== undefined && typeof email !== "string") return null;
 
   // Audience binding is still ours to enforce: the authorization server reports
   // what the token is for, but only this server knows what it is. Without this
   // check a token minted for cf-memory would be accepted by search.
-  const auds = Array.isArray(body.aud) ? body.aud : body.aud != null ? [body.aud] : [];
-  if (!auds.includes(config.audience)) return null;
+  const auds = typeof aud === "string" ? [aud] : aud;
+  if (!Array.isArray(auds) || !auds.every(value => typeof value === "string") || !auds.includes(config.audience)) return null;
 
   return {
-    subject: body.sub,
-    scopes: new Set((body.scope ?? "").split(" ").filter(Boolean)),
-    ...(body.email ? { email: body.email } : {}),
+    subject: sub,
+    scopes: new Set((scope ?? "").split(" ").filter(Boolean)),
+    ...(email ? { email } : {}),
   };
 }
 

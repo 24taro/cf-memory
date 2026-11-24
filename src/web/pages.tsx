@@ -630,6 +630,7 @@ export const PreviewPage: FC<{
                     <li>
                       <strong>{it.title}</strong> <span class="t">[[{it.ref}]]</span>
                       {it.sharedBy ? <span class="muted"> · @{it.sharedBy} さんの共有メモ</span> : null}
+                      {it.authorUnverified ? <span class="muted"> · 最終編集者を確認できません</span> : it.editedBy ? <span class="muted"> · @{it.editedBy} さんが最終編集</span> : null}
                       <br />
                       <span class="muted" style="white-space:pre-wrap">{it.text}</span>
                     </li>

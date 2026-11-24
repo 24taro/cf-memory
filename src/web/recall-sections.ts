@@ -26,6 +26,7 @@ export interface RecallSectionItem {
   /** Handle of the member who last wrote its text, when that is not the owner
    * (for the viewer's own note: a teammate wrote into it). */
   editedBy?: string;
+  authorUnverified?: true;
 }
 
 export interface RecallSection {
@@ -60,6 +61,11 @@ export function toRecallSections(sections: RecallTier[]): RecallSection[] {
   return sections.map((s) => ({
     rawLabel: s.label,
     label: tierLabelFor(s.label),
-    items: s.items.map((i) => ({ ref: i.ref, title: i.title, text: i.text, ...(i.shared_by === undefined ? {} : { sharedBy: i.shared_by }), ...(i.edited_by === undefined ? {} : { editedBy: i.edited_by }) })),
+    items: s.items.map((i) => ({
+      ref: i.ref, title: i.title, text: i.text,
+      ...(i.shared_by === undefined ? {} : { sharedBy: i.shared_by }),
+      ...(i.edited_by === undefined ? {} : { editedBy: i.edited_by }),
+      ...(i.author_unverified ? { authorUnverified: true as const } : {}),
+    })),
   }));
 }

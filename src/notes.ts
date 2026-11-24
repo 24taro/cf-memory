@@ -6,6 +6,7 @@
 // 2026-10-31: no embeddings. The legacy `embedding` / `embedding_model`
 // columns are neither written nor read (NOTE_COLUMNS) until phase 5 drops them.
 
+import { allows } from "./auth";
 import { normalizeScope, normalizeScopes, scopeClause } from "./context";
 import { clampLimit, now, sha256hex, ulid } from "./db";
 import { asStringArray, parseFrontmatter } from "./frontmatter";
@@ -27,6 +28,11 @@ const NOTE_COLUMN_LIST = ['id', 'user_id', 'slug', 'title', 'body_md', 'frontmat
   'scope', 'last_viewed_at', 'archived_at', 'valid_from', 'valid_until', 'superseded_by', 'supersedes', 'shared', 'type'];
 export const NOTE_COLUMNS = NOTE_COLUMN_LIST.join(', ');
 const NOTE_COLUMNS_N = NOTE_COLUMN_LIST.map(c => 'n.' + c).join(', ');
+
+export type RecallNoteRow = NoteRow & {
+  recall_editor_ref: string | null;
+  recall_revision_state: "missing" | "matching" | "mismatch";
+};
 
 export interface UpsertResult {
   note: NoteRow;
@@ -284,17 +290,29 @@ export class NotesRepo {
   // Final Recall hydration must authorize the same snapshot that reads bodies,
   // after both search and ambient/recency selection. D1 is the authority even
   // when an earlier query already validated these candidate IDs.
-  async getRowsByIds(principal: Principal, ids: string[], context: string[] = []): Promise<Map<string, NoteRow>> {
-    const out = new Map<string, NoteRow>();
+  async getRowsByIds(principal: Principal, ids: string[], context: string[] = []): Promise<Map<string, RecallNoteRow>> {
+    const out = new Map<string, RecallNoteRow>();
     const vis=readableSql('n',principal), scope=scopeClause('n',context), validity=validityClause('note',true);
     const args=[...validity.args(now()),...vis.args,...scope.args], cap=Math.max(1,90-args.length);
     for (let i = 0; i < ids.length; i += cap) {
       const batch = ids.slice(i, i + cap);
       const ph = batch.map(() => "?").join(",");
+      // Read the body and latest committed revision in one D1 snapshot. Match
+      // their content for older rows whose revision was saved separately.
       const res = await this.db
-        .prepare(`SELECT ${NOTE_COLUMNS_N} FROM notes n WHERE n.id IN (${ph}) AND n.deleted_at IS NULL AND n.kind!='block' AND n.archived_at IS NULL AND ${validity.sql}${vis.sql}${scope.sql}`)
+        .prepare(`SELECT ${NOTE_COLUMNS_N},
+          CASE WHEN r.editor='agent' AND r.editor_ref='api-token' THEN 'machine:fixed-api-token'
+               ELSE r.editor_ref END AS recall_editor_ref,
+          CASE WHEN r.rowid IS NULL THEN 'missing'
+               WHEN r.content_hash=n.content_hash AND r.frontmatter_json=n.frontmatter_json THEN 'matching'
+               ELSE 'mismatch' END AS recall_revision_state
+          FROM notes n
+          LEFT JOIN note_revisions r ON r.rowid=(
+            SELECT rev.rowid FROM note_revisions rev WHERE rev.note_id=n.id ORDER BY rev.rowid DESC LIMIT 1
+          )
+          WHERE n.id IN (${ph}) AND n.deleted_at IS NULL AND n.kind!='block' AND n.archived_at IS NULL AND ${validity.sql}${vis.sql}${scope.sql}`)
         .bind(...batch,...args)
-        .all<NoteRow>();
+        .all<RecallNoteRow>();
       for (const r of res.results ?? []) out.set(r.id, r);
     }
     return out;
@@ -424,6 +442,9 @@ export class NotesRepo {
     // applyBlockOp by skipping the separator onto an empty base and clamping to
     // char_limit. Plain note appends keep the blank-line separator and no clamp.
     if (input.append_md !== undefined) {
+      if (existing && (existing.kind === "block" || existing.pinned_block_label != null || existing.char_limit != null) && !allows(principal, "notes:read")) {
+        throw new Error("Forbidden: missing scope 'notes:read' (this operation reads the block it changes)");
+      }
       const blockSep = input.append_separator !== undefined;
       const sep = input.append_separator ?? "\n\n";
       const baseBody = existing && !existing.deleted_at ? existing.body_md : "";
@@ -562,6 +583,13 @@ export class NotesRepo {
         supersedeTargetId = target.id;
       }
     }
+    // Commit a content revision with its row. changes() ties its insertion to
+    // the immediately preceding note mutation, including a no-match CAS.
+    const recordRevision = !existing || existing.deleted_at || existing.content_hash !== contentHash || existing.frontmatter_json !== frontmatter;
+    const revision = recordRevision ? this.db.prepare(`INSERT INTO note_revisions
+      (id,note_id,body_md,frontmatter_json,editor,editor_ref,content_hash,created_at)
+      SELECT ?,id,body_md,frontmatter_json,?,?,content_hash,? FROM notes WHERE changes()=1 AND id=?`)
+      .bind(ulid(ts), principal.actor, principal.viaKeyPrefix ?? principal.handle, ts, id) : null;
     if (existing) {
       // Optimistic concurrency: only update if the row still carries the hash we
       // read. A concurrent writer that already moved the hash -> changes===0 ->
@@ -590,17 +618,16 @@ export class NotesRepo {
       // An id-addressed write must find its row still live: it never revives.
       const casHash = typeof input.expectedContentHash === "string" ? input.expectedContentHash : existing.content_hash;
       const where=updateGuard?guardedTextWhere(updateGuard,userId,slug,now()):undefined;
-      const result = where ? await this.db.prepare(`UPDATE notes AS n SET
+      const update = where ? this.db.prepare(`UPDATE notes AS n SET
         title=?, body_md=?, content_hash=?, word_count=?, updated_at=?
-        WHERE ${where.sql}`).bind(title,body,contentHash,wordCount,now(),...where.args).run()
-        : writeThrough ? await this.db
+        WHERE ${where.sql}`).bind(title,body,contentHash,wordCount,now(),...where.args)
+        : writeThrough ? this.db
         .prepare(
           `UPDATE notes SET title=?, body_md=?, frontmatter_json=?, content_hash=?, word_count=?, updated_at=?
            WHERE id=? AND content_hash=? AND user_id=? AND shared=1 AND deleted_at IS NULL`,
         )
         .bind(title, body, frontmatter, contentHash, wordCount, ts, id, casHash, rowOwner)
-        .run()
-        : await this.db
+        : this.db
         .prepare(
           `UPDATE notes SET title=?, body_md=?, frontmatter_json=?, kind=?, stage=?, scope=?, type=?, shared=?,
              pinned_block_label=?, char_limit=?, content_hash=?,
@@ -608,8 +635,8 @@ export class NotesRepo {
              updated_at=?, deleted_at=NULL, archived_at=NULL
            WHERE id=? AND content_hash=? AND user_id=?${input.expectedId !== undefined ? " AND deleted_at IS NULL" : ""}`,
         )
-        .bind(title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersededBy, supersedesId, ts, id, casHash, rowOwner)
-        .run();
+        .bind(title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersededBy, supersedesId, ts, id, casHash, rowOwner);
+      const result = revision ? (await this.db.batch([update, revision]))[0] : await update.run();
       if (result.meta.changes === 0) {if(updateGuard)throw new UpdateConflictError();throw new StaleUpsertError();}
     } else {
       const provenanceStatements = creationProvenance ? await creationProvenance(id, shared) : null;
@@ -629,9 +656,7 @@ export class NotesRepo {
         )
         .bind(id, userId, slug, title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersededBy, supersedesId, createdAt, ts,
           ...(guard ? [...current.args(now()), guard.id, userId, guard.content_hash, guard.scope, guard.shared ? 1 : 0, guard.updated_at, guard.provenance_count] : []));
-      // The first durable row and its creation evidence commit together. Other
-      // existing indexing/revision operations retain their current behavior.
-      const result = provenanceStatements ? (await this.db.batch([insert, ...provenanceStatements]))[0] : await insert.run();
+      const result = (await this.db.batch([insert, ...(revision ? [revision] : []), ...(provenanceStatements ?? [])]))[0];
       if (guard && result.meta.changes === 0) throw new SupersessionConflictError();
     }
 
@@ -640,20 +665,6 @@ export class NotesRepo {
     if (rowidRow?.rowid != null) {
       await this.db.prepare("DELETE FROM notes_fts WHERE rowid=?").bind(rowidRow.rowid).run();
       await this.db.prepare("INSERT INTO notes_fts (rowid,title,body,tags) VALUES (?,?,?,?)").bind(rowidRow.rowid, title, body, ftsTags).run();
-    }
-
-    // A revision is a full copy of the body and nothing prunes them, so one is
-    // kept only when what it records changed: title/body/tags (content_hash) or
-    // the stored frontmatter. A resubmitted identical document, or an edit of
-    // lifecycle fields alone, adds none. Reviving a tombstone always records one.
-    if (!existing || existing.deleted_at || existing.content_hash !== contentHash || existing.frontmatter_json !== frontmatter) {
-      await this.db
-        .prepare(
-          `INSERT INTO note_revisions (id,note_id,body_md,frontmatter_json,editor,editor_ref,content_hash,created_at)
-           VALUES (?,?,?,?,?,?,?,?)`,
-        )
-        .bind(ulid(ts), id, body, frontmatter, principal.actor, principal.viaKeyPrefix ?? principal.handle, contentHash, ts)
-        .run();
     }
 
     await this.reconcileTags(rowOwner, id, tags, ts);

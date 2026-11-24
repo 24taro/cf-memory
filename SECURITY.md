@@ -40,8 +40,8 @@ saved itself from a web page or a file.
 **Experimental team mode.** An instance is one group of invited members who trust each
 other; it is not a boundary between mutually distrusting tenants.
 
-- Shared notes can be edited by any member. Recall labels and fences text whose
-  owner or last editor is not the reader.
+- Shared notes can be edited by any member. Recall labels and fences text from
+  another member and text whose current revision lacks a verifiable editor.
 - The authorization server must return only verified email addresses: the first
   token whose address equals an invited, not yet linked row is linked to it.
 - A `machine:` token acts as the instance owner.

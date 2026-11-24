@@ -135,6 +135,16 @@ describe("agent door — what introspection says", () => {
     expect((await get("/api/v1/notes", token)).status).toBe(401);
   });
 
+  it("denies malformed introspection responses through the normal credential gate", async () => {
+    const sub = `user:${OWNER_ACCOUNT}`;
+    const active = { active: true, sub, aud: [TEST_RESOURCE], scope: "notes:read", email: OWNER_EMAIL };
+    const malformed = [[], { ...active, active: "true" }, { ...active, sub: 11 }, { ...active, scope: ["notes:read"] }, { ...active, email: {} }, { ...active, aud: [TEST_RESOURCE, 12] }];
+    for (const body of malformed) {
+      const token = await bearerTokenFor({ sub, email: OWNER_EMAIL, respondWith: { status: 200, body } });
+      expect((await get("/api/v1/notes", token)).status).toBe(401);
+    }
+  });
+
   it("refuses when introspection fails rather than treating the failure as a pass", async () => {
     // auth is on this server's request path (the accepted SPOF). Down must mean
     // "not authorised", never "let it through".

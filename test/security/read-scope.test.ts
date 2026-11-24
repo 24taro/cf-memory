@@ -491,6 +491,7 @@ describe("write-scoped operations return no stored content without notes:read", 
       ["memory_replace", { label: "probe", find: BLOCK.slice(0, 3), replace: BLOCK.slice(0, 3) + "#" }],
       ["memory_append", { label: "probe", value: "" }],
       ["memory_append", { label: "probe", value: "more", char_limit: 1 }],
+      ["notes_append", { slug: "block-probe", text: "more" }],
     ] as const) {
       const out = await mcp(writeOnly, name, args);
       expect(out.isError, `${name}: ${out.text}`).toBe(true);
@@ -505,15 +506,33 @@ describe("write-scoped operations return no stored content without notes:read", 
     expect(JSON.parse((await mcp(full, "memory_get", { label: "probe" })).text).block.value).toBe(before);
     // control: a token that may read still appends and replaces.
     expect((await mcp(full, "memory_append", { label: "probe", value: "x" })).isError).toBe(false);
+    expect((await mcp(full, "notes_append", { slug: "block-probe", text: "more" })).isError).toBe(false);
+  });
+
+  it("limits skill version and use statistics to callers with read scope", async () => {
+    await seed();
+    const update = { slug: "alice-skill", description: "update description" };
+    const outcome = { outcome: "success" };
+    const viaMcp = JSON.parse((await mcp(writeOnly, "skills_put", update)).text);
+    expect(viaMcp).toMatchObject({ slug: "alice-skill", created: false });
+    expect(viaMcp).not.toHaveProperty("version");
+    const viaRest = await (await post("/api/v1/skills", writeOnly, update)).json();
+    expect(viaRest).toMatchObject({ slug: "alice-skill", created: false });
+    expect(viaRest).not.toHaveProperty("version");
+    expect(JSON.parse((await mcp(full, "skills_put", update)).text)).toHaveProperty("version");
+    expect(JSON.parse((await mcp(writeOnly, "skills_log_use", { ...outcome, slug: "alice-skill" })).text)).toEqual({ found: true, slug: "alice-skill", ...outcome });
+    expect(await (await post("/api/v1/skills/alice-skill/log-use", writeOnly, outcome)).json()).toEqual({ ok: true, slug: "alice-skill", ...outcome });
+    const stats = await (await post("/api/v1/skills/alice-skill/log-use", full, outcome)).json();
+    expect(stats).toMatchObject({ success_rate: 1, invocation_count: 3 });
   });
 
   it("no write tool hands a seeded marker to a write-only token", async () => {
     await seed();
     for (const [name, args] of WRITE_CALLS()) {
       const out = await mcp(writeOnly, name, args);
-      // Reached the handler: neither the scope refusal nor a missing-argument error —
-      // except the two block tools that also need notes:read (tested above).
-      if (name !== "memory_append" && name !== "memory_replace") expect(out.text, name).not.toMatch(/^Forbidden|^rpc-error/);
+      // Block edits that depend on stored content require notes:read.
+      const readsBlock = name === "memory_append" || name === "memory_replace" || (name === "notes_append" && args.slug === "block-probe");
+      if (!readsBlock) expect(out.text, name).not.toMatch(/^Forbidden|^rpc-error/);
       for (const marker of STORED) expect(out.text, `${name} ${JSON.stringify(args)}`).not.toContain(marker);
     }
   });

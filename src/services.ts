@@ -8,12 +8,12 @@ import { normalizeScopes } from "./context";
 import { estimateTokens, now, ulid } from "./db";
 import { logSlowRead, type RecallTimings } from './read-timing';
 import { applyBlockOp, resolveCharLimit, type BlockOp } from "./memory";
-import { NotesRepo, StaleUpsertError } from "./notes";
+import { NotesRepo, StaleUpsertError, type RecallNoteRow } from "./notes";
 import { PortabilityService } from './portability';
 import { CaptureService } from "./capture";
 import { LogService, logSettings } from "./logs";
 import { GuidedSearchService } from './guided-search';
-import { orderBySalience, packContext, type RecallPack, type RecallTier } from "./recall";
+import { orderBySalience, packContext, type RecallItem, type RecallPack, type RecallTier } from "./recall";
 import { japaneseProseMatch, leadingQuestion, SearchService, SEMANTIC_STATUS } from "./search";
 import { SkillsRepo } from "./skills";
 import { slugify } from "./slug";
@@ -509,36 +509,23 @@ export class RecallService {
   /** Shown when the author's row cannot be read: the item is still marked. */
   static readonly UNKNOWN_AUTHOR = "unknown";
 
-  /** Who wrote what this recall is about to deliver, in one batched round-trip:
-   * handle per note-owner id, owner id per skill id, and per note the member who
-   * wrote its latest revision — the current title/body/tags, since a revision is
-   * recorded exactly when those change (notes.ts upsert, appendReviewed).
-   *
-   * A revision names its writer as `editor_ref`: the handle on the human door,
-   * the token subject `user:<account id>` on the Bearer door, and
-   * `machine:<name>` for a machine token, which acts as the owner. Those are
-   * the only forms a write records today, so a teammate's write-through always
-   * resolves to a member. A reference that resolves to nobody (an API-key
-   * prefix from before sharing existed, a note with no revision) leaves the
-   * note out of `editors`, and the caller then treats the row's owner as the
-   * writer. */
-  private async authors(noteOwnerIds: string[], skillIds: string[], noteIds: string[]): Promise<{ handles: Map<string, string>; skillOwners: Map<string, string>; editors: Map<string, Array<{ id: string; handle: string | null }>> }> {
+  /** Resolve the references carried by the note snapshots and skill hits.
+   * Each revision reference is the handle, a user subject, or an owner token. */
+  private async authors(noteOwnerIds: string[], skillIds: string[], editorRefs: string[]): Promise<{ handles: Map<string, string>; skillOwners: Map<string, string>; editors: Map<string, Array<{ id: string; handle: string | null }>> }> {
     const handles = new Map<string, string>(), skillOwners = new Map<string, string>(), editors = new Map<string, Array<{ id: string; handle: string | null }>>();
-    if (!this.db || (!noteOwnerIds.length && !skillIds.length && !noteIds.length)) return { handles, skillOwners, editors };
+    if (!this.db || (!noteOwnerIds.length && !skillIds.length && !editorRefs.length)) return { handles, skillOwners, editors };
     const marks = (n: number) => Array(n).fill("?").join(",");
     const statements: D1PreparedStatement[] = [];
-    if (noteOwnerIds.length) statements.push(this.db.prepare(`SELECT id AS user_id, handle, NULL AS skill_id, NULL AS note_id FROM users WHERE id IN (${marks(noteOwnerIds.length)})`).bind(...noteOwnerIds));
-    if (skillIds.length) statements.push(this.db.prepare(`SELECT s.user_id, u.handle, s.id AS skill_id, NULL AS note_id FROM skills s LEFT JOIN users u ON u.id = s.user_id WHERE s.id IN (${marks(skillIds.length)})`).bind(...skillIds));
-    if (noteIds.length) statements.push(this.db.prepare(
-      `SELECT u.id AS user_id, u.handle, NULL AS skill_id, r.note_id
-         FROM note_revisions r
-         JOIN users u ON u.handle = CASE WHEN r.editor_ref LIKE 'machine:%' THEN ? ELSE r.editor_ref END
-                      OR 'user:' || u.auth_user_id = r.editor_ref
-        WHERE r.note_id IN (${marks(noteIds.length)})
-          AND r.id = (SELECT r2.id FROM note_revisions r2 WHERE r2.note_id = r.note_id ORDER BY r2.created_at DESC, r2.id DESC LIMIT 1)`).bind(this.ownerHandle, ...noteIds));
-    for (const result of await this.db.batch<{ user_id: string; handle: string | null; skill_id: string | null; note_id: string | null }>(statements)) {
+    if (noteOwnerIds.length) statements.push(this.db.prepare(`SELECT id AS user_id, handle, NULL AS skill_id, NULL AS editor_ref FROM users WHERE id IN (${marks(noteOwnerIds.length)})`).bind(...noteOwnerIds));
+    if (skillIds.length) statements.push(this.db.prepare(`SELECT s.user_id, u.handle, s.id AS skill_id, NULL AS editor_ref FROM skills s LEFT JOIN users u ON u.id = s.user_id WHERE s.id IN (${marks(skillIds.length)})`).bind(...skillIds));
+    if (editorRefs.length) statements.push(this.db.prepare(
+      `SELECT u.id AS user_id, u.handle, NULL AS skill_id, ref.value AS editor_ref
+         FROM json_each(?) ref JOIN users u
+           ON u.handle = CASE WHEN ref.value LIKE 'machine:%' THEN ? ELSE ref.value END
+           OR u.auth_user_id = CASE WHEN substr(ref.value,1,5)='user:' THEN substr(ref.value,6) END`).bind(JSON.stringify(editorRefs), this.ownerHandle));
+    for (const result of await this.db.batch<{ user_id: string; handle: string | null; skill_id: string | null; editor_ref: string | null }>(statements)) {
       for (const row of result.results ?? []) {
-        if (row.note_id) { editors.set(row.note_id, [...(editors.get(row.note_id) ?? []), { id: row.user_id, handle: row.handle }]); continue; }
+        if (row.editor_ref) { editors.set(row.editor_ref, [...(editors.get(row.editor_ref) ?? []), { id: row.user_id, handle: row.handle }]); continue; }
         if (row.handle) handles.set(row.user_id, row.handle);
         if (row.skill_id) skillOwners.set(row.skill_id, row.user_id);
       }
@@ -629,17 +616,23 @@ export class RecallService {
     // The reader's own note that the reader (or the owner's machine token) last
     // wrote carries neither. A skill whose owner cannot be read is treated as
     // someone else's; skills have no write-through.
-    const foreignOwners = new Set<string>();
-    for (const row of rows.values()) if (row.user_id !== principal.userId) foreignOwners.add(row.user_id);
-    const { handles, skillOwners, editors } = await this.authors([...foreignOwners], skillHits.map((h) => h.id), [...rows.keys()]);
+    const foreignOwners = new Set<string>(), editorRefs = new Set<string>();
+    for (const row of rows.values()) {
+      if (row.user_id !== principal.userId) foreignOwners.add(row.user_id);
+      if (row.recall_revision_state === "matching" && row.recall_editor_ref) editorRefs.add(row.recall_editor_ref);
+    }
+    const { handles, skillOwners, editors } = await this.authors([...foreignOwners], skillHits.map((h) => h.id), [...editorRefs]);
     const sharedBy = (ownerId: string | undefined): { shared_by?: string } =>
       ownerId === principal.userId ? {} : { shared_by: (ownerId && handles.get(ownerId)) || RecallService.UNKNOWN_AUTHOR };
-    const writtenBy = (row: { id: string; user_id: string }): { shared_by?: string; edited_by?: string } => {
-      const matched = editors.get(row.id) ?? [];
+    const writtenBy = (row: RecallNoteRow): Pick<RecallItem, "shared_by" | "edited_by" | "author_unverified"> => {
+      const owner = sharedBy(row.user_id);
+      const matched = row.recall_revision_state === "matching" && row.recall_editor_ref ? editors.get(row.recall_editor_ref) ?? [] : [];
       // editor_ref resolves to one member; were it ever to match two, prefer the
       // one that is not the owner so the item is marked rather than not.
       const editor = matched.find((e) => e.id !== row.user_id) ?? matched[0];
-      return { ...sharedBy(row.user_id), ...(editor && editor.id !== row.user_id ? { edited_by: editor.handle || RecallService.UNKNOWN_AUTHOR } : {}) };
+      if (editor && editor.id !== row.user_id) return { ...owner, edited_by: editor.handle || RecallService.UNKNOWN_AUTHOR };
+      if (!editor) return { ...owner, author_unverified: true };
+      return owner;
     };
     for (const h of skillHits) {
       skillItems.push({ ref: h.slug, title: `skill:${h.title}`, text: h.snippet,
@@ -666,7 +659,7 @@ export class RecallService {
     const nowMs = now();
     const STAGE_ORD: Record<string, number> = { seedling: 0, budding: 1, evergreen: 2 };
     const noteIdByItem = new Map<{ ref: string; title: string; text: string }, string>();
-    const noteCands: Array<{ item: { ref: string; title: string; text: string; source_chars: number; source_tokens: number; preview_truncated: boolean; source_type: "note"; shared_by?: string; edited_by?: string }; relevance: number; views: number; stage: number; ageMs: number }> = [];
+    const noteCands: Array<{ item: RecallItem; relevance: number; views: number; stage: number; ageMs: number }> = [];
     for (const n of noteSummaries) {
       const row = rows.get(n.id);
       if (row && !row.deleted_at) {
@@ -692,7 +685,7 @@ export class RecallService {
     const orderedCands = q ? orderBySalience(noteCands) : noteCands;
     const noteItems = orderedCands.map((c) => c.item);
 
-    const ambientItems: Array<{ ref: string; title: string; text: string; source_chars: number; source_tokens: number; preview_truncated: boolean; source_type: "note"; shared_by?: string; edited_by?: string }> = [];
+    const ambientItems: RecallItem[] = [];
     for (const a of ambient) {
       const row = rows.get(a.id);
       if (row && !row.deleted_at) {
