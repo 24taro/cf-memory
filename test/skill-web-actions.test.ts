@@ -15,10 +15,8 @@
 //      decision 9 (owner-only) that means self-forks only. Forking another
 //      user's skill 404s and creates nothing. Anonymous fork attempts
 //      redirect to /login (or 401 for non-browser accepts).
-//   3. POST /@:handle/skills/:slug/delete -- owner-only (fetched via
-//      principal.userId, mirroring softDelete's own fail-closed re-check); a
-//      non-owner's attempt is a silent no-op (no 500), the skill still exists
-//      afterward.
+//   3. POST /@:handle/skills/:slug/delete -- the caller must own the named
+//      namespace. A request for another namespace leaves both skills intact.
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
@@ -260,8 +258,9 @@ describe("POST /@:handle/skills/:slug/delete", () => {
     expect(after.status).toBe(404);
   });
 
-  it("a non-owner attempting to delete someone else's skill does not delete it and does not 500", async () => {
+  it("keeps both skills when their slug matches and the caller uses the other owner's URL", async () => {
     await createSkill(OWNER_BEARER, "sw-delete-nonowner", { name: "残るはずのスキル" });
+    await createSkill(OTHER_BEARER, "sw-delete-nonowner", { name: "別のアカウントの同名スキル" });
 
     const res = await req("/@skill-web-actions-owner/skills/sw-delete-nonowner/delete", {
       method: "POST",
@@ -272,6 +271,9 @@ describe("POST /@:handle/skills/:slug/delete", () => {
     const stillThere = await req("/@skill-web-actions-owner/skills/sw-delete-nonowner", { headers: { get authorization() { return `Bearer ${OWNER_BEARER}`; } } });
     expect(stillThere.status).toBe(200);
     expect(await stillThere.text()).toContain("残るはずのスキル");
+    const callerSkill = await req(`/@${OTHER_HANDLE}/skills/sw-delete-nonowner`, { headers: { get authorization() { return `Bearer ${OTHER_BEARER}`; } } });
+    expect(callerSkill.status).toBe(200);
+    expect(await callerSkill.text()).toContain("別のアカウントの同名スキル");
   });
 
   it("an anonymous delete attempt redirects to /login and does not delete anything", async () => {

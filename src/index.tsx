@@ -770,14 +770,13 @@ app.post(`${H}/skills/:slug/fork`, async (c) => {
   return c.redirect(`/@${principal.handle}/skills/${result.skill.slug}`);
 });
 
-// issue #54: owner-only delete, mirroring skills.softDelete's own fail-closed
-// re-check (user_id === principal.userId) -- fetched via principal.userId so a
-// non-owner's request simply finds nothing and no-ops, no 500, no redundant
-// second ownership check duplicated here.
+// A delete uses the namespace in the submitted URL. Requests for another
+// namespace keep the existing redirect without changing either user's skill.
 app.post(`${H}/skills/:slug/delete`, async (c) => {
   const { services, principal } = c.var;
   const handle = c.req.param("h").slice(1);
   if (!allows(principal, "notes:write")) return ownerOnlyDenied(c);
+  if (handle !== principal.handle) return c.redirect(`/@${handle}`);
   const slug = slugify(c.req.param("slug"));
   const skill = await services.skills.getBySlug(principal.userId, slug);
   if (skill) await services.skills.softDelete(principal, skill.id);
