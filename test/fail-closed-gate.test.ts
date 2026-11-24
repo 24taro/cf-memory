@@ -110,6 +110,22 @@ describe("fail-closed gate (decision 9) — anonymous is stopped before any rout
     expect((await anonymous("/", { headers: { accept: "text/html" } })).status).toBe(302);
   });
 
+  it("serves private data, authentication errors and sign-in without caching responses", async () => {
+    const cookie = `CF_Authorization=${await jwtFor("gate-owner@example.com")}`;
+    const notes = await req("/api/v1/notes", { headers: { cookie } });
+    expect(notes.status).toBe(200);
+    expect(notes.headers.get("cache-control")).toBe("private, no-store");
+    expect((await req("/api/v1/notes")).headers.get("cache-control")).toBe("private, no-store");
+    expect((await req("/access/login")).headers.get("cache-control")).toBe("private, no-store");
+    const url = "https://memory.test/.well-known/oauth-protected-resource/mcp";
+    const oauth = await app.request(url, {}, { ...env!, AUTH_ISSUER: TEST_ISSUER });
+    expect(oauth.status).toBe(200);
+    expect(oauth.headers.get("cache-control")).toBe("public, max-age=300");
+    const singleOwner = await app.request(url, {}, { ...env!, AUTH_ISSUER: undefined });
+    expect(singleOwner.status).toBe(404);
+    expect(singleOwner.headers.get("cache-control")).toBe("private, no-store");
+  });
+
   it("seeds one owner for simultaneous valid first requests", async () => {
     const apiToken = "c".repeat(32);
     const fresh = { ...env!, OWNER_HANDLE: "first-owner", OWNER_EMAIL: "first-owner@example.com", API_TOKEN: apiToken };

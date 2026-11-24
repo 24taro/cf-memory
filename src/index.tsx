@@ -37,6 +37,7 @@ type Vars = {
 };
 
 const app = new Hono<{ Bindings: Env; Variables: Vars }>();
+const OAUTH_METADATA_PATH = "/.well-known/oauth-protected-resource/mcp";
 
 // W1: HTTP methods the CSRF Origin check below treats as state-changing.
 // GET/HEAD are read-only and OPTIONS is a preflight, never a real state change,
@@ -44,14 +45,14 @@ const app = new Hono<{ Bindings: Env; Variables: Vars }>();
 const CSRF_GUARDED_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 app.use("*", async (c, next) => {
-  const privateCapture = /^\/(?:capture(?:\/|$)|api\/v1\/capture(?:\/|$)|agent-health$|provenance\/|version$)/.test(new URL(c.req.url).pathname);
-  if (privateCapture) c.header('Cache-Control', 'private, no-store');
+  const url = new URL(c.req.url);
+  const publicMetadata = url.pathname === OAUTH_METADATA_PATH;
+  if (!publicMetadata) c.header("Cache-Control", "private, no-store");
   const env = c.env;
   c.set("services", makeServices(env.DB, env.BUNDLES ?? null, env, task => {
     try { c.executionCtx.waitUntil(task); }
     catch { return task; } // Direct app/test callers without an ExecutionContext.
   }));
-  const url = new URL(c.req.url);
   const principal = await resolvePrincipal(env.DB, env, c.req.raw.headers);
   c.set("principal", principal);
   // W1 (security, defense-in-depth): CSRF Origin check for cookie-authenticated
@@ -81,8 +82,9 @@ app.use("*", async (c, next) => {
   const nonce = crypto.randomUUID();
   c.set("cspNonce", nonce);
   await next();
-  // requireRead may replace the prepared headers with a new Response.
-  if (privateCapture) c.header('Cache-Control', 'private, no-store');
+  // The OAuth discovery document opts into caching. Data, sign-in responses,
+  // and errors stay private, including handlers that return a new Response.
+  if (!publicMetadata || c.res.status !== 200) c.header("Cache-Control", "private, no-store");
   // Defense-in-depth against stored XSS (markdown.ts sanitizes renderMarkdown's
   // output, but this is a second, independent layer): a restrictive CSP on every
   // response. No 'unsafe-inline' for script-src — the one legitimate inline
@@ -247,7 +249,7 @@ function resourceMetadataUrl(env: Env, requestUrl: string): string {
  * to be consistent, and this server's resource is `…/mcp` — advertising the
  * same body at both paths makes one of them wrong. The WWW-Authenticate header
  * points here, so nothing has to probe. */
-app.get("/.well-known/oauth-protected-resource/mcp", (c) => {
+app.get(OAUTH_METADATA_PATH, (c) => {
   const issuer = c.env.AUTH_ISSUER?.trim();
   // Single-owner mode has no authorization server to advertise.
   if (!issuer) return c.json({ error: "not found: this instance has no authorization server (it accepts its API token)" }, 404);
