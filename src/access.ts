@@ -81,7 +81,7 @@ async function refreshKeys(teamDomain: string): Promise<Map<string, CryptoKey>> 
   try {
     const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
       cache: "no-store",
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(JWKS_TIMEOUT_MS),
     });
     if (!res.ok) {

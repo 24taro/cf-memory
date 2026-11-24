@@ -48,7 +48,7 @@ export async function introspectToken(
     res = await config.auth.fetch(
       new Request("https://auth.internal/introspect", {
         method: "POST",
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(INTROSPECTION_TIMEOUT_MS),
         headers: {
           authorization: `Bearer ${config.secret}`,

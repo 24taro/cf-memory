@@ -174,6 +174,7 @@ describe("JWKS rotation: kid miss triggers ONE refetch", () => {
     expect(await verifyAccessJwt(await signJwt(validPayload(), { kid: "new-kid" }), fullEnv())).toBeNull();
     expect(await verifyAccessJwt(await signJwt(validPayload()), fullEnv())).toEqual({ email: "owner@example.com", sub: "sub-abc" });
     expect(fetchKeys).toHaveBeenCalledOnce();
+    expect(fetchKeys).toHaveBeenCalledWith(`https://${TEAM}/cdn-cgi/access/certs`, expect.objectContaining({ redirect: "manual" }));
   });
 
   it("refreshes an expired key set and stops accepting retired keys", async () => {

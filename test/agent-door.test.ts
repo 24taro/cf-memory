@@ -10,8 +10,9 @@
 // by helpers.ts's stub so introspection can be made to answer adversarially.
 
 import { readFileSync, readdirSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
+import ts from "typescript";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import app from "../src/index";
 import { TEST_RESOURCE, accessEnvVars, bearerTokenFor, rsEnvVars } from "./helpers";
@@ -120,6 +121,52 @@ describe("agent door — which account a subject resolves to", () => {
 });
 
 describe("agent door — what introspection says", () => {
+  it("uses the native Workers service binding for valid, delayed, and redirected responses", async () => {
+    const compat = { compatibilityDate: "2025-06-01", compatibilityFlags: ["nodejs_compat"] };
+    const modules = ["src/rs-introspect", "src/bounded-body"].map(path => ({
+      type: "ESModule" as const,
+      path: resolve(path),
+      contents: ts.transpileModule(readFileSync(path + ".ts", "utf8"), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+      }).outputText,
+    }));
+    const runtime = new Miniflare(convertV4MiniflareOptions({ workers: [
+      {
+        ...compat, name: "gateway", modulesRoot: resolve("."), serviceBindings: { AUTH: "fixture-auth" },
+        modules: [{
+          type: "ESModule", path: resolve("test/auth-binding-client.mjs"),
+          contents: `
+            import { introspectToken } from '../src/rs-introspect';
+            export default { async fetch(request, env) {
+              const name = new URL(request.url).pathname.slice(1);
+              const result = await introspectToken(name, { auth: env.AUTH, secret: 'fixture-secret', audience: 'fixture-audience' });
+              return Response.json(result?.subject ?? null);
+            } };
+          `,
+        }, ...modules],
+      },
+      {
+        ...compat, name: "fixture-auth", modules: true, script: `
+          export default { async fetch(request) {
+            if (request.headers.get('authorization') !== 'Bearer fixture-secret') return new Response(null, {status: 401});
+            const token = new URLSearchParams(await request.text()).get('token');
+            if (token === 'redirected') return Response.redirect('https://auth.internal/secondary', 302);
+            if (token === 'delayed') await new Promise(resolve => setTimeout(resolve, 7000));
+            return Response.json({active:true,sub:'machine:fixture',aud:'fixture-audience',scope:'notes:read'});
+          } };
+        `,
+      },
+    ] }));
+    try {
+      const invoke = async (kind: string) => (await runtime.dispatchFetch("http://gateway.test/" + kind)).json();
+      expect(await invoke("active")).toBe("machine:fixture");
+      expect(await invoke("redirected")).toBeNull();
+      expect(await invoke("delayed")).toBeNull();
+    } finally {
+      await runtime.dispose();
+    }
+  }, 20_000);
+
   it("refuses a token the authorization server does not know", async () => {
     expect((await get("/api/v1/notes", "at_test_never_issued")).status).toBe(401);
   });
