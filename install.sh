@@ -66,10 +66,12 @@ wrangler() { node node_modules/wrangler/bin/wrangler.js "$@"; }
 say "Checking the Cloudflare login"
 # `wrangler whoami` exits 0 even when logged out, so read what it says.
 logged_out() { wrangler whoami 2>&1 | grep -qi "not authenticated"; }
+login_required() { fail "not logged in to Cloudflare. Run 'npx wrangler login' and then this script again"; }
 if logged_out; then
+  if [[ "${CI:-}" == true || "${CI:-}" == 1 ]]; then login_required; fi
   echo "A browser window opens for the Cloudflare login. Choose Allow, then come back here."
   wrangler login || true
-  if logged_out; then fail "not logged in to Cloudflare. Run 'npx wrangler login' and then this script again"; fi
+  if logged_out; then login_required; fi
 fi
 
 # The owner's token. Kept in this checkout, readable only by you, never committed.

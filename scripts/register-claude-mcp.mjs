@@ -17,7 +17,7 @@ function register(config) {
   if (typeof servers !== 'object' || Array.isArray(servers)) throw new Error('Invalid Claude Code MCP settings');
   if (!Object.hasOwn(servers, name)) {
     execFileSync('claude', ['mcp', 'add-json', '--scope', 'user', name, '-'], {
-      input: JSON.stringify(config), stdio: ['pipe', 'ignore', 'ignore'],
+      input: JSON.stringify(config), stdio: ['pipe', 'ignore', 'ignore'], timeout: 30_000, killSignal: 'SIGKILL',
     });
     const installed = JSON.parse(readFileSync(registeredPath, 'utf8')).mcpServers?.[name];
     if (installed?.url !== config.url || installed?.headers?.Authorization !== config.headers.Authorization) {

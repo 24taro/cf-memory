@@ -76,6 +76,7 @@ interface InstallFixtureOptions {
   rotation?: 'start' | 'resume' | 'upload-fails';
   storageChange?: 'configured' | 'saved-binding' | 'after-deploy' | 'recreated-bucket';
   legacyStorage?: boolean;
+  loggedOut?: boolean;
   existingUrl?: string;
 }
 
@@ -84,7 +85,7 @@ const logDB = '22222222-2222-4222-8222-222222222222';
 const otherDB = '33333333-3333-4333-8333-333333333333';
 const bucketCreatedAt = '2026-11-22T00:00:00.000Z';
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, storageChange, legacyStorage = false, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, storageChange, legacyStorage = false, loggedOut = false, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -135,6 +136,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
       if (args[0] === 'whoami' && args.includes('--json')) {
         console.log(JSON.stringify({ accounts: [{ id: 'a'.repeat(32) }] }));
       }
+      if (args[0] === 'whoami' && process.env.LOGGED_OUT === 'true') console.log('You are not authenticated');
       if (args[0] === 'deploy') console.log('https://test.example.workers.dev');
       if (args[0] === 'deploy' && process.env.CLOUDFLARE_ACCOUNT_ID) {
         require('node:fs').appendFileSync(process.env.TRACE, JSON.stringify([
@@ -212,6 +214,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
         HOME: root, CODEX_HOME: join(root, '.codex'), PATH: `${bin}:/usr/bin:/bin`,
         WORKER: worker, TRACE: trace, RESERVATION: reservation, NODE_OPTIONS: `--import=${fetchMock}`, TOKEN_ACCEPTED: String(tokenAccepted),
         ROTATION: rotation ?? '', REMOTE_TOKEN_FILE: remoteTokenFile,
+        ...(loggedOut ? { CI: 'true', LOGGED_OUT: 'true' } : {}),
       },
     });
     const calls = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
@@ -229,6 +232,14 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+it('requires preconfigured Cloudflare authentication in CI without starting a browser login', () => {
+  const setup = installFixture({ worker: 'missing', savedToken: false, loggedOut: true });
+  expect(setup.result.status).toBe(1);
+  expect(setup.result.stderr).toContain('not logged in to Cloudflare');
+  expect(setup.calls).toEqual([['whoami']]);
+  expect(setup.tokenExists).toBe(false);
+});
 
 it('rotates the token only at the bound Worker and keeps the deployment settings and migrations untouched', () => {
   const f = installFixture({ bindingPhase: 'ready', rotation: 'start' });
