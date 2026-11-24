@@ -244,7 +244,18 @@ export class CaptureService {
     return { hits: rows.sort((a, b) => b.source_at - a.source_at || a.id.localeCompare(b.id)).slice(0, count), context_applied: args.context != null };
   }
   async provenance(memoryKind: 'note' | 'skill', memoryId: string, p?: Principal) {
-    const rows = await this.db.prepare(`SELECT event_id,source_session_id,actor_id,relation,generated_by,confidence,rationale,source_metadata_json,created_at FROM memory_provenance WHERE memory_kind=? AND memory_id=? AND ${provenanceReadable('')} ORDER BY created_at,event_id LIMIT 100`).bind(memoryKind, memoryId, p?.userId || 'anonymous').all<ProvenanceRow>();
+    if (!p || p.anonymous) return [];
+    const access = readableSql('m', p);
+    const table = memoryKind === 'note' ? 'notes' : 'skills';
+    // Read the memory and source permissions together. The owner retains the
+    // provenance of soft-deleted memories for retraction and restore.
+    const rows = await this.db.prepare(`SELECT pv.event_id,pv.source_session_id,pv.actor_id,pv.relation,pv.generated_by,
+      pv.confidence,pv.rationale,pv.source_metadata_json,pv.created_at
+      FROM memory_provenance pv JOIN ${table} m ON m.id=pv.memory_id
+      WHERE pv.memory_kind=? AND pv.memory_id=? AND ${access.sql}
+        AND (m.deleted_at IS NULL OR m.user_id=?) AND ${provenanceReadable('pv')}
+      ORDER BY pv.created_at,pv.event_id LIMIT 100`)
+      .bind(memoryKind, memoryId, ...access.args, p.userId, p.userId).all<ProvenanceRow>();
     return (rows.results ?? []).map(row => ({ ...row, source: JSON.parse(row.source_metadata_json), source_metadata_json: undefined }));
   }
   private async provenanceSources(p: Principal, value: unknown, shared: boolean) {

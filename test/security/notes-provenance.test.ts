@@ -114,6 +114,7 @@ describe("personal provenance stays with its actor after the note becomes shared
       await f.services.notes.upsert(f.alice, { slug, body_md: `${word} body`, shared: false });
       expect((await f.row<{ n: number }>("SELECT count(*) AS n FROM memory_provenance WHERE memory_id=?", note.id))!.n).toBe(2);
       expect(((await f.services.capture.provenance("note", note.id, f.alice)) as unknown as Prov).map((p) => p.event_id).sort()).toEqual([eid(n), eid(n + 1)]);
+      expect(await f.services.capture.provenance("note", note.id, f.bob)).toEqual([]);
       expect((await f.req(`/api/v1/notes/${note.id}`, f.bobToken)).status).toBe(404);
     });
   });
@@ -124,11 +125,11 @@ describe("personal provenance stays with its actor after the note becomes shared
     await expect(f.services.capture.attach(f.alice, { memory_id: note.id, source_event_ids: [eid(90)] })).rejects.toThrow("personal source cannot promote to shared memory");
   });
 
-  it("an anonymous or unauthenticated reader gets no personal rows from the service either", async () => {
-    await f.services.capture.put(f.alice, event(95, "personal", "src/dummy-personal-anon.ts"));
-    const { note } = await f.services.notes.upsert(f.alice, { slug: "prov-anon", title: "T", body_md: "x", shared: false });
+  it("an unauthenticated reader gets no provenance for a shared memory", async () => {
+    await f.services.capture.put(f.alice, event(95, "project", "src/dummy-project-anon.ts"));
+    const { note } = await f.services.notes.upsert(f.alice, { slug: "prov-anon", title: "T", body_md: "x", shared: true });
     await f.services.capture.attach(f.alice, { memory_id: note.id, source_event_ids: [eid(95)] });
-    await f.services.notes.upsert(f.alice, { slug: "prov-anon", body_md: "x", shared: true });
+    expect(await f.services.capture.provenance("note", note.id, f.bob)).toHaveLength(1);
     expect(await f.services.capture.provenance("note", note.id)).toEqual([]);
   });
 });

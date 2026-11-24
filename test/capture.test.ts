@@ -239,7 +239,7 @@ it('fifty-source provenance uses bounded set-based operations and preserves meta
   }
   const { note } = await services.notes.upsert(alice, { slug: 'many-sources', title: 'Observed contract', body_md: 'The database has a verified transaction contract.', type: 'project' });
   await services.capture.attach(alice, { memory_id: note.id, source_event_ids: ids, confidence: 0.98, rationale: 'ADD: supported fact' });
-  const provenance = await services.capture.provenance('note', note.id);
+  const provenance = await services.capture.provenance('note', note.id, alice);
   expect(provenance).toHaveLength(50);
   expect(provenance[0].rationale).toBe('ADD: supported fact');
   expect(provenance[0].source.occurred_at).toBeGreaterThan(0);
