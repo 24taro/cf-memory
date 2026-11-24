@@ -119,12 +119,11 @@ export async function runHook({ client, event, payload, env = process.env, fetch
     if (queue) {
       entries = buildEntries({ client, event, hook, repo: repo.repo, ts: eventTime(payload, at) });
       if (entries.length) {
-        // Each entry is queued for the server configured now, and for the account
-        // only when the token at hand (no Keychain read here) is known to be its
-        // own: a later flush for another server or account does not send it.
+        // Record the credential available at queue time. A refresh or account
+        // switch during the flush must never assign the entry to a new account.
         try {
           if (!env.CF_MEMORY_MCP_URL || !env.CF_MEMORY_ACCESS_TOKEN) config = await claudeConfig(env, deadline);
-          dropped = (await appendEntries(home, client, entries, await queuedFor(env, home, config, at))).dropped;
+          dropped = (await appendEntries(home, client, entries, await queuedFor(env, home, config, at, deadline))).dropped;
         } catch (error) { patch.last_error = { at, where: 'spool', code: failureCode(error) }; }
       }
     }
@@ -171,7 +170,7 @@ export async function runHook({ client, event, payload, env = process.env, fetch
       ? destination(connection, flushCall, home, at)
         // Back under this account, or its token just identified: what was held and is known to be its own goes too.
         .then(async to => { if (to.changed) await knownCreds(home).then(creds => requeueOwn(home, client, to, creds)).catch(() => {}); return to; })
-        .then(to => flush(home, client, batch => flushCall('log_append', { entries: batch }), { deadline: flushDeadline, to, own: new Set(entries.map(entry => entry.id)) }))
+        .then(to => flush(home, client, batch => flushCall('log_append', { entries: batch }), { deadline: flushDeadline, to }))
         .catch(error => ({ error }))
       : null;
     let budget = settings.recall_budget;

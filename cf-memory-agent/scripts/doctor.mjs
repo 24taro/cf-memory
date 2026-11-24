@@ -136,7 +136,7 @@ export async function doctor({ env = process.env, fetcher = fetch, refresh = fal
         report.warnings.push(what + 'were queued for account ' + group.account + ' on ' + group.origin + ', which is not the server and account now configured' + (current.account ? '' : ' (or the account could not be checked)') +
           ': they are not sent here. Once that server and account are configured again: ' + replay + ' --account ' + group.account);
       } else if (group.origin === null || group.origin === current.origin) {
-        report.problems.push(what + (group.origin === null ? 'have no readable destination' : 'were queued for ' + group.origin + ' but the account that queued them is not known (no token was at hand, or one no flush has identified, and another account flushed there last or the record in accounts.json was lost)') +
+        report.problems.push(what + (group.origin === null ? 'have no readable destination' : 'were queued for ' + group.origin + ' without a credential linked to a known account') +
           ': they are not sent on their own, and may be another account\'s. Sessions' + (group.sessions.length < 5 ? '' : ' (first 5)') + ': ' + group.sessions.join(', ') +
           '. To send the ones that are the account\'s now configured, name its sessions (or a time range with --since/--until): ' + replay + ' --unknown --session <session id> --to-current');
       } else {

@@ -1,4 +1,4 @@
-# cf-memory agent 0.3.2
+# cf-memory agent 0.3.3
 
 A small hook program for Claude Code and Codex. It keeps the conversation itself
 in cf-memory so agents can find it later by keyword.
@@ -115,40 +115,30 @@ that is known. Each queued line carries `to`: the origin of the server configure
 queued it (`CF_MEMORY_MCP_URL`, else the `~/.claude.json` url, else the default) and what the hook knew
 about the account without a request. The account that flushed last is never assumed.
 
-- `{ origin, account }`: the token at hand (`CF_MEMORY_ACCESS_TOKEN` or the `~/.claude.json` header)
+- `{ origin, account }`: the token at hand (environment, Claude config, or macOS Keychain)
   is one the server's `whoami` already reported for that account.
 - `{ origin, at, cred }`: account unknown. `cred` is a fingerprint of the token at hand (a keyed
   hash; the key is `~/.cf-memory/v3/accounts.key`), `at` the time it was queued.
-- `{ origin, at }`: account unknown and no token at hand: logged out, or the token is in the
-  Keychain (only a flush reads the Keychain, so every entry of a Keychain login is queued this way).
-- `{}`: no usable server url; never sent on its own.
+- `{ origin, at }`: the server is known and a token was unavailable or ambiguous.
+- `{}`: no usable server URL.
 
 A flush first settles which account its token belongs to: the server's `whoami` `user_id`, asked
 once per token and remembered in `~/.cf-memory/v3/accounts.json` (mode 0600) as hashes: per origin the
 accounts seen (a hash of the user id), for each up to 4 tokens (each a hash with its own salt, plus
-its fingerprint; forgotten after 90 days without use), and which account has been flushing there
-and since when. Two live tokens of one account therefore cost one request each, not one per
-switch. No token and no user id is stored. No answer, or an anonymous one, means no flush
+its fingerprint; forgotten after 90 days without use), and which account last flushed there.
+Two live tokens of one account cost one verification request each. Only hashes are stored.
+A missing or anonymous identity leaves the entries queued
 (`no_account`; the entries stay queued). The flush then sends:
 
 - entries labelled with its own account;
-- "account unknown" entries whose fingerprint is its own token's, or one `whoami` reported for
+- entries whose fingerprint is its own token's, or one `whoami` reported for
   this account before. A fingerprint of a token no flush has identified waits, also on a machine
-  with one account (it goes on its own at that token's first flush);
-- "account unknown" entries without a fingerprint only when this account is the first ever seen
-  on that server, or has been the only one flushing there since before the entry was queued.
-  Where another account flushed last, they wait: they are not given to whoever flushes next;
-- the entries the hook queued itself, when the origin matches (the first hook after a login).
+  with one account and goes on its own at that token's first verified flush.
 
-`accounts.json` missing means no account was seen yet. Unreadable or corrupt, nothing is concluded
-from it: entries are queued "account unknown", a flush takes none without a fingerprint, and the
-flush writes the file anew. A server's record dropped for space (8 servers are kept in full) stays
-marked as a server accounts were seen on, so its unknown entries wait as well.
-
-What remains undecidable: with a Keychain login nothing identifies the token when a hook queues, so
-an entry queued under account Y that no flush of Y ever saw (Y logged in, queued, and the previous
-account's token was back before any hook of Y reached the server) still goes to the previous
-account. With `CF_MEMORY_ACCESS_TOKEN` or a `~/.claude.json` header the fingerprint closes this.
+The Keychain lookup at recording time is local and limited to 500 ms. If a
+hook can read a credential later, it can send only entries already bound by
+the rules above. Use one matching Keychain entry per server or set the token
+explicitly in the client environment.
 
 Every other entry (another server, another account, account not known, no destination) moves, with
 its `to`, to `spool/<client>.held.jsonl` and the cursor passes it: it is not sent elsewhere and does
@@ -174,14 +164,10 @@ takes over from another one or its token is identified. The rest needs the opera
 
 `replay-rejected` keeps each entry's destination.
 
-Upgrading from an Agent that recorded no destinations: its spool lines have no `to`. The first
-flush that reaches such a line adopts it, once, as an "account unknown" entry of the server
-configured then, queued at the entry's own time, and the rule above applies. On a machine with one
-account the backlog is delivered as before, with no manual step (the first account seen on a
-server takes what was queued before it). Where another account flushed last, it is held with that
-server as its origin and shown as described above. A backlog queued for one server by the old
-Agent and found after the configuration moved to another server is adopted for the new one: the
-old Agent recorded nothing to tell them apart.
+Agent 0.3.3 holds old entries without an account or token fingerprint. If they
+also lack a server, `doctor` groups them under `--origin none`. Review the
+entries and use a specific `replay-held` selection with `--to-current` to
+assign them to the configured server and account.
 
 Credentials: `CF_MEMORY_ACCESS_TOKEN`, Claude's `mcpServers["cf-memory"].headers`, or the macOS
 Keychain item `Claude Code-credentials` (its `cf-memory|…` MCP OAuth entry). Codex uses the same

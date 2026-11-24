@@ -19,15 +19,13 @@
 // Destinations: a queued line also carries `to` (what the hook knew when it
 // queued it; the forms are listed in transport.mjs). A flush names the
 // destination it delivers to and sends only the entries that are known to be
-// that server's and that account's (`mine` in flush() is the whole rule). Every
+// that server's and that account's. Every
 // other entry moves, with its `to`, to <client>.held.jsonl before the cursor
 // passes it: never sent elsewhere. That file is kept up to 16 MB; past it held
 // entries are dropped and counted. `agent.mjs replay-held` queues held entries
 // again as they are, all of them or a selection (destination, account unknown,
 // session, time); only its `--to-current` gives the selected ones the current
-// destination. A line without `to` was queued by an Agent from before
-// destinations: the first flush that reaches it adopts it, once, as an
-// "account unknown" entry of that flush's server.
+// destination. Legacy entries without `to` stay held with no assigned destination.
 import { appendFile, link, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -129,18 +127,12 @@ function destinationOf(to) {
   if (to.account !== undefined) return typeof to.account === 'string' && ACCOUNT.test(to.account) ? { origin: to.origin, account: to.account } : undefined;
   return { origin: to.origin, at: Number.isFinite(to.at) && to.at >= 0 ? to.at : 0, ...(typeof to.cred === 'string' && ACCOUNT.test(to.cred) ? { cred: to.cred } : {}) };
 }
-// The destination a line has for the flush that reaches it. A line without
-// `to` (an Agent from before destinations) is adopted as an "account unknown"
-// entry of this flush's server, queued when its entry is dated.
-const boundTo = (line, here) => line.to === undefined
-  ? (here?.origin ? { origin: here.origin, at: Number.isFinite(line.ts) && line.ts >= 0 ? line.ts : 0 } : undefined)
-  : destinationOf(line.to);
 // The destination of a flush as transport.mjs destination() gives it; {} (nothing is delivered) when it names no account.
 function flushTo(to) {
   const at = destinationOf(to);
   if (!at?.account) return {};
   return {
-    ...at, since: Number.isFinite(to.since) && to.since >= 0 ? to.since : null,
+    ...at,
     creds: new Set(Array.isArray(to.creds) ? to.creds.filter(cred => typeof cred === 'string' && ACCOUNT.test(cred)) : []),
     others: new Map(Object.entries(to.others && typeof to.others === 'object' ? to.others : {}).filter(([cred, account]) => ACCOUNT.test(cred) && typeof account === 'string' && ACCOUNT.test(account))),
   };
@@ -152,26 +144,23 @@ function flushTo(to) {
 // - Account unknown with a token fingerprint: to the account that token is
 //   known to belong to (it is this flush's token, or whoami reported it for
 //   this account before). A fingerprint not known for this account waits.
-// - Account unknown without one: only when this account is the first ever seen
-//   on the origin, or it has been the only one flushing there since before the
-//   entry was queued (`since`). Where another account flushed last, or nothing
-//   reliable is recorded, the entry waits: it is not given to whoever comes next.
-// A flush that names no destination (no hook or command does) sends only lines without one.
+// - Account unknown without one: waits for explicit operator assignment.
+// Only the local queue tests call flush without a destination.
 function queuedHere(line, at) {
   if (at === undefined) return line.to === undefined;
-  const to = boundTo(line, at);
+  const to = destinationOf(line.to);
   if (!to || !at.origin || to.origin !== at.origin) return false;
   if (to.account) return to.account === at.account;
   if (to.cred) return at.creds.has(to.cred);
-  return at.since !== null && to.at >= at.since;
+  return false;
 }
-// The line as it is held: an adopted line keeps the origin it was adopted for,
-// and a fingerprint known to be another account's becomes that account.
+// Preserve the original destination. A verified token fingerprint can also
+// identify the account for later delivery.
 function heldLine(line, at) {
-  const to = boundTo(line, at);
+  const to = destinationOf(line.to);
   if (!to) return line;
   if (!to.account && to.cred && at?.origin === to.origin && at.others?.has(to.cred)) return { ...line, to: { origin: to.origin, account: at.others.get(to.cred) } };
-  return line.to === undefined ? { ...line, to } : line;
+  return line;
 }
 // The spool line of an entry: the log_append fields, then its destination and flags.
 const spoolLine = (entry, to, replayed) => Buffer.from(JSON.stringify({ ...wireEntry(entry), ...(to === undefined ? {} : { to }), ...(replayed ? { replayed: true } : {}) }) + '\n');
@@ -470,9 +459,6 @@ export const requeueOwn = (home, client, to, creds) => replayHeld(home, client, 
  * and reports `busy`.
  * `to` is the destination `send` delivers to (transport.mjs destination()): only
  * entries known to be queued for it are sent, the others are held (queuedHere).
- * `own`: ids this hook queued itself; on the same origin they go with this flush
- * (the account that queues an entry is the one whose credential the hook then
- * finds, even when another account was the last one seen there).
  * Returns { sent, stored, duplicates, dropped_over_cap, dropped_over_total_cap, ts_clamped, invalid, rejected, rejected_dropped, held, held_dropped, pending_bytes, busy?, error? }
  * (`invalid`: unreadable local lines skipped; `rejected`: entries the server refused;
  * `held`: entries not known to be this destination's, moved to held.jsonl;
@@ -481,10 +467,9 @@ export const requeueOwn = (home, client, to, creds) => replayHeld(home, client, 
  * error 'rejecting': the server refused 20 entries in a row, the rest stays queued;
  * 'budget': the deadline came before the first send; 'timeout': it came after the server answered).
  */
-export async function flush(home, client, send, { deadline, batchEntries = BATCH_ENTRIES, batchBytes = BATCH_BYTES, to, own } = {}) {
+export async function flush(home, client, send, { deadline, batchEntries = BATCH_ENTRIES, batchBytes = BATCH_BYTES, to } = {}) {
   const result = { sent: 0, stored: 0, duplicates: 0, dropped_over_cap: 0, dropped_over_total_cap: 0, ts_clamped: 0, invalid: 0, rejected: 0, rejected_dropped: 0, held: 0, held_dropped: 0, batches: 0 };
   const here = to === undefined ? undefined : flushTo(to);
-  const mine = parsed => queuedHere(parsed, here) || Boolean(here?.origin && own?.has(parsed.id) && destinationOf(parsed.to)?.origin === here.origin);
   await mkdir(spoolDir(home), { recursive: true, mode: 0o700 });
   const lock = await acquire(home, client);
   if (!lock) return { ...result, busy: true, pending_bytes: (await pendingStats(home, client)).bytes };
@@ -531,7 +516,7 @@ export async function flush(home, client, send, { deadline, batchEntries = BATCH
           const [parsed, torn] = stop > start ? lineEntry(chunk.subarray(start, stop).toString('utf8')) : [null, false];
           const entry = parsed && wireEntry(parsed);
           if (torn) result.invalid++; // the torn part before it
-          items.push({ entry, line: parsed, foreign: Boolean(parsed) && !mine(parsed), replayed: parsed?.replayed === true, blank: stop === start, end: offset + stop + 1, bytes: entry ? Buffer.byteLength(JSON.stringify(entry)) : 0 });
+          items.push({ entry, line: parsed, foreign: Boolean(parsed) && !queuedHere(parsed, here), replayed: parsed?.replayed === true, blank: stop === start, end: offset + stop + 1, bytes: entry ? Buffer.byteLength(JSON.stringify(entry)) : 0 });
           start = stop + 1;
         }
         for (let index = 0; index < items.length;) {

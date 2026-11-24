@@ -7,12 +7,11 @@ import { BREAKER_CAP_MS, BREAKER_MS, BUDGET_MS, CONTEXT_MAX, failureLine, flushH
 import { doctor } from '../scripts/doctor.mjs';
 import { makeEntry, sessionKey } from '../scripts/entries.mjs';
 import { appendEntries, pendingStats, SPOOL_ACTION_CAP_BYTES } from '../scripts/spool.mjs';
-import { McpFailure } from '../scripts/transport.mjs';
+import { McpFailure, queuedFor } from '../scripts/transport.mjs';
 import { fakeServer, tempDir, testEnv, TEST_TOKEN } from './helpers/fake-server.mjs';
 
-// A backlog seeded straight into the spool is queued for the fixture server, as a hook would queue it
-// (an entry with no destination is held, not sent: security-spool.test.mjs).
-const queuedAt = server => ({ origin: new URL(server.url).origin });
+// Seed the same server and credential binding a real hook would record.
+const queuedAt = f => queuedFor(f.env, f.home);
 
 async function fixture(behavior, extraEnv = {}) {
   const dir = tempDir(), server = await fakeServer(behavior);
@@ -195,9 +194,10 @@ test('without credentials entries stay in the spool and the failure is recorded'
     const health = f.health('claude-code');
     assert.equal(health.last_flush.error, 'no_credentials');
     assert.equal(f.server.calls.length, 0);
-    // With credentials back, the next hook delivers the backlog.
+    // With credentials back, the next hook delivers its own bound entry.
     await f.run('claude-code', 'Stop', { last_assistant_message: 'done' });
-    assert.deepEqual(f.server.named('log_append').flatMap(c => c.args.entries).map(e => e.kind), ['prompt', 'reply']);
+    assert.deepEqual(f.server.named('log_append').flatMap(c => c.args.entries).map(e => e.kind), ['reply']);
+    assert.equal(f.health('claude-code').last_flush.held, 1);
   } finally { await f.close(); }
 });
 
@@ -206,7 +206,7 @@ test('after a failed flush, tool hooks stay off the network for a minute; other 
   const f = await fixture({ failAppend: () => failing });
   try {
     // An entry left from ten minutes ago makes every tool hook due to flush.
-    await appendEntries(f.home, 'claude-code', [makeEntry({ client: 'claude-code', session_id: 'old', ts: Date.now() - 10 * 60000, kind: 'action', text: 'Bash: old' })], queuedAt(f.server));
+    await appendEntries(f.home, 'claude-code', [makeEntry({ client: 'claude-code', session_id: 'old', ts: Date.now() - 10 * 60000, kind: 'action', text: 'Bash: old' })], await queuedAt(f));
     await f.run('claude-code', 'PostToolUse', { tool_name: 'Bash', tool_input: { command: 'ls' } });
     assert.equal(f.server.named('log_append').length, 1);
     assert.equal(f.health('claude-code').last_flush.error, 'http_503');
@@ -307,7 +307,7 @@ test('a backlog flush stops at its share of the prompt budget, counts as progres
   try {
     const { appendEntries } = await import('../scripts/spool.mjs');
     const { makeEntry } = await import('../scripts/entries.mjs');
-    await appendEntries(f.home, 'claude-code', Array.from({ length: 600 }, (_, i) => makeEntry({ client: 'claude-code', session_id: 'old', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), queuedAt(f.server));
+    await appendEntries(f.home, 'claude-code', Array.from({ length: 600 }, (_, i) => makeEntry({ client: 'claude-code', session_id: 'old', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), await queuedAt(f));
     const started = performance.now();
     const { output } = await f.run('claude-code', 'UserPromptSubmit', { prompt: 'continue the work' });
     const ms = performance.now() - started;
@@ -360,7 +360,7 @@ test('a SessionStart whose session_context fails says so, like recall', async ()
 test('a server that refuses everything: the flush fails, every hook backs off, and doctor warns', async () => {
   const f = await fixture({ rejectEntry: () => true });
   try {
-    await appendEntries(f.home, 'claude-code', Array.from({ length: 24 }, (_, i) => makeEntry({ client: 'claude-code', session_id: 'old', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), queuedAt(f.server));
+    await appendEntries(f.home, 'claude-code', Array.from({ length: 24 }, (_, i) => makeEntry({ client: 'claude-code', session_id: 'old', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), await queuedAt(f));
     await f.run('claude-code', 'Stop', { last_assistant_message: 'done' });
     const health = f.health('claude-code');
     assert.deepEqual([health.last_flush.ok, health.last_flush.error, health.last_flush.rejected], [false, 'rejecting', 20]);

@@ -102,9 +102,9 @@ export async function credentials(env = process.env, allowRefresh = true, deadli
   const server = config?.mcpServers?.['cf-memory'], override = env.CF_MEMORY_MCP_URL || '';
   const issuedTo = issued => !override || origin(override) === origin(issued);
   const configUrl = server?.url || DEFAULT_MCP_URL;
-  let url = override || configUrl, token, source = null, elsewhere = false;
+  let url = override || configUrl, token, source = null, elsewhere = false, ambiguous = false;
   if (env.CF_MEMORY_ACCESS_TOKEN) { token = env.CF_MEMORY_ACCESS_TOKEN; source = 'env'; }
-  else if (server?.headers?.Authorization) {
+  else if (typeof server?.headers?.Authorization === 'string') {
     if (issuedTo(configUrl)) { token = server.headers.Authorization.replace(/^Bearer\s+/i, ''); source = 'claude_config'; } else elsewhere = true;
   }
   if (!token && process.platform === 'darwin' && env.CF_MEMORY_KEYCHAIN !== 'off') {
@@ -114,9 +114,13 @@ export async function credentials(env = process.env, allowRefresh = true, deadli
       const stored = JSON.parse(execFileSync('security', ['find-generic-password', '-s', env.CF_MEMORY_KEYCHAIN_SERVICE || KEYCHAIN_SERVICE, '-w'], {
         encoding: 'utf8', timeout: wait, stdio: ['ignore', 'pipe', 'ignore'],
       }));
-      const entries = Object.entries(stored.mcpOAuth || {}).filter(([key]) => key.startsWith('cf-memory|'));
-      const entry = entries.find(([, value]) => (!value.serverUrl || override || value.serverUrl === configUrl) && issuedTo(value.serverUrl || configUrl));
-      if (!entry && entries.length && override) elsewhere = true;
+      const entries = Object.entries(stored.mcpOAuth || {}).filter(([key, value]) =>
+        key.startsWith('cf-memory|') && typeof value?.accessToken === 'string' && value.accessToken);
+      const matching = entries.filter(([, value]) => (!value.serverUrl || override || value.serverUrl === configUrl) && issuedTo(value.serverUrl || configUrl));
+      // More than one usable credential leaves the active account ambiguous.
+      const entry = matching.length === 1 ? matching[0] : undefined;
+      ambiguous = matching.length > 1;
+      if (!matching.length && entries.length && override) elsewhere = true;
       if (entry) {
         if (allowRefresh && entry[1].refreshToken && Number.isFinite(entry[1].expiresAt) && entry[1].expiresAt < Date.now() + 60000) {
           let timeout = 0;
@@ -134,6 +138,7 @@ export async function credentials(env = process.env, allowRefresh = true, deadli
       if (error?.code === 'ETIMEDOUT' || error?.signal === 'SIGTERM') throw new DOMException('Keychain read timed out', 'TimeoutError');
     }
   }
+  if (ambiguous) throw Object.assign(Error('multiple cf-memory OAuth credentials match this server'), { code: 'ambiguous_credentials' });
   const parsed = new URL(url);
   // `elsewhere`: the only token found was issued for another server.
   if (!token && elsewhere || parsed.username || parsed.password || (parsed.protocol !== 'https:' && !(parsed.protocol === 'http:' && ['127.0.0.1', 'localhost', '[::1]'].includes(parsed.hostname)))) throw Error('unsafe MCP URL');
@@ -150,7 +155,10 @@ export function createMcp({ url, token }, timeout = 8000, fetcher = fetch, respo
         headers: { Authorization: 'Bearer ' + token, 'content-type': 'application/json', Accept: 'application/json, text/event-stream' },
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name, arguments: args } }),
       });
-      if (!response.ok) throw new McpFailure('http', name, response.status);
+      if (!response.ok) {
+        void response.body?.cancel().catch(() => {});
+        throw new McpFailure('http', name, response.status);
+      }
       let raw = await responseText(response, responseLimit), parsed, result;
       try {
         // Stateless cf-memory answers application/json; tolerate an SSE-framed body.
@@ -202,8 +210,7 @@ export function createDeadlineMcp(connection, deadline, fetcher = fetch, cap = 8
 //   { origin, account }    the token at hand is one whoami reported for that account
 //   { origin, at, cred }   account unknown; `cred` identifies the token at hand
 //                          (a keyed hash, key in <agent home>/accounts.key)
-//   { origin, at }         account unknown and no token at hand (logged out, or
-//                          the token is in the Keychain, which only a flush reads)
+//   { origin, at }         no credential could identify an account as the entry was queued
 //   {}                     no usable server url: never sent on its own
 // `at` is the time it was queued. spool.mjs has the delivery rule.
 const ACCOUNTS_MAX = 8, EVICTED_MAX = 64, ORIGIN_ACCOUNTS_MAX = 4, TOKENS_MAX = 4;
@@ -325,15 +332,20 @@ export const accountKey = (at, user) => digest('cf-memory-agent-account', at, us
 /**
  * What a line queued now says about where it goes (see the table above): the
  * configured server and, only when the token at hand is known to belong to it,
- * the account. No Keychain read and no request, so every hook can afford it.
- * The account last seen on the server is never assumed: an entry queued with
- * another token, or with none at hand, is "account unknown" and the flush
- * decides by what is known then (spool.mjs).
+ * the account. The fallback Keychain read is local, bounded and refresh-free.
+ * An entry without a credential stays held until the operator assigns it.
  */
-export async function queuedFor(env, home, config = {}, now = Date.now()) {
-  const at = configuredOrigin(env, config);
+export async function queuedFor(env, home, config = {}, now = Date.now(), deadline = Infinity) {
+  let at = configuredOrigin(env, config), token = tokenAtHand(env, config);
+  if (!token && process.platform === 'darwin' && env.CF_MEMORY_KEYCHAIN !== 'off') {
+    try {
+      const connection = await credentials(env, false, Math.min(deadline, performance.now() + 500), config);
+      token = connection.token;
+      at = origin(connection.url);
+    } catch { /* An unbound entry is kept for explicit recovery. */ }
+  }
   if (!at) return {};
-  const unknown = { origin: at, at: now }, token = tokenAtHand(env, config);
+  const unknown = { origin: at, at: now };
   if (!token) return unknown;
   const seen = seenAt(await readAccounts(home), at);
   const account = seen.state === 'known' ? accountOf(seen.record, token) : null;
@@ -355,15 +367,9 @@ export async function knownCreds(home) {
 /**
  * The destination a connection delivers to. `call` is the MCP client of that
  * same connection (whoami is asked once per token not remembered).
- * Returns { origin, account, since, creds, others, changed }:
+ * Returns { origin, account, creds, others, changed }:
  *   creds   fingerprints of the tokens known to be this account's (this one included)
  *   others  { cred: account } for the other accounts recorded on the origin
- *   since   "account unknown" entries without a known fingerprint are this
- *           account's when queued at or after this time: 0 for the first account
- *           ever seen on the origin, the start of the account's uninterrupted
- *           run of flushes there otherwise, null (none are) when another account
- *           flushed last, or when the record is unreadable, forgotten or could
- *           not be written.
  *   changed true when this flush learned something: a token newly identified,
  *           or the account taking over from another one (held entries known to
  *           be this account's can go now; see requeueOwn in spool.mjs).
@@ -383,8 +389,9 @@ export async function destination(connection, call, home, now = Date.now()) {
     account = accountKey(at, user);
   }
   const before = seen.state === 'known' ? seen.record : { at: 0, run: null, accounts: {} };
-  let since = seen.state === 'new' ? 0 : before.run?.account === account ? before.run.since : null;
-  const run = since === null ? { account, since: now } : { account, since };
+  // Retain the existing on-disk shape for account change detection. The
+  // timestamp carries no delivery authority.
+  const run = before.run?.account === account ? before.run : { account, since: now };
   const mine = before.accounts[account] ?? { at: 0, tokens: [] };
   const current = mine.tokens.find(token => token.hash === digest(token.salt, connection.token));
   const salt = current?.salt ?? digest(randomUUID(), randomUUID());
@@ -395,14 +402,12 @@ export async function destination(connection, call, home, now = Date.now()) {
   if (changed || now - (current?.at ?? 0) > TOUCH_MS) {
     const tokens = [token, ...mine.tokens.filter(other => other !== current && now - other.at < TOKEN_AGE_MS).sort((a, b) => b.at - a.at)].slice(0, TOKENS_MAX);
     const rest = Object.entries(before.accounts).filter(([key]) => key !== account).sort((a, b) => b[1].at - a[1].at).slice(0, ORIGIN_ACCOUNTS_MAX - 1);
-    try { await writeAccounts(home, book, at, { at: now, run, accounts: Object.fromEntries([[account, { at: now, tokens }], ...rest]) }); } catch {
-      // Not recorded, so the next flush would conclude the same again: unknown entries wait.
-      if (changed) since = null;
-    }
+    // If recording fails, a later flush verifies the credential again.
+    await writeAccounts(home, book, at, { at: now, run, accounts: Object.fromEntries([[account, { at: now, tokens }], ...rest]) }).catch(() => {});
   }
   const creds = [...new Set([cred, ...mine.tokens.map(known => known.cred)].filter(Boolean))];
   const others = Object.fromEntries(Object.entries(before.accounts).filter(([key]) => key !== account).flatMap(([key, entry]) => entry.tokens.filter(known => known.cred).map(known => [known.cred, key])));
-  return { origin: at, account, since, creds, others, changed };
+  return { origin: at, account, creds, others, changed };
 }
 
 // Safe diagnostic code for health files: never an exception message.
@@ -412,7 +417,7 @@ export function failureCode(error) {
     if (error.validation) return error.validation.batch ? 'invalid_batch' : 'invalid_entry';
     return error.kind;
   }
-  if (error?.code === 'no_credentials' || error?.code === 'no_account' || error?.code === 'budget') return error.code;
+  if (['no_credentials', 'ambiguous_credentials', 'no_account', 'budget'].includes(error?.code)) return error.code;
   if (['TimeoutError', 'AbortError'].includes(error?.name)) return 'timeout';
   if (error?.message === 'unsafe MCP URL') return 'unsafe_url';
   if (['ENOSPC', 'EACCES', 'EROFS', 'EPERM', 'EMFILE'].includes(error?.code)) return error.code;

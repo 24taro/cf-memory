@@ -44,11 +44,10 @@ other; it is not a boundary between mutually distrusting tenants.
   token whose address equals an invited, not yet linked row is linked to it.
 - A `machine:` token acts as the instance owner.
 - A Bearer token reads only with `notes:read`.
-- On macOS with Keychain OAuth, queued entries can reach the previous account
-  if you queue them under a new account on the same server and switch back
-  before the new account's first successful flush. Keep one account per client
-  profile, or use an explicit token so entries can be tied to the credential
-  when queued.
+- The hooks bind new queued entries to their credential when recording them,
+  including macOS Keychain OAuth. If the credential is unavailable or
+  ambiguous, the entries stay local for explicit review and recovery.
+  [Agent queue and recovery](cf-memory-agent/README.md).
 
 **Remote images.** A note may embed an `https:` image from any host. Opening the
 page in a browser requests it, so that host sees the reader's IP address.

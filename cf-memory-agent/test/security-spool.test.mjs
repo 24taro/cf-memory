@@ -83,7 +83,67 @@ function setup(url, token = TOKEN_X) {
 const lines = path => existsSync(path) ? readFileSync(path, 'utf8').split('\n').filter(Boolean).map(line => JSON.parse(line)) : [];
 const entry = (text, extra = {}) => makeEntry({ client: CLIENT, session_id: 'security-session', repo: '', ts: Date.now(), kind: 'prompt', text, ...extra });
 
-test('queued while logged out with server A configured, then pointed at server B: B never receives it; it is held, reported, and goes to A later', async () => {
+function simulatedKeychain(s) {
+  const bin = join(s.dir.path, 'keychain-bin');
+  mkdirSync(bin);
+  writeFileSync(join(bin, 'security'), '#!/bin/sh\nexec /bin/cat "${0%/*}/keychain.json"\n', { mode: 0o755 });
+  writeFileSync(join(bin, 'claude'), '#!/bin/sh\nexec /bin/cp "${0%/*}/next.json" "${0%/*}/keychain.json"\n', { mode: 0o755 });
+  const set = (tokens, { refresh = false, next = false } = {}) => {
+    const mcpOAuth = Object.fromEntries(tokens.map((accessToken, index) => ['cf-memory|' + index, {
+      serverUrl: s.env.CF_MEMORY_MCP_URL, accessToken,
+      ...(refresh ? { refreshToken: 'fixture-refresh', expiresAt: 1 } : {}),
+    }]));
+    writeFileSync(join(bin, next ? 'next.json' : 'keychain.json'), JSON.stringify({ mcpOAuth }), { mode: 0o600 });
+  };
+  const env = { ...s.loggedOut, CF_MEMORY_KEYCHAIN: 'on', CF_MEMORY_CLAUDE_BIN: join(bin, 'claude') };
+  return { bin, env, set };
+}
+
+test('macOS Keychain keeps a queued tool event with the account recording it', { skip: process.platform !== 'darwin' }, async () => {
+  const S = await accountServer();
+  const s = setup(S.url), path = process.env.PATH;
+  try {
+    const keychain = simulatedKeychain(s);
+    process.env.PATH = keychain.bin + ':' + path;
+    keychain.set([TOKEN_X]);
+    await s.hook('Stop', { last_assistant_message: 'first account' }, keychain.env);
+    keychain.set([TOKEN_Y]);
+    await s.hook('PostToolUse', { tool_name: 'Read', tool_input: { file_path: 'readme.md' } }, keychain.env);
+    assert.equal(S.named('whoami').length, 1, 'recording the action only reads the local credential');
+    keychain.set([TOKEN_X]);
+    await s.hook('Stop', { last_assistant_message: 'first account again' }, keychain.env);
+    assert.deepEqual(S.texts('u_x'), ['first account', 'first account again']);
+    assert.deepEqual(heldTexts(s.home), ['Read: readme.md']);
+    keychain.set([TOKEN_Y]);
+    await s.hook('Stop', { last_assistant_message: 'second account' }, keychain.env);
+    assert.deepEqual(S.texts('u_y'), ['second account', 'Read: readme.md']);
+    assert.deepEqual(heldTexts(s.home), []);
+  } finally { process.env.PATH = path; await S.close(); s.dir.cleanup(); }
+});
+
+test('macOS refresh and ambiguous Keychain entries keep records bound or held', { skip: process.platform !== 'darwin' }, async () => {
+  const S = await accountServer();
+  const s = setup(S.url), path = process.env.PATH;
+  try {
+    const keychain = simulatedKeychain(s);
+    process.env.PATH = keychain.bin + ':' + path;
+    keychain.set([TOKEN_X], { refresh: true });
+    keychain.set([TOKEN_Y], { next: true });
+    await s.hook('Stop', { last_assistant_message: 'finished before account change' }, keychain.env);
+    assert.deepEqual(S.texts('u_y'), []);
+    assert.deepEqual(heldTexts(s.home), ['finished before account change']);
+
+    keychain.set([TOKEN_X, TOKEN_Y]);
+    await s.hook('UserPromptSubmit', { prompt: 'unassigned prompt' }, keychain.env);
+    assert.equal(s.health().last_flush.error, 'ambiguous_credentials');
+    keychain.set([TOKEN_X]);
+    await s.hook('Stop', { last_assistant_message: 'first account is active' }, keychain.env);
+    assert.deepEqual(S.texts('u_x'), ['first account is active', 'finished before account change']);
+    assert.deepEqual(heldTexts(s.home), ['unassigned prompt']);
+  } finally { process.env.PATH = path; await S.close(); s.dir.cleanup(); }
+});
+
+test('a logged-out entry keeps server A and needs explicit recovery after switching servers', async () => {
   const A = await accountServer(), B = await accountServer();
   const s = setup(A.url);
   try {
@@ -111,8 +171,8 @@ test('queued while logged out with server A configured, then pointed at server B
     assert.deepEqual(B.texts(), ['reply-under-B', 'second-under-B']);
     assert.equal((await heldStats(s.home, CLIENT)).entries, 1);
 
-    // Back on A and logged in: now it is delivered, to A.
-    assert.deepEqual(await replayHeld(s.home, CLIENT), { replayed: 1, invalid: 0 });
+    // Select the entry explicitly when returning to A.
+    assert.deepEqual(await replayHeldCommand(['--client', CLIENT, '--origin', A.origin, '--unknown', '--session', 'security-session', '--to-current'], s.env), { [CLIENT]: { replayed: 1, invalid: 0 } });
     await s.hook('Stop', { last_assistant_message: 'reply-under-A' });
     assert.deepEqual(A.texts('u_x'), ['queued-for-A', 'reply-under-A']);
     assert.equal(B.texts().includes('queued-for-A'), false);
@@ -187,14 +247,15 @@ test('a rotated token of the same account still delivers its backlog, and the ac
   } finally { await S.close(); s.dir.cleanup(); }
 });
 
-test('queued while logged out on a server no account was seen on: goes to the first account that logs in on that server', async () => {
+test('the first login leaves entries recorded without a credential on hold', async () => {
   const S = await accountServer();
   const s = setup(S.url, TOKEN_Y);
   try {
     await s.hook('UserPromptSubmit', { prompt: 'before-first-login' }, s.loggedOut);
     assert.deepEqual(Object.keys(lines(spoolFile(s.home, CLIENT))[0].to), ['origin', 'at'], 'account unknown, no account assumed');
     await s.hook('Stop', { last_assistant_message: 'after-login' });
-    assert.deepEqual(S.texts('u_y'), ['before-first-login', 'after-login']);
+    assert.deepEqual(S.texts('u_y'), ['after-login']);
+    assert.deepEqual(heldTexts(s.home), ['before-first-login']);
   } finally { await S.close(); s.dir.cleanup(); }
 });
 
@@ -227,7 +288,7 @@ const legacySpool = (home, texts, ts = Date.now() - 3600000) => {
   writeFileSync(spoolFile(home, CLIENT), texts.map(text => JSON.stringify(entry(text, { ts })) + '\n').join(''), { mode: 0o600, flag: 'a' });
 };
 
-test('upgrade: a backlog queued by an Agent without destinations keeps being delivered on a machine with one account, with no manual step', async () => {
+test('upgrade holds an unbound backlog and delivers new entries normally', async () => {
   const S = await accountServer();
   const s = setup(S.url, TOKEN_X);
   try {
@@ -235,20 +296,19 @@ test('upgrade: a backlog queued by an Agent without destinations keeps being del
     const { output } = await s.hook('UserPromptSubmit', { prompt: 'new-prompt' });
     assert.ok(output?.hookSpecificOutput?.additionalContext.includes('fixture recall'));
     assert.equal(s.health().last_hook.ok, true);
-    assert.deepEqual(S.texts('u_x'), ['legacy-one', 'legacy-two', 'new-prompt']);
-    assert.equal(s.health().last_flush.held, 0);
-    // The backlog a later flush reaches (a large one takes several) still goes: the account is still the only one.
+    assert.deepEqual(S.texts('u_x'), ['new-prompt']);
+    assert.equal(s.health().last_flush.held, 2);
     legacySpool(s.home, ['legacy-three']);
     await s.hook('Stop', { last_assistant_message: 'done' });
-    assert.deepEqual(S.texts('u_x'), ['legacy-one', 'legacy-two', 'new-prompt', 'legacy-three', 'done']);
-    assert.equal((await heldStats(s.home, CLIENT)).entries, 0);
+    assert.deepEqual(S.texts('u_x'), ['new-prompt', 'done']);
+    assert.deepEqual(heldTexts(s.home), ['legacy-one', 'legacy-two', 'legacy-three']);
     const report = await s.report();
-    assert.deepEqual(report.problems, []);
-    assert.equal(report.ok, true);
+    assert.match(report.problems[0], /--origin none/);
+    assert.equal(report.ok, false);
   } finally { await S.close(); s.dir.cleanup(); }
 });
 
-test('upgrade: where another account flushed last, the old backlog is adopted once for that server as "account unknown", held, and shown at SessionStart and by doctor with the command', async () => {
+test('upgrade: unbound entries stay unassigned and can be selected for recovery', async () => {
   const S = await accountServer();
   const s = setup(S.url, TOKEN_X);
   const asY = { ...s.env, CF_MEMORY_ACCESS_TOKEN: TOKEN_Y };
@@ -260,7 +320,7 @@ test('upgrade: where another account flushed last, the old backlog is adopted on
     assert.deepEqual(S.texts('u_x'), ['under-X', 'back-under-X']);
     assert.deepEqual(S.texts('u_y'), ['under-Y']);
     const held = lines(heldFile(s.home, CLIENT));
-    assert.deepEqual(held.map(line => [line.text, line.to.origin, line.to.account, line.to.at === line.ts]), [['legacy-one', S.origin, undefined, true], ['legacy-two', S.origin, undefined, true]]);
+    assert.deepEqual(held.map(line => [line.text, line.to]), [['legacy-one', undefined], ['legacy-two', undefined]]);
     assert.equal(statSync(heldFile(s.home, CLIENT)).mode & 0o777, 0o600);
     assert.equal(s.health().last_flush.held, 2);
 
@@ -271,9 +331,9 @@ test('upgrade: where another account flushed last, the old backlog is adopted on
     const report = await s.report();
     assert.equal(report.ok, false);
     assert.equal(report.clients[CLIENT].spool.held_entries, 2);
-    assert.deepEqual(report.clients[CLIENT].spool.held.map(group => [group.origin, group.state, group.entries, group.sessions]), [[S.origin, 'unknown', 2, ['security-session']]]);
+    assert.deepEqual(report.clients[CLIENT].spool.held.map(group => [group.origin, group.state, group.entries, group.sessions]), [[null, 'none', 2, ['security-session']]]);
     const [problem] = report.problems;
-    assert.ok(problem.includes('agent.mjs replay-held --client ' + CLIENT + ' --origin ' + S.origin + ' --unknown --session <session id> --to-current'), problem);
+    assert.ok(problem.includes('agent.mjs replay-held --client ' + CLIENT + ' --origin none --unknown --session <session id> --to-current'), problem);
     assert.equal(report.problems.concat(report.warnings).some(line => / --to-current(?! needs)/.test(line.replace('--session <session id> --to-current', ''))), false, 'no advice sends a whole group to the current account');
 
     // Queued again as they are, they are held again; the selected ones go to the account the operator sends them to.
@@ -281,7 +341,7 @@ test('upgrade: where another account flushed last, the old backlog is adopted on
     await s.hook('Stop', { last_assistant_message: 'still-held' });
     assert.equal((await heldStats(s.home, CLIENT)).entries, 2);
     await assert.rejects(replayHeldCommand(['--client', CLIENT, '--to-current'], s.env), /needs a selection/);
-    assert.deepEqual(await replayHeldCommand(['--client', CLIENT, '--origin', S.origin, '--unknown', '--session', 'security-session', '--to-current'], s.env), { [CLIENT]: { replayed: 2, invalid: 0 } });
+    assert.deepEqual(await replayHeldCommand(['--client', CLIENT, '--origin', 'none', '--unknown', '--session', 'security-session', '--to-current'], s.env), { [CLIENT]: { replayed: 2, invalid: 0 } });
     await s.hook('Stop', { last_assistant_message: 'adopted' });
     assert.deepEqual(S.texts('u_x'), ['under-X', 'back-under-X', 'still-held', 'legacy-one', 'legacy-two', 'adopted']);
     assert.deepEqual(S.texts('u_y'), ['under-Y']);
@@ -335,7 +395,7 @@ test('flush(): the destination of an entry and of the flush must agree', async (
   const dir = tempDir('security-spool-');
   try {
     const mine = 'c'.repeat(16), theirs = 'd'.repeat(16), nobodys = 'e'.repeat(16);
-    // As destination() names it: this account since 1000, its token fingerprints, the other account's.
+    // A legacy time range carries no authority. Only known fingerprints or accounts match.
     const here = { origin: 'https://one.example', account: 'a'.repeat(16), since: 1000, creds: [mine], others: { [theirs]: 'b'.repeat(16) } };
     const queued = [
       [entry('mine'), { origin: here.origin, account: here.account }],
@@ -355,27 +415,21 @@ test('flush(): the destination of an entry and of the flush must agree', async (
     writeFileSync(spoolFile(dir.path, CLIENT), JSON.stringify({ ...entry('broken-destination'), to: 'https://one.example' }) + '\n' + JSON.stringify({ ...entry('broken-account'), to: { origin: here.origin, account: 7 } }) + '\n', { flag: 'a' });
     const sent = [];
     const result = await flush(dir.path, CLIENT, async batch => { sent.push(...batch.map(e => e.text)); return { stored: batch.length }; }, { to: here });
-    assert.deepEqual(sent, ['mine', 'my-token', 'since-my-run']);
-    assert.equal(result.sent, 3); assert.equal(result.held, 10); assert.equal(result.pending_bytes, 0);
+    assert.deepEqual(sent, ['mine', 'my-token']);
+    assert.equal(result.sent, 2); assert.equal(result.held, 11); assert.equal(result.pending_bytes, 0);
     const held = lines(heldFile(dir.path, CLIENT));
-    assert.deepEqual(held.map(line => line.text), ['before-my-run', 'no-time', 'other-account', 'other-accounts-token', 'unidentified-token', 'other-server', 'other-server-unknown', 'no-server', 'broken-destination', 'broken-account']);
+    assert.deepEqual(held.map(line => line.text), ['since-my-run', 'before-my-run', 'no-time', 'other-account', 'other-accounts-token', 'unidentified-token', 'other-server', 'other-server-unknown', 'no-server', 'broken-destination', 'broken-account']);
     // A fingerprint known to be the other account's is held as that account's; nothing else is relabelled.
     assert.deepEqual(held.find(line => line.text === 'other-accounts-token').to, { origin: here.origin, account: 'b'.repeat(16) });
     assert.deepEqual(held.find(line => line.text === 'unidentified-token').to, { origin: here.origin, at: 2000, cred: nobodys });
     assert.deepEqual(held.find(line => line.text === 'no-server').to, {});
 
-    // Without a record to go by (`since` null), no "account unknown" entry is taken; a flush that names no account takes nothing.
-    await replayHeld(dir.path, CLIENT, undefined, { origin: here.origin, unknown: true });
-    for (const to of [{ ...here, since: null }, { origin: here.origin, account: here.account }, { origin: here.origin }]) {
+    for (const to of [{ ...here, since: 0 }, { origin: here.origin, account: here.account }, { origin: here.origin }]) {
+      await replayHeld(dir.path, CLIENT, undefined, { origin: here.origin, unknown: true });
       const taken = [];
       await flush(dir.path, CLIENT, async batch => { taken.push(...batch.map(e => e.text)); return {}; }, { to: { ...to, creds: [], others: {} } });
       assert.deepEqual(taken, []);
-      await replayHeld(dir.path, CLIENT, undefined, { origin: here.origin, unknown: true });
     }
-    // The first account ever seen on the origin (`since` 0) takes them, whenever they were queued; never a token known to be someone else's.
-    const first = [];
-    await flush(dir.path, CLIENT, async batch => { first.push(...batch.map(e => e.text)); return {}; }, { to: { ...here, since: 0, creds: [] } });
-    assert.deepEqual(first.sort(), ['before-my-run', 'no-time']);
 
     // A flush that names no destination sends nothing that has one.
     await appendEntries(dir.path, CLIENT, [entry('bound')], here);
@@ -392,7 +446,7 @@ test('flush(): the destination of an entry and of the flush must agree', async (
     const after = [];
     await flush(dir.path, CLIENT, async batch => { after.push(...batch.map(e => e.text)); return {}; }, { to: here });
     assert.deepEqual(after, ['bound', 'mine-again']);
-    assert.deepEqual(lines(heldFile(dir.path, CLIENT)).map(line => line.text).sort(), ['broken-account', 'broken-destination', 'no-server', 'other-account', 'other-accounts-token', 'other-server', 'other-server-unknown', 'unidentified-token']);
+    assert.deepEqual(lines(heldFile(dir.path, CLIENT)).map(line => line.text).sort(), ['before-my-run', 'broken-account', 'broken-destination', 'no-server', 'no-time', 'other-account', 'other-accounts-token', 'other-server', 'other-server-unknown', 'since-my-run', 'unidentified-token']);
     assert.equal((await pendingStats(dir.path, CLIENT)).bytes, 0);
   } finally { dir.cleanup(); }
 });
@@ -574,32 +628,32 @@ test('two live tokens of one account used in turn cost one whoami each, not one 
   } finally { await S.close(); s.dir.cleanup(); }
 });
 
-test('queuedFor names an account only for a token known to be its own, and destination() tells what unknown entries a flush may take', async () => {
+test('queuedFor binds verified tokens and destination detects account changes', async () => {
   const dir = tempDir('security-spool-');
-  const env = { CF_MEMORY_MCP_URL: 'https://one.example/mcp' }, at = 'https://one.example';
+    const env = { CF_MEMORY_MCP_URL: 'https://one.example/mcp', CF_MEMORY_KEYCHAIN: 'off' }, at = 'https://one.example';
   const whoami = user => async () => ({ user_id: user, anonymous: false });
   const as = token => ({ url: env.CF_MEMORY_MCP_URL, token });
   try {
     assert.deepEqual(await queuedFor({}, dir.path, { mcpServers: { 'cf-memory': { url: 'not a url' } } }), {}, 'no usable server: no destination');
     assert.deepEqual(await queuedFor(env, dir.path, {}, 5), { origin: at, at: 5 });
     const first = await destination(as('token-x'), whoami('u_x'), dir.path, 100);
-    assert.equal(first.since, 0, 'the first account ever seen takes what was queued before it logged in');
+    assert.equal(first.changed, true);
     assert.deepEqual(await queuedFor({ ...env, CF_MEMORY_ACCESS_TOKEN: 'token-x' }, dir.path, {}, 150), { origin: at, account: first.account });
     // The same token from ~/.claude.json; a token for another server is not at hand for this one.
     assert.deepEqual(await queuedFor({}, dir.path, { mcpServers: { 'cf-memory': { url: env.CF_MEMORY_MCP_URL, headers: { Authorization: 'Bearer token-x' } } } }, 150), { origin: at, account: first.account });
     assert.deepEqual(await queuedFor(env, dir.path, { mcpServers: { 'cf-memory': { url: 'https://two.example/mcp', headers: { Authorization: 'Bearer token-x' } } } }, 150), { origin: at, at: 150 });
     const unknown = await queuedFor({ ...env, CF_MEMORY_ACCESS_TOKEN: 'token-y' }, dir.path, {}, 160);
     assert.deepEqual(Object.keys(unknown), ['origin', 'at', 'cred']);
-    assert.equal((await destination(as('token-x'), whoami('u_x'), dir.path, 200)).since, 0);
+    assert.equal((await destination(as('token-x'), whoami('u_x'), dir.path, 200)).changed, false);
 
     const y = await destination(as('token-y'), whoami('u_y'), dir.path, 300);
-    assert.equal(y.since, null, 'X flushed last: nothing of unknown account is Y\'s');
+    assert.equal(y.changed, true);
     assert.deepEqual(y.creds, [unknown.cred]);
     assert.deepEqual(Object.values(y.others), [first.account]);
-    assert.equal((await destination(as('token-y'), whoami('u_y'), dir.path, 400)).since, 300, 'from its first flush on');
+    assert.equal((await destination(as('token-y'), whoami('u_y'), dir.path, 400)).changed, false);
     const back = await destination(as('token-x'), async () => { throw Error('not asked'); }, dir.path, 500);
-    assert.deepEqual([back.account, back.since], [first.account, null], 'a remembered token still ends the other account\'s run');
-    assert.equal((await destination(as('token-x'), whoami('u_x'), dir.path, 600)).since, 500);
+    assert.deepEqual([back.account, back.changed], [first.account, true]);
+    assert.equal((await destination(as('token-x'), whoami('u_x'), dir.path, 600)).changed, false);
     for (const name of ['accounts.json', 'accounts.key']) {
       assert.equal(statSync(join(dir.path, name)).mode & 0o777, 0o600, name);
       assert.equal(/token-[xy]|u_[xy]/.test(readFileSync(join(dir.path, name), 'utf8')), false, name);
