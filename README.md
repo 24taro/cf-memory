@@ -61,8 +61,14 @@ token rotation.
 
 If the first install is interrupted, keep `.cf-memory.install-claim` and
 any deployment and token files it created, then rerun from that checkout.
-For an earlier setup with only `.cf-memory.secrets`, the installer records the
-deployment identity after verifying that the existing Worker accepts your token.
+For an earlier setup with only `.cf-memory.secrets`, pass the original Worker
+URL shown by your prior installer. The installer records the deployment
+identity after it matches that URL and verifies your token.
+
+```bash
+./install.sh --existing-url https://cf-memory.your-subdomain.workers.dev
+```
+
 The installer reports MCP and hook status separately for each client.
 If Codex prompts again after an update, review the hooks in `/hooks`.
 

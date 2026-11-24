@@ -3,6 +3,7 @@
 #
 #   ./install.sh              deploy, then connect Claude Code and Codex if installed
 #   ./install.sh --no-client  deploy only
+#   ./install.sh --existing-url URL  adopt an older checkout at its original Worker URL
 #
 # Safe to run again: it redeploys the same Worker with the same token and
 # applies only the migrations that are not applied yet.
@@ -10,12 +11,19 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 CLIENTS=1
-for arg in "$@"; do
-  case "$arg" in
+EXISTING_URL=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
     --no-client) CLIENTS=0 ;;
-    -h|--help) sed -n '2,8p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
-    *) echo "unknown option: $arg" >&2; exit 2 ;;
+    --existing-url)
+      [ "$#" -gt 1 ] && [[ -n "$2" && "$2" != --* ]] || { echo "--existing-url requires the original Worker URL" >&2; exit 2; }
+      EXISTING_URL=$2
+      shift
+      ;;
+    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
+  shift
 done
 
 say()  { printf '\n==> %s\n' "$*"; }
@@ -62,7 +70,7 @@ SECRETS_FILE=".cf-memory.secrets"
 INSTALL_CLAIM=".cf-memory.install-claim"
 DEPLOYMENT_FILE=".cf-memory.deployment.json"
 say "Verifying the Cloudflare account and Worker"
-target=$(CI=true node scripts/reserve-worker.mjs prepare "$INSTALL_CLAIM" "$DEPLOYMENT_FILE" "$SECRETS_FILE") ||
+target=$(CI=true node scripts/reserve-worker.mjs prepare "$INSTALL_CLAIM" "$DEPLOYMENT_FILE" "$SECRETS_FILE" "$EXISTING_URL") ||
   fail "could not prepare the selected Worker; no token was uploaded"
 read -r mode account_id worker_name api_url URL worker_id <<< "${target##*$'\n'}"
 [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ &&

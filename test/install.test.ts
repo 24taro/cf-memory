@@ -65,7 +65,7 @@ it('continues with Codex alone or when client setup is disabled', () => {
   }
 });
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true } = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, existingUrl = worker === 'present' && savedToken && !bindingPhase ? 'https://cf-memory.test.workers.dev' : '' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -144,7 +144,8 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     stub('curl', `cat >/dev/null\nprintf '%s\\n' '{"token_status":"active"}'`);
     stub('codex', 'exit 0');
     stub('claude', `case "$1 $2" in\n  "--version ") echo '2.1.327 (Claude Code)' ;;\n  'mcp add-json') node -e 'require("node:fs").writeFileSync(process.env.HOME + "/.claude.json", JSON.stringify({mcpServers:{"cf-memory":JSON.parse(require("node:fs").readFileSync(0,"utf8"))}}))' ;;\n  *) exit 1 ;;\nesac`);
-    const result = spawnSync('/bin/bash', ['install.sh', ...(clients ? [] : ['--no-client'])], {
+    const args = ['install.sh', ...(clients ? [] : ['--no-client']), ...(existingUrl ? ['--existing-url', existingUrl] : [])];
+    const result = spawnSync('/bin/bash', args, {
       cwd: root,
       encoding: 'utf8',
       env: {
@@ -257,6 +258,18 @@ it('keeps an unbound saved token out of a first deployment', () => {
   expect(tokenExists).toBe(true);
   expect(deploy).toBeUndefined();
   expect(calls.some(args => args[0] === 'api' && args[1] === 'POST')).toBe(false);
+});
+
+it.each([
+  ['', 'no deployment identity'],
+  ['https://cf-memory.other.workers.dev', 'differs from --existing-url'],
+])('requires the original URL before checking an unbound saved token (%s)', (existingUrl, error) => {
+  const { result, deploy, calls, binding } = installFixture({ existingUrl });
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain(error);
+  expect(deploy).toBeUndefined();
+  expect(binding).toBeNull();
+  expect(calls.some(args => args[2] === '/api/v1/whoami')).toBe(false);
 });
 
 it.each(['present', 'unknown'])('does not deploy when the local token is absent and Worker state is %s', worker => {

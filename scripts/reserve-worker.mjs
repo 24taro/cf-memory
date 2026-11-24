@@ -117,7 +117,16 @@ async function ownsActiveToken(origin, token, ownerHandle) {
   }
 }
 
-async function prepareWorker(claimFile, bindingFile, secretsFile) {
+function existingOrigin(value) {
+  try {
+    const url = new URL(value);
+    if (url.protocol === 'https:' && !url.username && !url.password && !url.search && !url.hash &&
+        ['/', '/mcp', '/mcp/'].includes(url.pathname)) return url.origin;
+  } catch { /* report the intended use without echoing the input */ }
+  throw new Error('--existing-url must be the original HTTPS Worker URL or its /mcp endpoint');
+}
+
+async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
   const { account, name, domain, region, ownerHandle } = configuredTarget();
   const binding = readBinding(bindingFile);
   if (binding && (binding.account !== account || binding.name !== name || binding.domain !== domain)) {
@@ -130,6 +139,7 @@ async function prepareWorker(claimFile, bindingFile, secretsFile) {
   }
   const origin = `https://${name}.${subdomain.result.subdomain}${region === 'fedramp_high' ? '.fed' : ''}.workers.dev`;
   if (binding && binding.origin !== origin) throw new Error('the selected Worker URL differs from this checkout’s saved deployment');
+  if (existingUrl && existingOrigin(existingUrl) !== origin) throw new Error('the selected Worker URL differs from --existing-url');
 
   const saved = readLocalFile(secretsFile);
   const token = saved?.match(/^API_TOKEN=([^\r\n]*)/m)?.[1];
@@ -162,6 +172,9 @@ async function prepareWorker(claimFile, bindingFile, secretsFile) {
       if (binding && token) return output('update', worker.id);
     }
     if (!token) throw new Error(`the Worker already exists. Restore ${secretsFile} from its original checkout`);
+    if (!binding && !existingUrl) {
+      throw new Error('the saved token has no deployment identity. Use --existing-url with the original Worker URL from your prior setup');
+    }
     if (!await ownsActiveToken(origin, token, ownerHandle)) {
       throw new Error('the selected Worker did not accept the saved owner token; check the deployment before retrying');
     }
@@ -170,7 +183,7 @@ async function prepareWorker(claimFile, bindingFile, secretsFile) {
   }
 
   if (existing.status !== 404 || existing.success !== false) throw new Error('could not verify whether the Worker already exists');
-  if (binding || saved !== null) throw new Error('the original Worker could not be verified; the saved token cannot be used on a new Worker');
+  if (binding || saved !== null || existingUrl) throw new Error('the original Worker could not be verified; the saved token cannot be used on a new Worker');
 
   // Cloudflare's create-only request arbitrates across checkouts. Never fall
   // back to an upsert when another checkout claims the name first.
@@ -186,13 +199,13 @@ async function prepareWorker(claimFile, bindingFile, secretsFile) {
 }
 
 try {
-  const [command, first, second, third] = process.argv.slice(2);
+  const [command, first, second, third, fourth] = process.argv.slice(2);
   if (command === 'ready') {
     const binding = readBinding(first);
     if (!binding || binding.workerId !== second) throw new Error('the saved deployment identity changed before completion');
     if (binding.phase !== 'ready') writeBinding(first, { ...binding, phase: 'ready' }, true);
   } else if (command === 'prepare') {
-    const { mode, account, name, domain, origin, workerId } = await prepareWorker(first, second, third);
+    const { mode, account, name, domain, origin, workerId } = await prepareWorker(first, second, third, fourth);
     console.log(`${mode} ${account} ${name} ${domain} ${origin} ${workerId}`);
   } else {
     throw new Error('expected prepare or ready');
