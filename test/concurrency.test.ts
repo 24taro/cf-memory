@@ -14,6 +14,7 @@ const OWNER = "u_owner";
 const principal = principalFixture({ userId: OWNER, handle: "owner" });
 
 let mf: Miniflare;
+let db: D1Database;
 let services: Services;
 
 async function applyMigrations(db: D1Database): Promise<void> {
@@ -36,7 +37,7 @@ async function applyMigrations(db: D1Database): Promise<void> {
 
 beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: "export default {};", d1Databases: ["DB"] }));
-  const db = (await mf.getD1Database("DB")) as unknown as D1Database;
+  db = (await mf.getD1Database("DB")) as unknown as D1Database;
   await applyMigrations(db);
   await db.prepare("INSERT INTO users (id,handle,display_name,bio_md,created_at,updated_at) VALUES (?,?,?,?,?,?)").bind(OWNER, "owner", "owner", "", 0, 0).run();
   services = makeServices(db);
@@ -148,18 +149,26 @@ describe("concurrency — skills upsert CAS (review follow-up)", () => {
     await Promise.all(
       ["i1", "i2", "i3", "i4", "i5"].map((body) => services.skills.upsert(principal, { slug: "ver-skill", name: "Ver", instructions: body })),
     );
-    const list = await services.skills.list(principal, { ownerId: OWNER });
-    const matches = list.filter((s) => s.slug === "ver-skill");
-    // Exactly one row for the slug (no duplicate inserts from the CAS retries).
-    expect(matches).toHaveLength(1);
-    // 1 create (0.1.0) + 5 CAS-serialized updates each bump the patch at least
-    // once. The CAS UPDATE commits before the FTS/event writes (no real D1 txn),
-    // so a throw there can trigger a retry that re-bumps the patch — the contract
-    // is that NO bump is lost, not an exact count, so assert the patch is
-    // monotonic and reflects at least the 5 updates (>= 0.1.5), allowing >= for
-    // benign over-bumps under FTS contention.
-    const m = /^0\.1\.(\d+)$/.exec(matches[0]?.version ?? "");
-    expect(m, `unexpected version ${matches[0]?.version}`).not.toBeNull();
-    expect(Number(m?.[1])).toBeGreaterThanOrEqual(5);
+    const saved = await services.skills.getBySlug(OWNER, "ver-skill");
+    expect(saved?.version).toBe("0.1.5");
+    const row = await db.prepare(`SELECT f.instructions FROM skills_fts f JOIN skills s ON s.rowid=f.rowid
+      WHERE s.id=?`).bind(saved!.id).first<{ instructions: string }>();
+    expect(row?.instructions).toBe(saved?.instructions_md);
+    const events = await db.prepare("SELECT COUNT(*) AS count FROM events WHERE target_id=? AND verb='skill.updated'")
+      .bind(saved!.id).first<{ count: number }>();
+    expect(events?.count).toBe(5);
+  });
+
+  it("merges concurrent skill metadata edits while keeping the same content hash", async () => {
+    const original = await services.skills.upsert(principal, { slug: "meta-skill", name: "Skill", instructions: "same content" });
+    const flags = ["one", "two", "three", "four"];
+    await Promise.all(flags.map(flag => services.skills.upsert(principal, {
+      slug: "meta-skill",
+      frontmatter: { [flag]: true },
+    })));
+    const saved = await services.skills.getBySlug(OWNER, "meta-skill");
+    expect(saved?.content_hash).toBe(original.skill.content_hash);
+    expect(saved?.version).toBe("0.1.4");
+    expect(JSON.parse(saved!.frontmatter_json)).toMatchObject(Object.fromEntries(flags.map(flag => [flag, true])));
   });
 });

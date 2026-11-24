@@ -151,6 +151,14 @@ export class SkillsRepo {
     return this.db.prepare(`SELECT ${SKILL_COLUMNS} FROM skills WHERE id=?`).bind(id).first<SkillRow>();
   }
 
+  private reindex(id: string, userId: string): D1PreparedStatement[] {
+    return [
+      this.db.prepare("DELETE FROM skills_fts WHERE rowid=(SELECT rowid FROM skills WHERE id=? AND user_id=?)").bind(id, userId),
+      this.db.prepare(`INSERT INTO skills_fts (rowid,name,description,instructions)
+        SELECT rowid,name,description,instructions_md FROM skills WHERE id=? AND user_id=? AND deleted_at IS NULL`).bind(id, userId),
+    ];
+  }
+
   /** Record a deliberate USE of a skill (issue #95). The "use" signal is INSTALL
    * — materializing the bundle into an agent via MCP `skills_install` or the REST
    * `/skills/:slug/install` door — NOT a plain get/view/SKILL.md fetch. Bumps
@@ -225,9 +233,11 @@ export class SkillsRepo {
     const MAX_ATTEMPTS = 12;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
-        const ts = now();
         const existing = await this.getBySlug(userId, slug);
         if (input.createOnly && existing) throw new Error('skill already exists; create-only conflict');
+        // Use a strictly advancing stamp so metadata-only edits take part in the
+        // CAS even when the indexed text and content hash stay the same.
+        const ts = Math.max(now(), (existing?.updated_at ?? -1) + 1);
         const id = existing?.id ?? ulid(ts);
         const created = !existing;
         const version = input.version ?? (existing ? bumpPatch(existing.version) : "0.1.0");
@@ -243,22 +253,23 @@ export class SkillsRepo {
         const skillMd = input.skill_md ?? composeSkillMd(name, description, instructions);
         const frontmatter = JSON.stringify({ ...(existing ? JSON.parse(existing.frontmatter_json) : {}), ...(input.frontmatter ?? {}), name, description });
         const contentHash = await sha256hex(`${name}\n${description}\n${instructions}`);
+        const event = this.db.prepare(`INSERT INTO events
+          (id,user_id,actor,actor_ref,verb,target_kind,target_id,reason,summary,payload_json,created_at)
+          SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE changes()=1`)
+          .bind(ulid(), userId, principal.actor, principal.viaKeyPrefix ?? principal.handle, created ? "skill.created" : "skill.updated", "skill", id, null, name, "{}", ts);
+        const index = this.reindex(id, userId);
 
         if (existing) {
-          // Optimistic concurrency: only update if the row still carries the hash we
-          // read; a concurrent writer that already moved it -> changes===0 -> retry.
-          // deleted_at=NULL unconditionally (issue #36, mirrors notes.upsert):
-          // getBySlug() doesn't filter deleted_at, so a soft-deleted skill's slug
-          // is still "claimed" -- upserting it again is meant to resurrect it, not
-          // leave it soft-deleted-but-updated (which would still be invisible to
-          // isReadable()).
-          const result = await this.db
+          // A known tombstone can be revived. If it was deleted or edited after
+          // this read, retry against that newer state.
+          const update = this.db
             .prepare(
               `UPDATE skills SET name=?, description=?, instructions_md=?, skill_md=?, frontmatter_json=?,
-                 version=?, scope=?, content_hash=?, updated_at=?, deleted_at=NULL WHERE id=? AND content_hash=?`,
+                 version=?, scope=?, content_hash=?, updated_at=?, deleted_at=NULL
+               WHERE id=? AND content_hash=? AND updated_at=?`,
             )
-            .bind(name, description, instructions, skillMd, frontmatter, version, scope, contentHash, ts, id, existing.content_hash)
-            .run();
+            .bind(name, description, instructions, skillMd, frontmatter, version, scope, contentHash, ts, id, existing.content_hash, existing.updated_at);
+          const [result] = await this.db.batch([update, event, ...index]);
           if (result.meta.changes === 0) throw new StaleUpsertError();
         } else {
           const insert = this.db
@@ -268,23 +279,9 @@ export class SkillsRepo {
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`,
             )
             .bind(id, userId, slug, name, description, instructions, skillMd, frontmatter, version, scope, null, contentHash, ts, ts);
-          if (creationProvenance) await this.db.batch([insert, ...await creationProvenance(id, false)]);
-          else await insert.run();
+          const provenance = creationProvenance ? await creationProvenance(id, false) : [];
+          await this.db.batch([insert, event, ...index, ...provenance]);
         }
-
-        const rowidRow = await this.db.prepare("SELECT rowid AS rowid FROM skills WHERE id=?").bind(id).first<{ rowid: number }>();
-        if (rowidRow?.rowid != null) {
-          await this.db.prepare("DELETE FROM skills_fts WHERE rowid=?").bind(rowidRow.rowid).run();
-          await this.db.prepare("INSERT INTO skills_fts (rowid,name,description,instructions) VALUES (?,?,?,?)").bind(rowidRow.rowid, name, description, instructions).run();
-        }
-
-        await this.db
-          .prepare(
-            `INSERT INTO events (id,user_id,actor,actor_ref,verb,target_kind,target_id,reason,summary,payload_json,created_at)
-             VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-          )
-          .bind(ulid(), userId, principal.actor, principal.viaKeyPrefix ?? principal.handle, created ? "skill.created" : "skill.updated", "skill", id, null, name, "{}", ts)
-          .run();
 
         return { skill: (await this.getById(id)) as SkillRow, created };
       } catch (err) {
@@ -308,20 +305,15 @@ export class SkillsRepo {
    * own content/behavior depends on the parent row still existing), so this
    * intentionally does NOT cascade. */
   async softDelete(principal: Principal, id: string): Promise<boolean> {
-    const skill = await this.getById(id);
-    if (!skill || skill.user_id !== principal.userId || skill.deleted_at) return false;
     const ts = now();
-    await this.db.prepare("UPDATE skills SET deleted_at=?, updated_at=? WHERE id=?").bind(ts, ts, id).run();
-    const rowidRow = await this.db.prepare("SELECT rowid AS rowid FROM skills WHERE id=?").bind(id).first<{ rowid: number }>();
-    if (rowidRow?.rowid != null) await this.db.prepare("DELETE FROM skills_fts WHERE rowid=?").bind(rowidRow.rowid).run();
-    await this.db
-      .prepare(
-        `INSERT INTO events (id,user_id,actor,actor_ref,verb,target_kind,target_id,reason,summary,payload_json,created_at)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-      )
-      .bind(ulid(), principal.userId, principal.actor, principal.viaKeyPrefix ?? principal.handle, "skill.deleted", "skill", id, null, skill.name, "{}", ts)
-      .run();
-    return true;
+    const remove = this.db.prepare(`UPDATE skills SET deleted_at=?,updated_at=MAX(updated_at+1,?)
+      WHERE id=? AND user_id=? AND deleted_at IS NULL`).bind(ts, ts, id, principal.userId);
+    const event = this.db.prepare(`INSERT INTO events
+      (id,user_id,actor,actor_ref,verb,target_kind,target_id,reason,summary,payload_json,created_at)
+      SELECT ?,user_id,?,?,'skill.deleted','skill',id,NULL,name,'{}',? FROM skills WHERE id=? AND changes()=1`)
+      .bind(ulid(), principal.actor, principal.viaKeyPrefix ?? principal.handle, ts, id);
+    const [result] = await this.db.batch([remove, event, ...this.reindex(id, principal.userId)]);
+    return result.meta.changes > 0;
   }
 
   async list(principal: Principal, opts: { ownerId: string; limit?: number }): Promise<SkillSummary[]> {
