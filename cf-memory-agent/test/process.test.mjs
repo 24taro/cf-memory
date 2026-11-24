@@ -8,6 +8,7 @@ import { flushCommand } from '../scripts/agent.mjs';
 import { doctor } from '../scripts/doctor.mjs';
 import { makeEntry } from '../scripts/entries.mjs';
 import { appendEntries, pendingStats } from '../scripts/spool.mjs';
+import { queuedFor } from '../scripts/transport.mjs';
 import { PLUGIN_VERSION } from '../scripts/version.mjs';
 import { CODEX_APPROVAL, parseInstallArgs } from '../scripts/install.mjs';
 import { fakeServer, tempDir, testEnv, TEST_TOKEN } from './helpers/fake-server.mjs';
@@ -507,8 +508,7 @@ test('agent.mjs flush records a timeout after partial delivery as progress, as t
   const dir = tempDir(), server = await fakeServer({ delay: name => name === 'log_append' ? 400 : 0 });
   try {
     const env = testEnv(dir.path, server.url), home = env.CF_MEMORY_AGENT_HOME;
-    // Queued for the fixture server, as a hook would queue it (an entry with no destination is held, not sent).
-    await appendEntries(home, 'codex', Array.from({ length: 200 }, (_, i) => makeEntry({ client: 'codex', session_id: 's', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), { origin: new URL(server.url).origin });
+    await appendEntries(home, 'codex', Array.from({ length: 200 }, (_, i) => makeEntry({ client: 'codex', session_id: 's', ts: 1790000000000 + i, kind: 'action', text: 'Bash: echo ' + i })), await queuedFor(env, home));
     const report = await flushCommand(['--client', 'codex'], env, 1000);
     assert.equal(report.codex.error, 'timeout');
     assert.ok(report.codex.sent >= 50 && report.codex.sent < 200, 'sent ' + report.codex.sent);
