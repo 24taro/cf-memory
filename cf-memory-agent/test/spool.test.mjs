@@ -314,15 +314,28 @@ test('sealing a large spool while another hook appends loses no entry and leaves
 test('repeated full flushes (each one seals) while three hook processes append lose nothing', async () => {
   const dir = tempDir();
   try {
-    const delivered = new Set();
-    const send = async batch => { for (const e of batch) delivered.add(e.id); return {}; };
-    const appenders = ['a', 'b', 'c'].map(tag => child('appender.mjs', [dir.path, '2000', tag]));
-    let invalid = 0, flushes = 0;
-    for (const end = Date.now() + 2300; Date.now() < end; flushes++) invalid += (await flush(dir.path, 'codex', send)).invalid;
-    const appended = (await Promise.all(appenders)).flat();
-    invalid += (await flush(dir.path, 'codex', send)).invalid;
-    assert.ok(flushes > 10 && appended.length > 1000, flushes + ' flushes, ' + appended.length + ' appended');
-    assert.deepEqual([appended.filter(id => !delivered.has(id)).length, invalid], [0, 0]);
+    const delivered = [], expected = [];
+    for (let round = 0; round < 12; round++) {
+      const first = makeEntry({ client: 'codex', session_id: 'flush', ts: TS0 + round, kind: 'reply', text: 'Round ' + round });
+      await appendEntries(dir.path, 'codex', [first]);
+      expected.push(first.id);
+      // Begin the child writes while the first batch is in flight. Every round
+      // exercises concurrent writes regardless of process and filesystem speed.
+      const result = await flush(dir.path, 'codex', async batch => {
+        delivered.push(...batch.map(entry => entry.id));
+        if (batch[0].id === first.id) {
+          const appended = await Promise.all(['a', 'b', 'c'].map(tag =>
+            child('appender.mjs', [dir.path, 'count=32', `${round}-${tag}`])));
+          assert.deepEqual(appended.map(ids => ids.length), [32, 32, 32]);
+          expected.push(...appended.flat());
+        }
+        return {};
+      });
+      assert.ifError(result.error);
+      assert.deepEqual([result.sent, result.invalid, result.pending_bytes], [97, 0, 0]);
+      assert.equal(existsSync(spoolFile(dir.path, 'codex')), false, 'the live spool was sealed and removed');
+    }
+    assert.deepEqual(delivered.sort(), expected.sort());
   } finally { dir.cleanup(); }
 });
 
