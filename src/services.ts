@@ -30,9 +30,8 @@ export interface UserRow {
   updated_at: number;
 }
 
-/** Called on EVERY request from the global middleware. The one-time email
- * fixup below is guarded by a WHERE clause that only matches an un-fixed-up
- * row, so it converges to a no-op SELECT.
+/** Called after verifying a credential. The one-time email fixup below is
+ * guarded by a WHERE clause that only matches an un-fixed-up row.
  *
  * OWNER_EMAIL is still load-bearing, but for one reason only: it is the address
  * ON the owner row. It stopped being an allow-list on 2026-08-18 — it decides
@@ -68,12 +67,14 @@ export async function ensureOwner(db: D1Database, env: Env): Promise<UserRow> {
   // itself) and the post-0025 schema (columns dropped) — the property that
   // makes deploy-code-first / apply-0025-later safe. Do not "restore" the
   // columns here; post-0025 that is a hard SQL error.
-  await db
-    .prepare("INSERT INTO users (id,handle,display_name,email,bio_md,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
-    .bind(id, handle, handle, ownerEmail, "", ts, ts)
-    .run();
-  await db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('owner_handle', ?)").bind(handle).run();
-  return (await db.prepare("SELECT * FROM users WHERE id=?").bind(id).first<UserRow>()) as UserRow;
+  await db.batch([
+    db.prepare(`INSERT INTO users (id,handle,display_name,email,bio_md,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(handle) DO NOTHING`).bind(id, handle, handle, ownerEmail, "", ts, ts),
+    db.prepare("INSERT OR REPLACE INTO meta (key,value) VALUES ('owner_handle', ?)").bind(handle),
+  ]);
+  const owner = await getUserByHandle(db, handle);
+  if (!owner) throw new Error("could not initialize the configured owner");
+  return owner;
 }
 
 export function getUserByHandle(db: D1Database, handle: string): Promise<UserRow | null> {
@@ -94,13 +95,12 @@ export function getUserById(db: D1Database, id: string): Promise<UserRow | null>
  * provides an account id. They converge on the same row, which an invitation
  * created; the token door attaches the account id to it on first use.
  *
- * The owner handle is honoured so the instance owner's row keeps its identity
- * rather than a second one appearing beside it.
+ * The owner address is initialized before this lookup so the owner keeps
+ * their original account.
  */
 async function resolveInvitedPerson(
   db: D1Database,
   email: string,
-  ownerHandle: string,
 ): Promise<UserRow | null> {
   const lower = email.trim().toLowerCase();
   if (!lower) return null;
@@ -111,12 +111,7 @@ async function resolveInvitedPerson(
   if (existing) return existing;
 
   // 2026-08-18: there used to be a branch here that let an address-less owner row
-  // be claimed by whoever signed in. It was unreachable — ensureOwner runs in the
-  // global middleware BEFORE this and either fills the address in from OWNER_EMAIL
-  // or throws — but with more than one person it had the shape of "the first
-  // stranger through the door inherits the owner's notes", which is not a shape to
-  // leave lying around waiting for the middleware order to change. A newcomer now
-  // gets a new row, always.
+  // be claimed by whoever signed in. A newcomer requires a separate invitation.
 
   // Not invited. Cloudflare Access says this person may reach the host; the
   // invitation says they use cf-memory. Returning null produces the refusal screen
@@ -220,8 +215,7 @@ export async function resolvePrincipal(db: D1Database, env: Env, headers: Header
     // token that does not match falls through to introspection, so an instance
     // may run both doors.
     if (await matchesApiToken(bearer, env.API_TOKEN)) {
-      const owner = await getUserByHandle(db, ownerHandle);
-      if (!owner) return anon(true, "agent");
+      const owner = await ensureOwner(db, env);
       return {
         userId: owner.id,
         handle: owner.handle,
@@ -262,12 +256,10 @@ export async function resolvePrincipal(db: D1Database, env: Env, headers: Header
     let user: UserRow | null = null;
     if (verified.subject.startsWith("user:")) {
       const authUserId = verified.subject.slice("user:".length);
+      await ensureOwner(db, env);
       user = await resolveAccount(db, authUserId, verified.email ?? null);
-      // 招待されていない。機械なので画面は要らず、401 が答え(invalidKey で
-      // 「トークンは有効だが、ここに居場所が無い」と区別がつく)。
-      if (!user) return anon(true, "agent");
     } else if (verified.subject.startsWith("machine:")) {
-      user = await getUserByHandle(db, ownerHandle);
+      user = await ensureOwner(db, env);
     } else {
       // Anything else — including the retired `human:<email>` form — is refused.
       // Falling through to the owner path was briefly present here and would have
@@ -307,7 +299,8 @@ export async function resolvePrincipal(db: D1Database, env: Env, headers: Header
   // also arrives with a token, the account id links to the same row and takes
   // over as the key from then on.
   const accessPrincipal = async (email: string): Promise<Principal> => {
-    const person = await resolveInvitedPerson(db, email, ownerHandle);
+    await ensureOwner(db, env);
+    const person = await resolveInvitedPerson(db, email);
     if (!person) return notInvited(email);
     return {
       userId: person.id,

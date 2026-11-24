@@ -11,7 +11,7 @@ import { handleMcp, MCP_TOOL_NAMES, storedTitle } from "./mcp";
 import { NoteInputError, StaleUpsertError, storedAs } from "./notes";
 import { searchFilters, SearchInputError, standaloneSearch } from "./search";
 import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData } from "./serialize";
-import { blockWriteResult, ensureOwner, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
+import { blockWriteResult, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
 import { attachmentDisposition, BundleQuotaError, BundlesUnconfiguredError, MAX_BUNDLE_FILE_BYTES, resolveServeContentType, validateBundlePath } from "./bundle";
 import { boundedBytes, MAX_REQUEST_BODY_BYTES, RequestBodyTooLargeError } from "./bounded-body";
 import { SkillsRepo, type SkillInput, type SkillRow } from "./skills";
@@ -22,12 +22,11 @@ import { pruneLogs, logSettings } from './logs';
 import { Layout } from "./web/layout";
 import { CaptureInputError, CaptureService } from './capture';
 import { AgentHealthPage, CaptureEventPage, CapturePage, CaptureSessionPage, CaptureSessionsPage, ProvenancePage } from './web/agent-pages';
-import { type ActivityRow, ActivityPage, ChangesPage, EditPage, HomePage, MemoryPage, MissingNotePage, NetworkPage, NotePage, PreviewPage, ProfilePage, RankingPage, SearchPage, SkillEditPage, SkillPage, SkillsListPage } from "./web/pages";
+import { type ActivityRow, ActivityPage, ChangesPage, EditPage, MemoryPage, MissingNotePage, NetworkPage, NotePage, PreviewPage, ProfilePage, RankingPage, SearchPage, SkillEditPage, SkillPage, SkillsListPage } from "./web/pages";
 import { toRecallSections } from "./web/recall-sections";
 
 type Vars = {
   services: Services;
-  owner: UserRow;
   principal: Principal;
   budget: number;
   // Per-request CSP nonce for the one static inline <script> (network graph).
@@ -52,7 +51,6 @@ app.use("*", async (c, next) => {
     try { c.executionCtx.waitUntil(task); }
     catch { return task; } // Direct app/test callers without an ExecutionContext.
   }));
-  c.set("owner", await ensureOwner(env.DB, env));
   const url = new URL(c.req.url);
   const principal = await resolvePrincipal(env.DB, env, c.req.raw.headers);
   c.set("principal", principal);
@@ -390,17 +388,7 @@ async function buildGraph(db: D1Database, userId: string, isOwner: boolean): Pro
 }
 
 // ---------------------------------------------------------------- web (human)
-app.get("/", async (c) => {
-  const { services, owner, principal } = c.var;
-  // Full per-viewer home (issue #91, supersedes #57's owner-name notice): an
-  // AUTHENTICATED viewer is sent to their OWN garden, exactly like the bare nav
-  // paths (/network, /ranking, ...) redirect just below. Keyed off
-  // principal.anonymous/handle (covers BOTH Bearer and Access auth). Anonymous
-  // visitors keep the instance owner's public landing (unchanged).
-  if (!principal.anonymous) return c.redirect(`/@${principal.handle}`);
-  const changes = await services.notes.changes(owner.id, principal, 30);
-  return c.html(<HomePage handle={owner.handle} sessionHandle={sessionHandle(c)} changes={changes} />);
-});
+app.get("/", (c) => c.redirect(`/@${c.var.principal.handle}`));
 
 // Post-SSO landing (design 2026-07-25 §5.2): the edge Access app covers
 // /access*, so a browser reaching this route has just passed (or already
@@ -461,7 +449,7 @@ function searchQueryFilters(query: Record<string, string>, form = false) {
 }
 
 app.get("/search", async (c) => {
-  const { services, owner, principal } = c.var;
+  const { services, principal } = c.var;
   const q = c.req.query("q") ?? "";
   // `mode` is ignored: semantic search was removed (2026-10-31) and every mode
   // is keyword search, so the page no longer offers a mode selector.
@@ -477,24 +465,22 @@ app.get("/search", async (c) => {
   try {
     const filters = searchQueryFilters(c.req.query(), true);
     const result = q ? await standaloneSearch(services.search, principal, q, { ...filters, scope, context, limit: 30 }) : null;
-    return c.html(<SearchPage handle={owner.handle} sessionHandle={sessionHandle(c)} q={q} scope={scope} scopes={scopes} context={context} filters={filters} hits={result?.hits ?? []} />);
+    return c.html(<SearchPage handle={c.env.OWNER_HANDLE || "owner"} sessionHandle={sessionHandle(c)} q={q} scope={scope} scopes={scopes} context={context} filters={filters} hits={result?.hits ?? []} />);
   } catch (error) {
     if (error instanceof SearchInputError) return c.text(error.message, 400);
     throw error;
   }
 });
 
-// Bare nav paths redirect to the caller's own canonical /@handle routes when
-// authenticated (so a teammate lands on their own garden, not always the
-// instance owner's); anonymous visitors keep the old owner-handle default.
+// The authentication gate leaves the caller's own canonical /@handle route.
 for (const p of ["network", "ranking", "changes", "feed.xml", "index.md"]) {
-  app.get(`/${p}`, (c) => c.redirect(`/@${c.var.principal.anonymous ? c.var.owner.handle : c.var.principal.handle}/${p}`));
+  app.get(`/${p}`, (c) => c.redirect(`/@${c.var.principal.handle}/${p}`));
 }
 
 const H = "/:h{@[^/]+}";
 
 app.get(H, async (c) => {
-  const { services, principal, owner } = c.var;
+  const { services, principal } = c.var;
   const handle = c.req.param("h").slice(1);
   const user = await getUserByHandle(c.env.DB, handle);
   if (!user) return c.notFound();

@@ -14,6 +14,7 @@ import app from "../src/index";
 import { TEST_ISSUER, accessEnvVars, setupAccessAuth } from "./helpers";
 
 let mf: Miniflare;
+let db: D1Database;
 let env: Parameters<typeof app.request>[2];
 let jwtFor: (email: string) => Promise<string>;
 
@@ -41,7 +42,7 @@ async function req(path: string, init: RequestInit = {}): Promise<Response> {
 
 beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({ modules: true, script: "export default {};", d1Databases: ["DB"] }));
-  const db = (await mf.getD1Database("DB")) as unknown as D1Database;
+  db = (await mf.getD1Database("DB")) as unknown as D1Database;
   await applyMigrations(db);
   await db.prepare("INSERT INTO users (id,handle,display_name,email,bio_md,created_at,updated_at) VALUES (?,?,?,?,?,?,?)").bind("u_gate_owner", "gate-owner", "owner", "gate-owner@example.com", "", 0, 0).run();
   jwtFor = await setupAccessAuth();
@@ -94,11 +95,39 @@ describe("fail-closed gate (decision 9) — anonymous is stopped before any rout
     // surface with no reader, and it went with the host-wide Access change.
     expect((await req("/healthz")).status).toBe(401);
 
-    // The unauthenticated first-run door is gone: ensureOwner runs in the
-    // request middleware, so the route only ever duplicated it — while sitting
-    // open to anyone and able to create the owner row on an empty users table.
+    // Owner initialization belongs to the verified credential paths.
     const boot = await req("/api/v1/bootstrap", { method: "POST" });
     expect(boot.status).toBe(401);
+  });
+
+  it("serves sign-in and anonymous denials without querying the owner database", async () => {
+    const prepare = () => { throw new Error("unexpected D1 access"); };
+    const noDatabase = { ...env!, DB: { prepare }, API_TOKEN: "a".repeat(32) } as Parameters<typeof app.request>[2];
+    const anonymous = (path: string, init?: RequestInit) => app.request(`https://memory.test${path}`, init, noDatabase);
+    expect((await anonymous("/api/v1/notes")).status).toBe(401);
+    expect((await anonymous("/mcp", { headers: { authorization: `Bearer ${"b".repeat(32)}` } })).status).toBe(401);
+    expect((await anonymous("/access/login")).status).toBe(403);
+    expect((await anonymous("/", { headers: { accept: "text/html" } })).status).toBe(302);
+  });
+
+  it("seeds one owner for simultaneous valid first requests", async () => {
+    const apiToken = "c".repeat(32);
+    const fresh = { ...env!, OWNER_HANDLE: "first-owner", OWNER_EMAIL: "first-owner@example.com", API_TOKEN: apiToken };
+    const request = () => app.request("https://memory.test/mcp", {
+      method: "POST",
+      headers: { authorization: `Bearer ${apiToken}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "whoami" } }),
+    }, fresh);
+    expect((await app.request("https://memory.test/api/v1/whoami", {}, fresh)).status).toBe(401);
+    expect(await db.prepare("SELECT id FROM users WHERE handle=?").bind(fresh.OWNER_HANDLE).first()).toBeNull();
+    const responses = await Promise.all([request(), request()]);
+    expect(responses.map(response => response.status)).toEqual([200, 200]);
+    const identities = await Promise.all(responses.map(async response => {
+      const rpc = await response.json<{ result: { content: [{ text: string }] } }>();
+      return JSON.parse(rpc.result.content[0].text) as { handle: string; user_id: string };
+    }));
+    expect(identities[0]).toMatchObject({ handle: "first-owner", user_id: expect.any(String) });
+    expect(identities[0].user_id).toBe(identities[1].user_id);
   });
 
   // Regression guard: /access* must stay in OPEN_PATHS — dropping it would
