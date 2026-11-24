@@ -125,6 +125,40 @@ describe("concurrency — note append (issue #3 acceptance criterion)", () => {
     expect(row?.body_md).toContain("base");
     for (const t of tokens) expect(row?.body_md).toContain(t);
   });
+
+  it("keeps FTS, tags, and links aligned with the last concurrent note edit", async () => {
+    const slug = "concurrent-index";
+    const { note } = await services.notes.upsert(principal, { slug, body_md: "initial" });
+    await Promise.all(["first", "second", "third"].map(label => services.notes.upsert(principal, {
+      slug,
+      body_md: `current ${label} [[target-${label}]]`,
+      tags: [label],
+    })));
+    const saved = await services.notes.getRowById(note.id);
+    const label = saved?.body_md.split(" ")[1];
+    const row = await db.prepare(`SELECT f.body,f.tags FROM notes_fts f JOIN notes n ON n.rowid=f.rowid
+      WHERE n.id=?`).bind(note.id).first<{ body: string; tags: string }>();
+    expect(row).toEqual({ body: saved?.body_md, tags: label });
+    expect(await services.notes.tagsFor(note.id)).toEqual([label]);
+    const links = await db.prepare("SELECT target_slug FROM links WHERE src_note_id=?").bind(note.id).all<{ target_slug: string }>();
+    expect(links.results).toEqual([{ target_slug: `target-${label}` }]);
+    const events = await db.prepare("SELECT COUNT(*) AS count FROM events WHERE target_id=? AND verb='note.updated'")
+      .bind(note.id).first<{ count: number }>();
+    expect(events?.count).toBe(3);
+  });
+
+  it("merges concurrent metadata edits on an unchanged note body", async () => {
+    const slug = "concurrent-note-metadata";
+    const body_md = "unchanged body";
+    const { note } = await services.notes.upsert(principal, { slug, body_md });
+    await Promise.all([
+      services.notes.upsert(principal, { slug, body_md, scope: "https://github.com/example/repo" }),
+      services.notes.upsert(principal, { slug, body_md, type: "project" }),
+    ]);
+    expect(await services.notes.getRowById(note.id)).toMatchObject({
+      scope: "github.com/example/repo", type: "project", content_hash: note.content_hash,
+    });
+  });
 });
 
 describe("concurrency — skills upsert CAS (review follow-up)", () => {

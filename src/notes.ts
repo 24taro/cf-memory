@@ -1,7 +1,5 @@
-// NotesRepo: the write path over the one substrate. A note upsert atomically (for
-// a single writer) maintains: the note row + revision history + FTS index +
-// the wikilink mesh (extract outgoing links, resolve targets, and auto-resolve
-// inbound stubs that were waiting for this slug) + tags + events.
+// NotesRepo commits a note with its revisions, search index, tags, resolved
+// links, and audit event.
 //
 // 2026-10-31: no embeddings. The legacy `embedding` / `embedding_model`
 // columns are neither written nor read (NOTE_COLUMNS) until phase 5 drops them.
@@ -28,6 +26,8 @@ const NOTE_COLUMN_LIST = ['id', 'user_id', 'slug', 'title', 'body_md', 'frontmat
   'scope', 'last_viewed_at', 'archived_at', 'valid_from', 'valid_until', 'superseded_by', 'supersedes', 'shared', 'type'];
 export const NOTE_COLUMNS = NOTE_COLUMN_LIST.join(', ');
 const NOTE_COLUMNS_N = NOTE_COLUMN_LIST.map(c => 'n.' + c).join(', ');
+
+type NoteMutationGate = { sql: string; args: unknown[] };
 
 export type RecallNoteRow = NoteRow & {
   recall_editor_ref: string | null;
@@ -333,14 +333,12 @@ export class NotesRepo {
     // indistinguishable from a write conflict below (twelve retries, then a 500).
     if (input.kind !== undefined && !NOTE_KINDS.includes(input.kind)) throw new NoteInputError("kind must be one of note, journal, observation");
     const userId = principal.userId;
-    // Under concurrent writes to the SAME slug, the loser collides on either
-    // INSERT notes (UNIQUE user_id,slug) or the notes_fts rowid delete/insert;
-    // both fail before the revision/event writes, so a single retry converges
-    // (winner's row now visible -> UPDATE; FTS rowid clear) into an idempotent upsert.
+    // A conflicting create or update retries from a fresh snapshot. The row
+    // and its revision, event, tags, index, and links commit together.
     const MAX_ATTEMPTS = 12;
     for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
       try {
-    const ts = now();
+    const startedAt = now();
     // B1: lift a leading `--- YAML ---` block out of the body into frontmatter.
     let parsed = parseFrontmatter(input.body_md ?? "");
     let hasFm = Object.keys(parsed.data).length > 0;
@@ -354,7 +352,7 @@ export class NotesRepo {
     // wins) so a `.md` twin round-trip re-PUTs onto the SAME note instead of
     // forking a new one off the title.
     let slug = slugifyPath(input.slug ?? fmSlug ?? input.title ?? fmTitle ?? title);
-    if (slug === "untitled" && (input.slug ?? "").trim().toLowerCase() !== "untitled") slug = `untitled-${ulid(ts).toLowerCase()}`;
+    if (slug === "untitled" && (input.slug ?? "").trim().toLowerCase() !== "untitled") slug = `untitled-${ulid(startedAt).toLowerCase()}`;
     // 2026-08-21: 読みは「自分の行 → 無ければ共有行」で解決するのに、書きは自分の
     // 名前空間に固定されていた。共有ノートに追記すると自分の名前空間に同じ slug の
     // 別の行ができ、以後その人には自分のコピーだけが見える —— 共有ノートが永久に
@@ -391,6 +389,7 @@ export class NotesRepo {
       audience === false || (audience === undefined && input.append_md === undefined);
     const sharedRow = ownLive || personalIntent ? null : await this.getSharedRowBySlug(slug);
     const existing = ownLive ?? (sharedRow && sharedRow.kind !== "block" && sharedRow.pinned_block_label == null ? sharedRow : null) ?? ownRow;
+    const ts = Math.max(startedAt, (existing?.updated_at ?? -1) + 1);
     // A non-owner reaching a teammate's shared row edits CONTENT only: body, title
     // and tags. Audience and lifecycle — shared, type, kind, scope, stage, the
     // validity window, supersession, the block marker and its limit, archived
@@ -542,7 +541,6 @@ export class NotesRepo {
       own.valid_until !== undefined ? own.valid_until : (parseFmDate(fmOwn.valid_until) ?? existing?.valid_until ?? null);
     // This note stays whatever it already was on the supersession axis (a later
     // note may supersede IT); the supersede-stamp below writes the OTHER row.
-    const supersededBy = existing?.superseded_by ?? null;
     // `supersedes` = the note THIS one replaces. Accept a slug or an id, from the
     // structured input or frontmatter; resolve to an owner-owned note id (never
     // self). Preserve the existing backpointer when omitted.
@@ -583,19 +581,36 @@ export class NotesRepo {
         supersedeTargetId = target.id;
       }
     }
-    // Commit a content revision with its row. changes() ties its insertion to
-    // the immediately preceding note mutation, including a no-match CAS.
+    const commit = this.mutationEvent(userId, principal, created ? "note.created" : "note.updated", id, title, ts, {
+      content_hash: contentHash,
+      op: created ? "create" : "replace",
+      ...(supersedeTargetId ? { supersedes: supersedeTargetId } : {}),
+    });
+    const { sql: committed, args: gate } = commit.gate;
     const recordRevision = !existing || existing.deleted_at || existing.content_hash !== contentHash || existing.frontmatter_json !== frontmatter;
     const revision = recordRevision ? this.db.prepare(`INSERT INTO note_revisions
       (id,note_id,body_md,frontmatter_json,editor,editor_ref,content_hash,created_at)
-      SELECT ?,id,body_md,frontmatter_json,?,?,content_hash,? FROM notes WHERE changes()=1 AND id=?`)
-      .bind(ulid(ts), principal.actor, principal.viaKeyPrefix ?? principal.handle, ts, id) : null;
+      SELECT ?,id,body_md,frontmatter_json,?,?,content_hash,? FROM notes WHERE id=? AND ${committed}`)
+      .bind(ulid(ts), principal.actor, principal.viaKeyPrefix ?? principal.handle, ts, id, ...gate) : null;
+    const related = [
+      commit.event,
+      ...(revision ? [revision] : []),
+      ...this.tagStatements(rowOwner, id, tags, ts, commit.gate),
+      ...this.indexStatements(id, ftsTags, commit.gate),
+      ...this.outgoingLinkStatements(rowOwner, id, body, ts, commit.gate),
+      // Resolve pending links from the owner, or from everyone when the note is shared.
+      this.db.prepare(`UPDATE links SET target_note_id=?,resolved=1
+        WHERE target_slug=? AND target_note_id IS NULL AND ${committed}${shared ? "" : " AND user_id=?"}`)
+        .bind(id, slug, ...gate, ...(shared ? [] : [rowOwner])),
+      // This pointer is for display. Recall derives supersession from live forward links.
+      ...(supersedeTargetId ? [
+        this.db.prepare(`UPDATE notes SET superseded_by=? WHERE id=? AND user_id=? AND ${committed}`)
+          .bind(id, supersedeTargetId, userId, ...gate),
+      ] : []),
+    ];
     if (existing) {
-      // Optimistic concurrency: only update if the row still carries the hash we
-      // read. A concurrent writer that already moved the hash -> changes===0 ->
-      // throw a retriable conflict BEFORE any FTS/revision/event writes so the
-      // loser re-enters the loop and recomputes (notably appends) against the
-      // winner's body. A no-op edit still matches the row (changes===1).
+      // Bind the write to the hash, timestamp, and slug read in this attempt.
+      // The timestamp covers metadata-only edits, and the slug covers renames.
       // CAS token: a read-modify-write caller (block set/replace, H-1) passes the
       // content_hash of the base IT read (expectedContentHash) so the guard covers
       // the whole read->upsert window, not just upsert's own re-read; otherwise
@@ -620,23 +635,23 @@ export class NotesRepo {
       const where=updateGuard?guardedTextWhere(updateGuard,userId,slug,now()):undefined;
       const update = where ? this.db.prepare(`UPDATE notes AS n SET
         title=?, body_md=?, content_hash=?, word_count=?, updated_at=?
-        WHERE ${where.sql}`).bind(title,body,contentHash,wordCount,now(),...where.args)
+        WHERE ${where.sql}`).bind(title,body,contentHash,wordCount,ts,...where.args)
         : writeThrough ? this.db
         .prepare(
           `UPDATE notes SET title=?, body_md=?, frontmatter_json=?, content_hash=?, word_count=?, updated_at=?
-           WHERE id=? AND content_hash=? AND user_id=? AND shared=1 AND deleted_at IS NULL`,
+           WHERE id=? AND content_hash=? AND user_id=? AND updated_at=? AND slug=? AND shared=1 AND deleted_at IS NULL`,
         )
-        .bind(title, body, frontmatter, contentHash, wordCount, ts, id, casHash, rowOwner)
+        .bind(title, body, frontmatter, contentHash, wordCount, ts, id, casHash, rowOwner, existing.updated_at, slug)
         : this.db
         .prepare(
           `UPDATE notes SET title=?, body_md=?, frontmatter_json=?, kind=?, stage=?, scope=?, type=?, shared=?,
              pinned_block_label=?, char_limit=?, content_hash=?,
-             word_count=?, valid_from=?, valid_until=?, superseded_by=?, supersedes=?,
+             word_count=?, valid_from=?, valid_until=?, supersedes=?,
              updated_at=?, deleted_at=NULL, archived_at=NULL
-           WHERE id=? AND content_hash=? AND user_id=?${input.expectedId !== undefined ? " AND deleted_at IS NULL" : ""}`,
+           WHERE id=? AND content_hash=? AND user_id=? AND updated_at=? AND slug=? AND deleted_at IS ?${input.expectedId !== undefined ? " AND deleted_at IS NULL" : ""}`,
         )
-        .bind(title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersededBy, supersedesId, ts, id, casHash, rowOwner);
-      const result = revision ? (await this.db.batch([update, revision]))[0] : await update.run();
+        .bind(title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersedesId, ts, id, casHash, rowOwner, existing.updated_at, slug, existing.deleted_at);
+      const [result] = await this.db.batch([update, ...related]);
       if (result.meta.changes === 0) {if(updateGuard)throw new UpdateConflictError();throw new StaleUpsertError();}
     } else {
       const provenanceStatements = creationProvenance ? await creationProvenance(id, shared) : null;
@@ -654,68 +669,12 @@ export class NotesRepo {
              AND (SELECT count(*) FROM memory_provenance pv WHERE pv.memory_kind='note' AND pv.memory_id=n.id)=?
            )` : `VALUES (${values})`}`,
         )
-        .bind(id, userId, slug, title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, supersededBy, supersedesId, createdAt, ts,
+        .bind(id, userId, slug, title, body, frontmatter, kind, stage, scope, noteType, shared ? 1 : 0, pinned, charLimit, contentHash, wordCount, validFrom, validUntil, null, supersedesId, createdAt, ts,
           ...(guard ? [...current.args(now()), guard.id, userId, guard.content_hash, guard.scope, guard.shared ? 1 : 0, guard.updated_at, guard.provenance_count] : []));
-      const result = (await this.db.batch([insert, ...(revision ? [revision] : []), ...(provenanceStatements ?? [])]))[0];
+      const [result] = await this.db.batch([insert, ...related, ...(provenanceStatements ?? [])]);
       if (guard && result.meta.changes === 0) throw new SupersessionConflictError();
     }
 
-    // FTS: regular fts5 keyed by notes.rowid; delete-then-insert is the safe update.
-    const rowidRow = await this.db.prepare("SELECT rowid AS rowid FROM notes WHERE id=?").bind(id).first<{ rowid: number }>();
-    if (rowidRow?.rowid != null) {
-      await this.db.prepare("DELETE FROM notes_fts WHERE rowid=?").bind(rowidRow.rowid).run();
-      await this.db.prepare("INSERT INTO notes_fts (rowid,title,body,tags) VALUES (?,?,?,?)").bind(rowidRow.rowid, title, body, ftsTags).run();
-    }
-
-    await this.reconcileTags(rowOwner, id, tags, ts);
-    await this.rebuildOutgoingLinks(rowOwner, id, body, ts, principal);
-
-    // auto-resolve inbound stub links now that a note with this slug exists.
-    //
-    // 2026-08-22: 共有ノートなら、待っていたのが誰の stub でも解決する。個人ノート
-    // なら従来どおり本人の stub だけ。「[[slug]] と書いて待つ → 誰かが書いた瞬間に
-    // 繋がる」という庭の成長の仕組みは、共有ノートでこそ効く —— 相手が書いてくれた
-    // のに自分の側は「まだ書かれていない」と表示し続けるのでは、待つ意味が無い。
-    //
-    // 共有を後から外した場合、他人の links 行はこのノートを指したまま残るが、
-    // 読み取り側(outgoing の LEFT JOIN が readableSql を持つ)が解決済みとして
-    // 扱わないので、その人には未解決として描かれる。可視性の門は読み取り側にある。
-    if (shared) {
-      await this.db
-        .prepare(`UPDATE links SET target_note_id=?, resolved=1 WHERE target_slug=? AND target_note_id IS NULL`)
-        .bind(id, slug)
-        .run();
-    } else {
-      await this.db
-        .prepare(`UPDATE links SET target_note_id=?, resolved=1 WHERE user_id=? AND target_slug=? AND target_note_id IS NULL`)
-        .bind(id, rowOwner, slug)
-        .run();
-    }
-
-    // decision 10: when this note declares it supersedes another, stamp the OLD
-    // note superseded_by = THIS note, for display/history only (notes_get shows
-    // "replaced by X"). Recall hiding is NOT derived from this pointer — it is
-    // derived from the never-overwritten FORWARD pointer `supersedes` on the live
-    // superseder (`NOT EXISTS (a live note whose supersedes = the old note)`, read
-    // at query time). So deleting this note auto-revives the old fact with no
-    // reconcile; and when two live notes supersede the same target, deleting one
-    // still leaves the other hiding it (superseded_by, being last-writer-wins, could
-    // not express that). We set superseded_by UNCONDITIONALLY (latest superseder
-    // wins the display pointer). No valid_until is set (that conflated supersession
-    // with an explicit window). Idempotent under the CAS retry (same value). Does
-    // NOT bump updated_at (a supersession is not an edit).
-    if (supersedeTargetId) {
-      await this.db
-        .prepare(`UPDATE notes SET superseded_by=? WHERE id=? AND user_id=?`)
-        .bind(id, supersedeTargetId, userId)
-        .run();
-    }
-
-    await this.event(userId, principal, created ? "note.created" : "note.updated", id, title, {
-      content_hash: contentHash,
-      op: created ? "create" : "replace",
-      ...(supersedeTargetId ? { supersedes: supersedeTargetId } : {}),
-    });
     const note = (await this.getRowById(id)) as NoteRow;
     if (!writeThrough) return { note, created, shared };
     // Answer from the row as it is now, not from the snapshot read above.
@@ -742,49 +701,62 @@ export class NotesRepo {
     throw new Error("upsert: unreachable");
   }
 
-  private async rebuildOutgoingLinks(userId: string, srcId: string, body: string, ts: number, principal: Principal): Promise<void> {
-    await this.db.prepare("DELETE FROM links WHERE src_note_id=?").bind(srcId).run();
-    const seen = new Set<string>();
-    for (const m of parseWikilinks(body)) {
-      if (seen.has(m.targetSlug)) continue;
-      seen.add(m.targetSlug);
-      // 2026-08-22: 解決先は「自分の生きた行 → 無ければ共有行」。読み
-      // (getRowBySlugForCaller)と同じ規則で、リンクも同じ行に着く。
-      //
-      // ここが user_id に閉じていたので、共有ノートへの [[wikilink]] は
-      // resolved=0 で保存されていた。実害は2つ: (1) backlinks は
-      // target_note_id で引くので、共有ノートを指すリンクが1本も出ない
-      // (2) グラフが「まだ書かれていない」と描く —— 後者は読み取り側で
-      // 可視性から導出して塞いだが、それは表示の手当てで、こちらが本体。
-      const own = await this.db
-        .prepare(`SELECT id FROM notes WHERE user_id=? AND slug=? AND deleted_at IS NULL`)
-        .bind(userId, m.targetSlug)
-        .first<{ id: string }>();
-      const target =
-        own ??
-        (await this.db
-          .prepare(`SELECT id FROM notes WHERE slug=? AND shared=1 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 1`)
-          .bind(m.targetSlug)
-          .first<{ id: string }>());
-      const targetId = target?.id ?? null;
-      await this.db
-        .prepare(
-          `INSERT OR IGNORE INTO links (id,user_id,src_note_id,target_slug,target_note_id,kind,anchor_text,position,resolved)
-           VALUES (?,?,?,?,?,?,?,?,?)`,
-        )
-        .bind(ulid(ts), userId, srcId, m.targetSlug, targetId, m.kind, m.anchorText, m.position, targetId ? 1 : 0)
-        .run();
-    }
+  private indexStatements(id: string, tags: string, gate: NoteMutationGate): D1PreparedStatement[] {
+    return [
+      this.db.prepare(`DELETE FROM notes_fts WHERE rowid=(SELECT rowid FROM notes WHERE id=?) AND ${gate.sql}`).bind(id, ...gate.args),
+      this.db.prepare(`INSERT INTO notes_fts (rowid,title,body,tags)
+        SELECT rowid,title,body_md,? FROM notes WHERE id=? AND ${gate.sql}`).bind(tags, id, ...gate.args),
+    ];
   }
 
-  private async reconcileTags(userId: string, noteId: string, tags: string[], ts: number): Promise<void> {
-    await this.db.prepare("DELETE FROM note_tags WHERE note_id=?").bind(noteId).run();
-    for (const name of tags) {
-      const tslug = slugify(name);
-      await this.db.prepare("INSERT OR IGNORE INTO tags (id,user_id,name,slug) VALUES (?,?,?,?)").bind(ulid(ts), userId, name, tslug).run();
-      const row = await this.db.prepare("SELECT id FROM tags WHERE user_id=? AND slug=?").bind(userId, tslug).first<{ id: string }>();
-      if (row) await this.db.prepare("INSERT OR IGNORE INTO note_tags (note_id,tag_id) VALUES (?,?)").bind(noteId, row.id).run();
+  private outgoingLinkStatements(userId: string, id: string, body: string, ts: number, gate: NoteMutationGate): D1PreparedStatement[] {
+    const statements = [this.db.prepare(`DELETE FROM links WHERE src_note_id=? AND ${gate.sql}`).bind(id, ...gate.args)];
+    const links = [], seen = new Set<string>();
+    for (const match of parseWikilinks(body)) {
+      if (seen.has(match.targetSlug)) continue;
+      seen.add(match.targetSlug);
+      links.push({ id: ulid(ts), slug: match.targetSlug, kind: match.kind, anchor: match.anchorText, position: match.position });
     }
+    // Per-binding chunks keep the JSON supplied to D1 small for large notes.
+    for (let offset = 0; offset < links.length; offset += 100) {
+      statements.push(this.db.prepare(`INSERT OR IGNORE INTO links
+        (id,user_id,src_note_id,target_slug,target_note_id,kind,anchor_text,position,resolved)
+        SELECT link_id,?,?,slug,target,kind,anchor,position,target IS NOT NULL FROM (
+          SELECT json_extract(value,'$.id') AS link_id,json_extract(value,'$.slug') AS slug,
+            json_extract(value,'$.kind') AS kind,json_extract(value,'$.anchor') AS anchor,json_extract(value,'$.position') AS position,
+            COALESCE((SELECT id FROM notes WHERE user_id=? AND slug=json_extract(value,'$.slug') AND deleted_at IS NULL),
+              (SELECT id FROM notes WHERE shared=1 AND slug=json_extract(value,'$.slug') AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1)) AS target
+          FROM json_each(?) WHERE ${gate.sql}
+        )`).bind(userId, id, userId, JSON.stringify(links.slice(offset, offset + 100)), ...gate.args));
+    }
+    return statements;
+  }
+
+  private tagStatements(userId: string, noteId: string, tags: string[], ts: number, gate: NoteMutationGate): D1PreparedStatement[] {
+    const statements = [this.db.prepare(`DELETE FROM note_tags WHERE note_id=? AND ${gate.sql}`).bind(noteId, ...gate.args)];
+    for (let offset = 0; offset < tags.length; offset += 100) {
+      const entries = JSON.stringify(tags.slice(offset, offset + 100).map(name => ({ id: ulid(ts), name, slug: slugify(name) })));
+      statements.push(
+        this.db.prepare(`INSERT OR IGNORE INTO tags (id,user_id,name,slug)
+          SELECT json_extract(value,'$.id'),?,json_extract(value,'$.name'),json_extract(value,'$.slug')
+          FROM json_each(?) WHERE ${gate.sql}`).bind(userId, entries, ...gate.args),
+        this.db.prepare(`INSERT OR IGNORE INTO note_tags (note_id,tag_id)
+          SELECT ?,t.id FROM json_each(?) JOIN tags t ON t.user_id=? AND t.slug=json_extract(value,'$.slug')
+          WHERE ${gate.sql}`).bind(noteId, entries, userId, ...gate.args),
+      );
+    }
+    return statements;
+  }
+
+  private mutationEvent(userId: string, principal: Principal, verb: string, targetId: string, summary: string, ts: number, payload: Record<string, unknown> = {}) {
+    const eventId = ulid(ts);
+    // This statement immediately follows the row mutation. Its unique ID gates
+    // every related statement even when a competing request used the same clock tick.
+    const event = this.db.prepare(`INSERT INTO events
+      (id,user_id,actor,actor_ref,verb,target_kind,target_id,reason,summary,payload_json,created_at)
+      SELECT ?,?,?,?,?,?,?,?,?,?,? WHERE changes()=1`)
+      .bind(eventId, userId, principal.actor, principal.viaKeyPrefix ?? principal.handle, verb, "note", targetId, null, summary, JSON.stringify(payload), ts);
+    return { event, gate: { sql: "EXISTS (SELECT 1 FROM events WHERE id=?)", args: [eventId] } };
   }
 
   private async event(userId: string, principal: Principal, verb: string, targetId: string, summary: string, payload: Record<string, unknown> = {}): Promise<void> {
@@ -807,26 +779,25 @@ export class NotesRepo {
     // Guard the mutation itself, not just the earlier read. A stale snapshot
     // must not delete an independently edited/shared/scoped/re-provenanced row,
     // nor clean up its FTS/links or emit a successful deletion event.
-    const result = await this.db.prepare(`UPDATE notes AS n SET deleted_at=?, updated_at=?
+    const remove = this.db.prepare(`UPDATE notes AS n SET deleted_at=?, updated_at=?
       WHERE n.id=? AND n.user_id=? AND n.deleted_at IS NULL ${guard ? `
       AND ${current.sql} n.content_hash=? AND n.scope=? AND COALESCE(n.shared,0)=? AND n.updated_at=?
       AND n.archived_at IS NULL AND n.kind!='block' AND n.pinned_block_label IS NULL
       AND (SELECT count(*) FROM memory_provenance pv WHERE pv.memory_kind='note' AND pv.memory_id=n.id)=?` : ''}`)
-      .bind(ts, ts, id, principal.userId, ...(guard ? [...current.args(ts), guard.content_hash, guard.scope, guard.shared ? 1 : 0, guard.updated_at, guard.provenance_count] : [])).run();
+      .bind(ts, ts, id, principal.userId, ...(guard ? [...current.args(ts), guard.content_hash, guard.scope, guard.shared ? 1 : 0, guard.updated_at, guard.provenance_count] : []));
+    const commit = this.mutationEvent(principal.userId, principal, "note.deleted", id, note.title, ts);
+    const { sql: committed, args: gate } = commit.gate;
+    const [result] = await this.db.batch([
+      remove,
+      commit.event,
+      this.db.prepare(`DELETE FROM notes_fts WHERE rowid=(SELECT rowid FROM notes WHERE id=?) AND ${committed}`).bind(id, ...gate),
+      this.db.prepare(`DELETE FROM links WHERE src_note_id=? AND ${committed}`).bind(id, ...gate),
+      this.db.prepare(`UPDATE links SET target_note_id=NULL,resolved=0 WHERE target_note_id=? AND ${committed}`).bind(id, ...gate),
+    ]);
     if (!result.meta.changes) {
       if (guard) throw new DeletionConflictError();
       return false;
     }
-    // decision 10: no reconcile needed. Recall hides a superseded note only while
-    // a LIVE note supersedes it (derived: NOT EXISTS a live note whose supersedes =
-    // this note), so soft-deleting a superseder automatically returns the fact it
-    // replaced to recall — atomically and without any compensating write to race.
-    const rowidRow = await this.db.prepare("SELECT rowid AS rowid FROM notes WHERE id=?").bind(id).first<{ rowid: number }>();
-    if (rowidRow?.rowid != null) await this.db.prepare("DELETE FROM notes_fts WHERE rowid=?").bind(rowidRow.rowid).run();
-    await this.db.prepare("DELETE FROM links WHERE src_note_id=?").bind(id).run();
-    // inbound links fall back to stubs
-    await this.db.prepare("UPDATE links SET target_note_id=NULL, resolved=0 WHERE target_note_id=?").bind(id).run();
-    await this.event(principal.userId, principal, "note.deleted", id, note.title);
     return true;
   }
 
@@ -883,10 +854,7 @@ export class NotesRepo {
       WHERE e.id=? AND e.user_id=? AND e.verb='note.appended' AND json_extract(e.payload_json,'$.request_hash')=?
       AND n.id=? AND n.user_id=? AND n.updated_at=e.created_at AND n.content_hash=? AND json_extract(e.payload_json,'$.commit_nonce')=?)`;
     const gate=[receiptId,principal.userId,requestHash,id,principal.userId,contentHash,commitNonce];
-    const links: {id:string;target_slug:string;kind:string;anchor_text:string|null;position:number}[]=[], seen=new Set<string>();
-    for(const m of parseWikilinks(body))if(!seen.has(m.targetSlug)){
-      seen.add(m.targetSlug);links.push({id:ulid(ts),target_slug:m.targetSlug,kind:m.kind,anchor_text:m.anchorText,position:m.position});
-    }
+    const mutationGate = { sql: committed, args: gate };
     const finalWhere=guardedTextWhere(guard,principal.userId,slug,now());
     const results=await this.db.batch([
       this.db.prepare(`UPDATE notes AS n SET body_md=?,content_hash=?,word_count=?,updated_at=?
@@ -898,19 +866,11 @@ export class NotesRepo {
         SELECT ?,?,?,?,?,?,?,?,?,?,? FROM notes n WHERE changes()=1 AND n.id=? AND n.user_id=? AND n.content_hash=?`)
         .bind(receiptId,principal.userId,principal.actor,principal.viaKeyPrefix??principal.handle,'note.appended','note',id,provenance.rationale,note.title,payload,ts,id,principal.userId,contentHash),
       ...provenanceStatements,
-      this.db.prepare(`DELETE FROM notes_fts WHERE rowid=(SELECT rowid FROM notes WHERE id=?) AND ${committed}`).bind(id,...gate),
-      this.db.prepare(`INSERT INTO notes_fts(rowid,title,body,tags) SELECT rowid,title,body_md,? FROM notes n WHERE n.id=? AND ${committed}`).bind(tags.join(' '),id,...gate),
+      ...this.indexStatements(id, tags.join(' '), mutationGate),
       this.db.prepare(`INSERT INTO note_revisions(id,note_id,body_md,frontmatter_json,editor,editor_ref,content_hash,created_at)
         SELECT ?,id,body_md,frontmatter_json,?,?,content_hash,? FROM notes n WHERE n.id=? AND ${committed}`)
         .bind(ulid(ts),principal.actor,principal.viaKeyPrefix??principal.handle,ts,id,...gate),
-      this.db.prepare(`DELETE FROM links WHERE src_note_id=? AND ${committed}`).bind(id,...gate),
-      this.db.prepare(`INSERT OR IGNORE INTO links(id,user_id,src_note_id,target_slug,target_note_id,kind,anchor_text,position,resolved)
-        SELECT json_extract(value,'$.id'),?,?,json_extract(value,'$.target_slug'),
-          COALESCE((SELECT id FROM notes WHERE user_id=? AND slug=json_extract(value,'$.target_slug') AND deleted_at IS NULL),
-            (SELECT id FROM notes WHERE shared=1 AND slug=json_extract(value,'$.target_slug') AND deleted_at IS NULL ORDER BY created_at,id LIMIT 1)),
-          json_extract(value,'$.kind'),json_extract(value,'$.anchor_text'),json_extract(value,'$.position'),
-          EXISTS(SELECT 1 FROM notes WHERE slug=json_extract(value,'$.target_slug') AND deleted_at IS NULL AND (user_id=? OR shared=1))
-        FROM json_each(?) WHERE ${committed}`).bind(principal.userId,id,principal.userId,principal.userId,JSON.stringify(links),...gate),
+      ...this.outgoingLinkStatements(principal.userId, id, body, ts, mutationGate),
     ]);
     if(!results[0].meta.changes)return replay(await this.appendStatus(principal,id,operationId));
     return {appended:true,id,slug,append_id:operationId,content_hash:contentHash,provenance_stored:true,replayed:false};
@@ -1069,7 +1029,7 @@ export class NotesRepo {
   // これら3つ(backlinks / outgoing / backlinksBySlug)は閲覧者を束縛する。
   //
   // 2026-08-21: `kind != 'block'` も要る。core-memory ブロックにも [[wikilink]] の
-  // リンク行は作られる(upsert は kind を問わず rebuildOutgoingLinks を呼ぶ)ので、
+  // リンク行は作られる(upsert は kind を問わずリンクを更新する)ので、
   // 条件が無いとブロックの slug と title がバックリンク一覧に出る。一覧と検索は
   // ブロックを除くのに、ここだけが露出口になっていた。
   async backlinks(noteId: string, viewerId: string): Promise<NoteSummary[]> {
