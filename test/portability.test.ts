@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { readFileSync, readdirSync } from 'node:fs';
 import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { afterAll, beforeAll, expect, it } from 'vitest';
@@ -29,6 +30,47 @@ beforeAll(async () => {
   services = makeServices(db, await mf.getR2Bucket('BUNDLES') as unknown as R2Bucket);
 });
 afterAll(async () => { await mf?.dispose(); });
+it('rejects repeating provenance pages with the same continuation', async () => {
+  const source = { ...snapshot(41), rationale: 'Fixture' };
+  const cursor = { at: source.created_at, event_id: source.event_id, relation: source.relation };
+  let pages = 0;
+  const mock = async (name: string) => {
+    if (name === 'whoami') return { user_id: 'owner' };
+    if (name === 'memory_export') return { format: 'cf-memory-memory/v1', records: [{ id: 'example' }], next_cursor: null };
+    if (name === 'memory_export_provenance') {
+      pages++;
+      return { found: true, before: 3000, snapshots: [source], next_cursor: cursor };
+    }
+    throw Error('unexpected tool');
+  };
+  await expect(exportArchive(mock, { url: 'https://memory.test/mcp', token: 'fixture' })).rejects.toThrow('non-progressing provenance cursor');
+  expect(pages).toBe(2);
+});
+
+it('preflights a long supersession chain without recursively walking the stack', async () => {
+  const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+  const record = {
+    memory_kind: 'note', kind: 'note', stage: 'seedling', title: 'Record', body_md: 'Text', tags: [], shared: false,
+    type: null, scope: 'global', slug: 'record', frontmatter: {}, provenance: [],
+    created_at: 10, updated_at: 10, content_hash: sha('Record\nText\n'),
+  };
+  const count = 10_000;
+  const records = Array.from({ length: count }, (_, index) => ({
+    ...record, id: 'record-' + index, supersedes: index + 1 < count ? 'record-' + (index + 1) : null,
+  }));
+  const payload = { format: 'cf-memory-memory/v1', source: { instance: hash(1), owner_id: 'owner' }, created_at: 11, records };
+  const checked: string[] = [];
+  const simulate = async (tool: string) => {
+    checked.push(tool);
+    return { found: false };
+  };
+  await expect(importArchive(simulate, { ...payload, checksum: sha(JSON.stringify(payload)) })).resolves.toMatchObject({
+    mode: 'dry-run', create: count, missing_predecessors: 0,
+  });
+  expect(checked).toHaveLength(count);
+  expect(new Set(checked)).toEqual(new Set(['notes_get']));
+}, 30_000);
+
 it('owner export follows stable pages, includes archived history/lifecycle, excludes teammates, embeddings and raw capture', async () => {
   const old = (await services.notes.upsert(alice, { slug: 'export-old', title: 'Database', body_md: 'MySQL', scope: 'https://github.com/example/repo.git', type: 'project' })).note;
   const next = (await services.notes.upsert(alice, { slug: 'export-new', title: 'Database', body_md: 'PostgreSQL', supersedes: old.id, type: 'project', tags: ['database'] })).note;

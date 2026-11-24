@@ -129,6 +129,7 @@ Cloudflare 上のインスタンスを削除するには、導入時のアカウ
 - [Web 画面(Cloudflare Access)](docs/WEB-ACCESS.md)
 - [チームで使う（実験的機能）](docs/TEAM-MODE.md)
 - [エージェントプラグイン](cf-memory-agent/README.md)
+- [バックアップと復元](cf-memory-agent/README.md#back-up-and-restore-memory)。ノート、スキル、添付、来歴を別のインスタンスへ移せます。
 - [セキュリティ](SECURITY.md)
 
 ## ローカル開発

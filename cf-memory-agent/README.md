@@ -228,6 +228,27 @@ node cf-memory-agent/scripts/agent.mjs replay-held [--client claude-code|codex] 
   record. The spool and health files stay.
 - `--home DIR` installs everything under `DIR` (tests); an empty `--home=` is refused.
 
+## Back up and restore memory
+
+From the cf-memory checkout, use the same credentials as the hooks. Export
+your notes, skills, attachments, core blocks, and their stored provenance to a
+new file outside the repository. The archive is readable JSON and the tool
+creates it with owner-only permissions.
+
+```bash
+node cf-memory-agent/scripts/portability.mjs export ~/cf-memory-backup.json
+```
+
+Switch to the destination instance's credentials before running the preview.
+Review the plan, then apply it. Restored notes and skills are private. Add
+`--include-core` to both commands when you also want to restore core blocks.
+The conversation log stays in its own D1 database.
+
+```bash
+node cf-memory-agent/scripts/portability.mjs import ~/cf-memory-backup.json
+node cf-memory-agent/scripts/portability.mjs import ~/cf-memory-backup.json --apply
+```
+
 ## Files
 
 `scripts/agent.mjs` (Claude entry and commands), `scripts/codex-hook.mjs` (Codex entry),

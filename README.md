@@ -192,6 +192,7 @@ you created for the instance. Delete `.cf-memory.secrets` and
 - [Web pages behind Cloudflare Access](docs/WEB-ACCESS.md): read and edit your notes in a browser.
 - [Experimental team mode](docs/TEAM-MODE.md): several people on one instance, with an OAuth authorization server.
 - [The agent plugin](cf-memory-agent/README.md): what each hook does, the local spool, settings.
+- [Back up and restore memory](cf-memory-agent/README.md#back-up-and-restore-memory): move notes and skills with their attachments and provenance.
 - [Security](SECURITY.md): the trust model and how to report a problem.
 
 ## Develop
