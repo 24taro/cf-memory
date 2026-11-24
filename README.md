@@ -71,8 +71,9 @@ surface in future keyword Recall.
 
 To update, pull the latest changes in the same checkout and run `./install.sh`
 again. Keep `.cf-memory.secrets` and `.cf-memory.deployment.json`. They identify
-the token, Worker, two D1 database IDs, and R2 bucket. The installer checks the
-storage bindings before updating the Worker and again before running migrations.
+the token, Worker, two D1 database IDs, and the R2 bucket's name, jurisdiction,
+and creation time. The installer verifies storage before updating the Worker
+and again before running migrations.
 If you move to another checkout, copy both files and select the original
 Cloudflare account. Update the registered Claude Code marketplace to the new
 checkout before reconnecting Claude Code. See [Security](SECURITY.md) for token

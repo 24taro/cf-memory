@@ -94,7 +94,7 @@ function cloudflareApi({ domain, account }) {
   return async function request(path, options = {}) {
     try {
       const response = await fetch(base + path, {
-        ...options, headers: { ...headers, 'Content-Type': 'application/json' },
+        ...options, headers: { ...options.headers, ...headers, 'Content-Type': 'application/json' },
         redirect: 'error', signal: AbortSignal.timeout(30_000),
       });
       return { ...await response.json(), status: response.status, ok: response.ok };
@@ -203,13 +203,29 @@ async function verifyStorage(target) {
       jurisdiction(liveBucket.jurisdiction) !== jurisdiction(plannedBucket.jurisdiction)) {
     throw new Error('the configured BUNDLES R2 bucket differs from the running Worker');
   }
-  const BUNDLES = { bucket_name: liveBucket.bucket_name, jurisdiction: jurisdiction(liveBucket.jurisdiction) };
+  const bucketName = liveBucket.bucket_name;
+  const bucketJurisdiction = jurisdiction(liveBucket.jurisdiction);
+  const bucket = await accountRequest(`/r2/buckets/${encodeURIComponent(bucketName)}`, {
+    headers: bucketJurisdiction ? { 'cf-r2-jurisdiction': bucketJurisdiction } : {},
+  });
+  const createdAt = bucket.result?.creation_date;
+  if (!bucket.ok || !bucket.success || bucket.result?.name !== bucketName ||
+      (bucket.result?.jurisdiction && jurisdiction(bucket.result.jurisdiction) !== bucketJurisdiction) ||
+      typeof createdAt !== 'string' || !Number.isFinite(Date.parse(createdAt))) {
+    throw new Error('could not verify the creation date of the BUNDLES R2 bucket');
+  }
+  const BUNDLES = { bucket_name: bucketName, jurisdiction: bucketJurisdiction, created_at: createdAt };
   const saved = binding?.storage;
   if (saved && (saved.DB !== DB || saved.LOGS !== LOGS || saved.BUNDLES?.bucket_name !== BUNDLES.bucket_name ||
-      saved.BUNDLES?.jurisdiction !== BUNDLES.jurisdiction)) {
+      saved.BUNDLES?.jurisdiction !== BUNDLES.jurisdiction ||
+      (saved.BUNDLES?.created_at !== undefined && saved.BUNDLES.created_at !== BUNDLES.created_at))) {
     throw new Error('the running Worker storage differs from this checkout’s saved deployment');
   }
   return { DB, LOGS, BUNDLES };
+}
+
+function recordStorage(file, binding, storage) {
+  if (binding.storage?.BUNDLES?.created_at === undefined) writeBinding(file, { ...binding, storage }, true);
 }
 
 async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
@@ -236,7 +252,7 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
       // before publishing its route or applying the database migrations.
       if (binding && token) {
         const storage = await verifyStorage(target);
-        if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
+        recordStorage(bindingFile, binding, storage);
         return output('update', worker.id);
       }
     }
@@ -249,7 +265,7 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
     }
     const storage = await verifyStorage(target);
     if (!binding) writeBinding(bindingFile, { ...record(worker.id), storage, phase: 'ready' });
-    else if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
+    else recordStorage(bindingFile, binding, storage);
     return output('update', worker.id);
   }
 
@@ -276,7 +292,7 @@ async function recordDeployedStorage(bindingFile, workerId) {
     throw new Error('the deployed Worker identity could not be verified before database migration');
   }
   const storage = await verifyStorage(target);
-  if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
+  recordStorage(bindingFile, binding, storage);
 }
 
 async function rotateToken(bindingFile, secretsFile) {

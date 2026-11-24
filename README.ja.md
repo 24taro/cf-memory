@@ -53,7 +53,7 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 ### 更新する・初回導入を再開する
 
-最新の変更を同じチェックアウトに取り込み、`./install.sh` をもう一度実行します。`.cf-memory.secrets` にはトークン、`.cf-memory.deployment.json` には Worker、2つの D1 の ID、R2 バケットの情報を保存します。インストーラーは Worker 更新前とデータベース移行前に、保存先の紐づけを照合します。
+最新の変更を同じチェックアウトに取り込み、`./install.sh` をもう一度実行します。`.cf-memory.secrets` にはトークン、`.cf-memory.deployment.json` には Worker、2つの D1 の ID、R2 バケットの名前、管轄、作成日時を保存します。インストーラーは Worker 更新前とデータベース移行前に、保存先を照合します。
 
 別のチェックアウトへ移る場合は、この2ファイルをコピーし、元の Cloudflare アカウントを選択してください。Claude Code を再接続するときは、登録済みマーケットプレイスの参照元も新しい場所に変更します。トークンの更新手順は [Security](SECURITY.md) にあります。
 

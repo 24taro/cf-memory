@@ -74,15 +74,17 @@ interface InstallFixtureOptions {
   bindingPhase?: string;
   tokenAccepted?: boolean;
   rotation?: 'start' | 'resume' | 'upload-fails';
-  storageChange?: 'configured' | 'saved-binding' | 'after-deploy';
+  storageChange?: 'configured' | 'saved-binding' | 'after-deploy' | 'recreated-bucket';
+  legacyStorage?: boolean;
   existingUrl?: string;
 }
 
 const primaryDB = '11111111-1111-4111-8111-111111111111';
 const logDB = '22222222-2222-4222-8222-222222222222';
 const otherDB = '33333333-3333-4333-8333-333333333333';
+const bucketCreatedAt = '2026-11-22T00:00:00.000Z';
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, storageChange, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, storageChange, legacyStorage = false, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -109,7 +111,11 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     if (bindingPhase) writeFileSync(bindingFile, JSON.stringify({
       version: 1, phase: bindingPhase, account: 'a'.repeat(32), name: 'cf-memory', workerId: 'c'.repeat(32),
       domain: 'https://api.cloudflare.com/client/v4', origin: 'https://cf-memory.test.workers.dev',
-      ...(storageChange === 'saved-binding' ? { storage: { DB: otherDB, LOGS: logDB, BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '' } } } : {}),
+      ...((legacyStorage || storageChange === 'saved-binding' || storageChange === 'recreated-bucket') ? { storage: {
+        DB: storageChange === 'saved-binding' ? otherDB : primaryDB,
+        LOGS: logDB,
+        BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '', ...(legacyStorage ? {} : { created_at: bucketCreatedAt }) },
+      } } : {}),
     }), { mode: 0o600 });
     const trace = join(root, 'wrangler-args');
     writeFileSync(trace, '');
@@ -165,6 +171,10 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
           const uuid = path.split('/').at(-1);
           const name = uuid === '${logDB}' ? 'cf-memory-logs' : 'cf-memory';
           return Response.json({ success: true, result: { uuid, name } });
+        }
+        if (path.endsWith('/r2/buckets/cf-memory-bundles')) {
+          const creation_date = '${storageChange ?? ''}' === 'recreated-bucket' ? '2026-11-23T00:00:00.000Z' : '${bucketCreatedAt}';
+          return Response.json({ success: true, result: { name: 'cf-memory-bundles', jurisdiction: 'default', creation_date } });
         }
         if (path.endsWith('/scripts/cf-memory/settings')) {
           return Response.json({ success: true, result: { bindings: [
@@ -344,10 +354,10 @@ it('requires the original destination and an accepted token before a routine upd
   expect(rejectedToken.binding).toBeNull();
 });
 
-it('checks the same D1 and R2 bindings before deploying and again before migrations', () => {
-  const setup = installFixture({ bindingPhase: 'ready' });
+it('records the R2 creation time in a prior binding and checks storage before deploying and migrating', () => {
+  const setup = installFixture({ bindingPhase: 'ready', legacyStorage: true });
   expect(setup.result.status, setup.result.stderr).toBe(0);
-  expect(setup.binding.storage).toEqual({ DB: primaryDB, LOGS: logDB, BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '' } });
+  expect(setup.binding.storage).toEqual({ DB: primaryDB, LOGS: logDB, BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '', created_at: bucketCreatedAt } });
   const isStorageCheck = (args: string[]) => args[2]?.endsWith('/scripts/cf-memory/settings');
   const deploy = setup.calls.findIndex(args => args[0] === 'deploy');
   const storageChecks = setup.calls.flatMap((args, index) => isStorageCheck(args) ? [index] : []);
@@ -357,7 +367,7 @@ it('checks the same D1 and R2 bindings before deploying and again before migrati
   expect(storageChecks[1]!).toBeLessThan(setup.calls.findIndex(args => args[0] === 'd1'));
 });
 
-it.each(['configured', 'saved-binding'] as const)('stops a Worker update when storage differs from the %s identity', storageChange => {
+it.each(['configured', 'saved-binding', 'recreated-bucket'] as const)('stops a Worker update when storage differs from the %s identity', storageChange => {
   const setup = installFixture({ bindingPhase: 'ready', storageChange });
   expect(setup.result.status).toBe(1);
   expect(setup.result.stderr).toContain('differs');
