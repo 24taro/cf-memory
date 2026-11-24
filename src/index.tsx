@@ -1286,15 +1286,24 @@ api.get("/memory/blocks", async (c) => {
 api.patch("/memory/blocks/:label", async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
-  const b = await c.req.json<{ op?: "set" | "append" | "replace"; value: string; char_limit?: number; replace?: string }>();
+  const body: unknown = await c.req.json().catch(() => null);
+  if (!body || typeof body !== "object" || Array.isArray(body)) return c.json({ error: "expected a JSON object" }, 400);
+  const { value, char_limit, replace, op: requestedOp } = body as Record<string, unknown>;
+  const op = requestedOp ?? "set";
+  if (op !== "set" && op !== "append" && op !== "replace") return c.json({ error: "invalid block operation" }, 400);
   // append/replace answer according to the stored block (length, block_full, a
   // match): without notes:read that answer is an oracle for the block's text.
-  if ((b.op ?? "set") !== "set") {
+  if (op !== "set") {
     const unreadable = requireRead(c);
     if (unreadable) return unreadable;
   }
+  if (typeof value !== "string") return c.json({ error: "value must be a string" }, 400);
+  if (char_limit != null && (typeof char_limit !== "number" || !Number.isFinite(char_limit))) {
+    return c.json({ error: "char_limit must be numeric or null" }, 400);
+  }
+  if (replace != null && typeof replace !== "string") return c.json({ error: "replace must be a string" }, 400);
   try {
-    const block = await c.var.services.memory.setBlock(c.var.principal, c.req.param("label"), b.op ?? "set", b.value, b.char_limit, b.replace);
+    const block = await c.var.services.memory.setBlock(c.var.principal, c.req.param("label"), op, value, char_limit, replace ?? undefined);
     // The block is returned only to a caller that may read it (blockWriteResult).
     return c.json({ block: blockWriteResult(c.var.principal, block) });
   } catch (e) {

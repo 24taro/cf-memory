@@ -468,6 +468,15 @@ describe("write-scoped operations return no stored content without notes:read", 
     expect(((await viaRest.json()) as { block: { value: string } }).block.value).toContain(BLOCK);
   });
 
+  it("rejects invalid REST block edits with a 400 and leaves the block unchanged", async () => {
+    await seed();
+    for (const body of [null, [], {}, { op: "unknown", value: "" }, { value: 5 }, { value: "", char_limit: "10" }, { op: "replace", value: "", replace: [] }]) {
+      const res = await req("/api/v1/memory/blocks/probe", full, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      expect(res.status, JSON.stringify(body)).toBe(400);
+    }
+    expect(JSON.parse((await mcp(full, "memory_get", { label: "probe" })).text).block.value).toBe(BLOCK);
+  });
+
   it("memory_set answers a write-only token with label, length and char_limit only", async () => {
     await seed();
     const out = await mcp(writeOnly, "memory_set", { label: "probe-2", value: "fresh" });
