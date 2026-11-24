@@ -14,3 +14,4 @@ coverage/
 .cf-memory.secrets
 .cf-memory.secrets.*
 .cf-memory.install-claim
+.cf-memory.deployment.json*

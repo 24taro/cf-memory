@@ -60,33 +60,24 @@ fi
 # The owner's token. Kept in this checkout, readable only by you, never committed.
 SECRETS_FILE=".cf-memory.secrets"
 INSTALL_CLAIM=".cf-memory.install-claim"
-DEPLOY_LOG=$(mktemp)
-trap 'rm -f "$DEPLOY_LOG"' EXIT
-set --
-if secret_list=$(CI=true wrangler secret list --format json 2>"$DEPLOY_LOG"); then
-  if ! printf '%s' "$secret_list" | node -e '
-    const secrets = JSON.parse(require("node:fs").readFileSync(0, "utf8"));
-    process.exit(Array.isArray(secrets) && secrets.some(secret => secret.name === "API_TOKEN") ? 0 : 1);
-  ' 2>/dev/null; then
-    fail "the existing Worker has no verified API_TOKEN secret. Check its name and Cloudflare account before installing"
-  fi
-  [ -s "$SECRETS_FILE" ] || fail "the Worker already exists. Restore $SECRETS_FILE from the original checkout or rotate its API token explicitly (see SECURITY.md)"
-elif grep -Eq 'Worker "[^"]+" not found\.' "$DEPLOY_LOG"; then
-  say "Reserving the Worker name for this first install"
-  reservation=$(CI=true node scripts/reserve-worker.mjs "$INSTALL_CLAIM") ||
-    fail "the first install did not reserve the Worker; no token was uploaded"
-  read -r account_id worker_name api_url <<< "${reservation##*$'\n'}"
-  [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ && -n "$api_url" ]] ||
-    fail "could not confirm the reserved Cloudflare account and Worker"
-  export CLOUDFLARE_ACCOUNT_ID="$account_id" CLOUDFLARE_API_BASE_URL="$api_url"
+DEPLOYMENT_FILE=".cf-memory.deployment.json"
+say "Verifying the Cloudflare account and Worker"
+target=$(CI=true node scripts/reserve-worker.mjs prepare "$INSTALL_CLAIM" "$DEPLOYMENT_FILE" "$SECRETS_FILE") ||
+  fail "could not prepare the selected Worker; no token was uploaded"
+read -r mode account_id worker_name api_url URL worker_id <<< "${target##*$'\n'}"
+[[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ &&
+   "$worker_id" =~ ^[[:xdigit:]]{32}$ && -n "$api_url" && "$URL" =~ ^https://[a-z0-9.-]+\.workers\.dev$ ]] ||
+  fail "could not confirm the Cloudflare account, Worker, and URL"
+export CLOUDFLARE_ACCOUNT_ID="$account_id" CLOUDFLARE_API_BASE_URL="$api_url"
+set -- --name "$worker_name"
+if [ "$mode" = first ]; then
   if [ ! -e "$SECRETS_FILE" ]; then
     say "Generating the API token ($SECRETS_FILE)"
     (umask 077; set -C; generated_token=$(openssl rand -hex 32); printf 'API_TOKEN=%s\n' "$generated_token" > "$SECRETS_FILE")
   fi
-  set -- --secrets-file "$SECRETS_FILE" --name "$worker_name"
-else
-  cat "$DEPLOY_LOG" >&2
-  fail "could not verify whether the Worker already exists"
+  set -- --secrets-file "$SECRETS_FILE" "$@"
+elif [ "$mode" != update ]; then
+  fail "could not confirm the deployment mode"
 fi
 chmod 600 "$SECRETS_FILE"
 TOKEN=$(sed -n 's/^API_TOKEN=//p' "$SECRETS_FILE" | head -n 1)
@@ -96,11 +87,9 @@ export -n TOKEN
 say "Deploying the Worker (creates the D1 databases and the R2 bucket on first run)"
 if ! CI=true wrangler deploy "$@" \
     --var "BUILD_GIT_SHA:$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
-    --var "BUILD_DATE:$(date -u +%Y-%m-%dT%H:%M:%SZ)" 2>&1 | tee "$DEPLOY_LOG"; then
+    --var "BUILD_DATE:$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
   fail "wrangler deploy failed (see the output above)"
 fi
-URL=$(grep -Eo 'https://[A-Za-z0-9.-]+\.workers\.dev' "$DEPLOY_LOG" | head -n 1 || true)
-[ -n "$URL" ] || fail "the deploy printed no workers.dev address. Open Workers & Pages in the Cloudflare dashboard once to choose your workers.dev subdomain, then run this again"
 
 say "Applying database migrations"
 CI=true wrangler d1 migrations apply DB --remote
@@ -109,10 +98,11 @@ CI=true wrangler d1 migrations apply LOGS --remote
 say "Checking $URL"
 OK=0
 for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -fsS -m 15 -H @- "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
+  if printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -q -fsS -m 15 -H @- "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
   sleep 3
 done
 [ "$OK" = 1 ] || fail "the Worker is deployed at $URL but did not accept the token. Run this script again in a minute"
+node scripts/reserve-worker.mjs ready "$DEPLOYMENT_FILE" "$worker_id"
 rm -f "$INSTALL_CLAIM"
 echo "The server accepts your token."
 

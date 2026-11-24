@@ -40,11 +40,9 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 ### 更新する・初回導入を再開する
 
-更新するときは同じチェックアウトで最新の変更を取り込み、`./install.sh` をもう一度実行します。同じ Cloudflare アカウントを使い、`.cf-memory.secrets` を残しておくと、既存のデータベース、バケット、トークンを再利用します。
+更新するときは同じチェックアウトで最新の変更を取り込み、`./install.sh` をもう一度実行します。トークンを保存する `.cf-memory.secrets` と、デプロイ先を記録する `.cf-memory.deployment.json` は残してください。通常の更新ではトークン、データベース、バケットを再利用します。別のチェックアウトに移る場合は、この2ファイルをコピーして元の Cloudflare アカウントを選択します。トークンの更新手順は [Security](SECURITY.md) にあります。
 
-通常の更新ではデプロイ済みのトークンを保持します。別のチェックアウトに移る場合は、先に元の `.cf-memory.secrets` をコピーしてください。トークンの更新手順は [Security](SECURITY.md) にあります。
-
-初回導入が中断した場合は、作成済みの `.cf-memory.install-claim` と `.cf-memory.secrets` を残し、同じチェックアウトで再実行してください。インストーラーはクライアントごとに MCP 登録とフック導入の結果を表示します。Codex が再承認を求めたら `/hooks` で確認してください。
+初回導入が中断した場合は、作成済みの予約・デプロイ先・トークンの各ファイルを残し、同じチェックアウトで再実行してください。旧版で `.cf-memory.secrets` だけがある場合は、稼働中の Worker がトークンを受け入れることを確認してからデプロイ先を記録します。インストーラーはクライアントごとに MCP 登録とフック導入の結果を表示します。Codex が再承認を求めたら `/hooks` で確認してください。
 
 ## 仕組み
 
@@ -102,7 +100,7 @@ npx wrangler d1 delete cf-memory-logs
 npx wrangler r2 bucket delete cf-memory-bundles
 ```
 
-R2 バケットにオブジェクトがある場合は、先に空にしてください。Cloudflare Access や独自ドメインを設定した場合は、Cloudflare 側の関連設定も削除してください。API トークンが不要になったら、チェックアウトの `.cf-memory.secrets` を削除します。
+R2 バケットにオブジェクトがある場合は、先に空にしてください。Cloudflare Access や独自ドメインを設定した場合は、Cloudflare 側の関連設定も削除してください。API トークンが不要になったら、チェックアウトの `.cf-memory.secrets` と `.cf-memory.deployment.json` を削除します。
 
 ## そのほか
 

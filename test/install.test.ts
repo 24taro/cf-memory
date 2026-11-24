@@ -65,7 +65,7 @@ it('continues with Codex alone or when client setup is disabled', () => {
   }
 });
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '' } = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -78,9 +78,14 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     symlinkSync(process.execPath, join(bin, 'node'));
     const tokenFile = join(root, '.cf-memory.secrets');
     const claimFile = join(root, '.cf-memory.install-claim');
+    const bindingFile = join(root, '.cf-memory.deployment.json');
     if (dotEnv) writeFileSync(join(root, '.env'), dotEnv);
     if (savedToken) writeFileSync(tokenFile, `API_TOKEN=${'x'.repeat(32)}\n`, { mode: 0o600 });
     if (reservation === 'resume' || reservation === 'deployed') writeFileSync(claimFile, 'a'.repeat(32), { mode: 0o600 });
+    if (bindingPhase) writeFileSync(bindingFile, JSON.stringify({
+      version: 1, phase: bindingPhase, account: 'a'.repeat(32), name: 'cf-memory', workerId: 'c'.repeat(32),
+      domain: 'https://api.cloudflare.com/client/v4', origin: 'https://cf-memory.test.workers.dev',
+    }), { mode: 0o600 });
     const trace = join(root, 'wrangler-args');
     writeFileSync(trace, '');
     const wrangler = join(root, 'node_modules/wrangler/bin/wrangler.js');
@@ -96,10 +101,6 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
       if (args[0] === 'whoami' && args.includes('--json')) {
         console.log(JSON.stringify({ accounts: [{ id: 'a'.repeat(32) }] }));
       }
-      if (args[0] === 'secret') {
-        if (process.env.WORKER === 'present') console.log('[{"name":"API_TOKEN","type":"secret_text"}]');
-        else { console.error(process.env.WORKER === 'missing' ? 'Worker "cf-memory" not found.' : 'Could not reach Cloudflare.'); process.exitCode = 1; }
-      }
       if (args[0] === 'deploy') console.log('https://test.example.workers.dev');
       if (args[0] === 'deploy' && process.env.CLOUDFLARE_ACCOUNT_ID) {
         require('node:fs').appendFileSync(process.env.TRACE, JSON.stringify([
@@ -110,25 +111,32 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     const fetchMock = join(root, 'mock-cloudflare.mjs');
     writeFileSync(fetchMock, `
       import { appendFileSync } from 'node:fs';
-      let tags;
       globalThis.fetch = async (url, options) => {
         const method = options.method ?? 'GET';
-        appendFileSync(process.env.TRACE, JSON.stringify(['api', method, new URL(url).pathname]) + '\\n');
+        const path = new URL(url).pathname;
+        appendFileSync(process.env.TRACE, JSON.stringify(['api', method, path]) + '\\n');
         const state = process.env.RESERVATION;
+        const worker = { id: 'c'.repeat(32), name: 'cf-memory' };
+        if (path === '/api/v1/whoami') {
+          return process.env.TOKEN_ACCEPTED === 'true'
+            ? Response.json({ token_status: 'active', handle: 'owner', scopes: ['admin'] })
+            : Response.json({ error: 'unauthorized' }, { status: 401 });
+        }
+        if (path.endsWith('/subdomain')) return Response.json({ success: true, result: { subdomain: 'test' } });
         if (method === 'POST') {
           const submitted = JSON.parse(options.body);
-          tags = submitted.tags;
-          if (state === 'created') return Response.json({ success: true, result: submitted });
+          if (state === 'created') return Response.json({ success: true, result: { ...worker, tags: submitted.tags } });
           if (state === 'unconfirmed') return Response.json({ success: false }, { status: 503 });
           return Response.json({ success: false, errors: [{ code: 10040 }] }, { status: 409 });
         }
         if (url.includes('/versions?')) {
           return Response.json({ success: true, result: state === 'deployed' ? [{ id: 'existing' }] : [] });
         }
-        return Response.json({
-          success: true,
-          result: { name: 'cf-memory', tags: state === 'competing' ? ['another-install'] : tags },
-        });
+        if (process.env.WORKER === 'unknown') return Response.json({ success: false }, { status: 503 });
+        if (process.env.WORKER === 'present' || state === 'resume' || state === 'deployed') {
+          return Response.json({ success: true, result: { ...worker, tags: ['cf-memory-install-' + 'a'.repeat(32)] } });
+        }
+        return Response.json({ success: false }, { status: 404 });
       };
     `);
     const stub = (name: string, body: string) => writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o700 });
@@ -141,7 +149,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
       encoding: 'utf8',
       env: {
         HOME: root, CODEX_HOME: join(root, '.codex'), PATH: `${bin}:/usr/bin:/bin`,
-        WORKER: worker, TRACE: trace, RESERVATION: reservation, NODE_OPTIONS: `--import=${fetchMock}`,
+        WORKER: worker, TRACE: trace, RESERVATION: reservation, NODE_OPTIONS: `--import=${fetchMock}`, TOKEN_ACCEPTED: String(tokenAccepted),
       },
     });
     const calls = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
@@ -149,6 +157,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     const hooks = join(root, '.codex', 'hooks.json');
     return {
       result, calls, deploy, tokenExists: existsSync(tokenFile), claimExists: existsSync(claimFile),
+      binding: existsSync(bindingFile) ? JSON.parse(readFileSync(bindingFile, 'utf8')) : null,
       codex: existsSync(hooks) ? readFileSync(hooks, 'utf8') : '',
     };
   } finally {
@@ -178,7 +187,9 @@ it('deploys a new Worker with a token and preserves the existing secret on updat
   expect(update.result.status).toBe(0);
   expect(update.deploy).toBeDefined();
   expect(update.deploy).not.toContain('--secrets-file');
-  expect(update.calls.some(args => args[0] === 'api')).toBe(false);
+  expect(update.calls.findIndex(args => args[2] === '/api/v1/whoami'))
+    .toBeLessThan(update.calls.findIndex(args => args[0] === 'deploy'));
+  expect(update.binding.phase).toBe('ready');
 });
 
 it('resumes its own reserved Worker before any version exists', () => {
@@ -199,7 +210,7 @@ it('reserves and deploys to the account selected in Wrangler dotenv', () => {
   expect(calls).toContainEqual(['deployment-target', account, 'https://api.cloudflare.com/client/v4']);
 });
 
-it.each(['competing', 'deployed', 'unconfirmed'])('uploads no credentials if the first-install reservation is %s', reservation => {
+it.each(['competing', 'unconfirmed'])('uploads no credentials if the first-install reservation is %s', reservation => {
   const { result, calls, deploy, tokenExists, claimExists } = installFixture({ worker: 'missing', reservation, savedToken: false });
   expect(result.status).toBe(1);
   expect(result.stderr).toContain('no token was uploaded');
@@ -207,6 +218,45 @@ it.each(['competing', 'deployed', 'unconfirmed'])('uploads no credentials if the
   expect(deploy).toBeUndefined();
   expect(tokenExists).toBe(false);
   expect(claimExists).toBe(true);
+});
+
+it('does not treat a Worker with versions as a new deployment', () => {
+  const { result, deploy, tokenExists, calls } = installFixture({ worker: 'missing', reservation: 'deployed', savedToken: false });
+  expect(result.status).toBe(1);
+  expect(deploy).toBeUndefined();
+  expect(tokenExists).toBe(false);
+  expect(calls.some(args => args[0] === 'api' && args[1] === 'POST')).toBe(false);
+});
+
+it('finishes provisioning its original Worker after the first deployment was interrupted', () => {
+  const { result, deploy, binding, calls } = installFixture({ bindingPhase: 'pending', reservation: 'deployed', tokenAccepted: false });
+  expect(result.status).toBe(0);
+  expect(deploy).toBeDefined();
+  expect(deploy).not.toContain('--secrets-file');
+  expect(binding.phase).toBe('ready');
+  expect(calls.some(args => args[2] === '/api/v1/whoami')).toBe(false);
+});
+
+it('requires the original destination and an accepted token before a routine update', () => {
+  const changedAccount = installFixture({ bindingPhase: 'ready', dotEnv: `CLOUDFLARE_ACCOUNT_ID=${'b'.repeat(32)}\n` });
+  expect(changedAccount.result.status).toBe(1);
+  expect(changedAccount.result.stderr).toContain('differs from this checkout');
+  expect(changedAccount.calls.some(args => args[0] === 'api' || args[0] === 'deploy')).toBe(false);
+
+  const rejectedToken = installFixture({ tokenAccepted: false });
+  expect(rejectedToken.result.status).toBe(1);
+  expect(rejectedToken.calls).toContainEqual(['api', 'GET', '/api/v1/whoami']);
+  expect(rejectedToken.deploy).toBeUndefined();
+  expect(rejectedToken.binding).toBeNull();
+});
+
+it('keeps an unbound saved token out of a first deployment', () => {
+  const { result, deploy, tokenExists, calls } = installFixture({ worker: 'missing' });
+  expect(result.status).toBe(1);
+  expect(result.stderr).toContain('saved token cannot be used on a new Worker');
+  expect(tokenExists).toBe(true);
+  expect(deploy).toBeUndefined();
+  expect(calls.some(args => args[0] === 'api' && args[1] === 'POST')).toBe(false);
 });
 
 it.each(['present', 'unknown'])('does not deploy when the local token is absent and Worker state is %s', worker => {

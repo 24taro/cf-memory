@@ -53,16 +53,18 @@ node cf-memory-agent/scripts/agent.mjs doctor
 ### Update or resume setup
 
 To update, pull the latest changes in the same checkout and run `./install.sh`
-again. Use the same Cloudflare account and keep `.cf-memory.secrets` to reuse
-the API token. The databases and bucket are reused.
-Regular updates preserve the deployed token. If you move to another checkout,
-copy the original `.cf-memory.secrets` before installing. See [Security](SECURITY.md)
-for token rotation.
+again. Keep `.cf-memory.secrets` and `.cf-memory.deployment.json`. They identify
+the token and the deployment it belongs to. Regular updates preserve the token,
+databases, and bucket. If you move to another checkout, copy those two files
+and select the original Cloudflare account. See [Security](SECURITY.md) for
+token rotation.
 
 If the first install is interrupted, keep `.cf-memory.install-claim` and
-`.cf-memory.secrets` if present, then rerun from that checkout. The installer
-reports MCP and hook status separately for each client. If Codex prompts again
-after an update, review the hooks in `/hooks`.
+any deployment and token files it created, then rerun from that checkout.
+For an earlier setup with only `.cf-memory.secrets`, the installer records the
+deployment identity after verifying that the existing Worker accepts your token.
+The installer reports MCP and hook status separately for each client.
+If Codex prompts again after an update, review the hooks in `/hooks`.
 
 ## How it works
 
@@ -163,7 +165,8 @@ npx wrangler r2 bucket delete cf-memory-bundles
 
 Empty the R2 bucket first if it contains objects. If you set up Cloudflare
 Access or a custom domain, remove the associated settings in Cloudflare. Once
-you no longer need the API token, delete `.cf-memory.secrets` from the checkout.
+you no longer need the API token, delete `.cf-memory.secrets` and
+`.cf-memory.deployment.json` from the checkout.
 
 ## More
 
