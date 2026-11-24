@@ -1,15 +1,11 @@
-// Salvaged from multiuser-auth.test.ts (deleted with password login): the
-// owner-only isolation guarantees are auth-mechanism-independent and must
-// survive the Access-only switch. bob exists as a raw user ROW + bearer key
-// (no password/session door needed for cross-user isolation checks). Harness
-// mirrors Task 3's access-principal.test.ts (real Hono app on a Miniflare D1
-// with the full migration set, Access-JWT fixtures from test/helpers.ts).
+// Exercise owner-only routes with Access and delegated agent credentials
+// against the real Hono app and the full migration set on Miniflare D1.
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import app from "../src/index";
-import { TEST_RESOURCE, accessEnvVars, bearerKeyFixture, bearerTokenFor, rsEnvVars, setupAccessAuth, principalFixture } from "./helpers";
+import { TEST_RESOURCE, accessEnvVars, bearerTokenFor, rsEnvVars, setupAccessAuth, principalFixture } from "./helpers";
 import { makeServices, type Services } from "../src/services";
 
 let mf: Miniflare;
@@ -17,7 +13,6 @@ let env: Parameters<typeof app.request>[2];
 let jwtFor: (email: string) => Promise<string>;
 let db: D1Database;
 let services: Services;
-let bobKey: string;
 
 const asBobPrincipal = () => principalFixture({ userId: "u_iso_bob", handle: "iso-bob" });
 
@@ -90,7 +85,6 @@ beforeAll(async () => {
     .run();
   jwtFor = await setupAccessAuth();
   services = makeServices(db);
-  bobKey = await bearerKeyFixture(db, "u_iso_bob");
   env = { DB: db, OWNER_HANDLE: "iso-owner", ...accessEnvVars("iso-owner@example.com") } as unknown as Parameters<typeof app.request>[2];
 });
 
@@ -163,15 +157,20 @@ describe("owner-only isolation survives the Access-only auth switch", () => {
     expect(res.status).toBe(404);
   });
 
-  // W2: an authenticated-but-wrong viewer on an owner-only route (sessionHandle
-  // !== handle) used to hit `return c.redirect(\`/login?next=...\`)` — a dead
-  // end now that /login is deleted. bob is authenticated (Bearer, not
-  // anonymous), so the GLOBAL gate lets him through; this route's own
-  // owner-only guard must then deny flatly (ownerOnlyDenied, 403) instead of
-  // bouncing him at a redirect target that no longer exists.
-  it.skip("a Bearer agent (bob) browsing an owner-only HTML route gets a flat 403 — unexpressible: a bearer caller is the owner now", async () => {
-    const res = await req("/@iso-owner/keys", { headers: { accept: "text/html", get authorization() { return `Bearer ${bobKey}`; } } });
+  // Keep this denial at the route boundary: the viewer passes authentication.
+  it("gives an authenticated non-owner a 403 for the owner's skill editor", async () => {
+    const owner = await jwtFor("iso-owner@example.com");
+    await services.skills.upsert(principalFixture({ userId: "u_iso_owner", handle: "iso-owner" }), {
+      slug: "editor-fixture", name: "Editor fixture",
+    });
+    const path = "/@iso-owner/skills/editor-fixture/edit";
+    expect((await req(path, { headers: { accept: "text/html", cookie: `CF_Authorization=${owner}` } })).status).toBe(200);
+    const headers = await bobMcpHeaders();
+    const identity = await req("/api/v1/whoami", { headers });
+    expect(await identity.json()).toMatchObject({ handle: "iso-bob", token_status: "active" });
+    const res = await req(path, { headers: { accept: "text/html", ...headers } });
     expect(res.status).toBe(403);
+    expect(res.headers.get("location")).toBeNull();
   });
 });
 
