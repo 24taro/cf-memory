@@ -213,3 +213,45 @@ describe("tools surface in tools/list", () => {
     expect(names).toContain("notes_get_many");
   });
 });
+
+describe("MCP batch response budget", () => {
+  it("keeps completed write receipts and skips later calls after an oversized result", async () => {
+    const { ctx, calls } = makeCtx(principal(["notes:read", "notes:write"]));
+    const remove = (id: string) => ({ jsonrpc: "2.0", id, method: "tools/call", params: { name: "notes_delete", arguments: { slug: "wrong-note" } } });
+    const request = new Request("http://x/mcp", {
+      method: "POST",
+      body: JSON.stringify([
+        remove("first"),
+        { jsonrpc: "2.0", id: "一覧", method: "tools/list" },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+        remove("last"),
+      ]),
+    });
+    const limit = 1800;
+    const response = await handleMcp(request, ctx, limit);
+    const text = await response.text();
+    expect(new TextEncoder().encode(text).byteLength).toBeLessThanOrEqual(limit);
+    expect(JSON.parse(text)).toEqual([
+      expect.objectContaining({ id: "first", result: expect.any(Object) }),
+      expect.objectContaining({ id: "一覧", error: expect.objectContaining({ code: -32002 }) }),
+      expect.objectContaining({ id: "last", error: expect.objectContaining({ code: -32001 }) }),
+    ]);
+    expect(calls.softDelete).toEqual([{ id: "n_1" }]);
+  });
+
+  it("returns small batch responses in order and leaves notification responses empty", async () => {
+    const { ctx } = makeCtx(principal([]));
+    const request = new Request("http://x/mcp", {
+      method: "POST",
+      body: JSON.stringify([
+        { jsonrpc: "2.0", id: 1, method: "ping" },
+        { jsonrpc: "2.0", id: "二", method: "ping" },
+        { jsonrpc: "2.0", method: "notifications/initialized" },
+      ]),
+    });
+    expect(await (await handleMcp(request, ctx)).json()).toEqual([
+      { jsonrpc: "2.0", id: 1, result: {} },
+      { jsonrpc: "2.0", id: "二", result: {} },
+    ]);
+  });
+});

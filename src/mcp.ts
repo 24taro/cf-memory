@@ -968,10 +968,34 @@ export function toolErrorText(tool: string, e: unknown, log: (line: string) => v
   return `Internal error in ${tool} (code ${code}). Retry later; if it keeps failing, report the code.`;
 }
 function json(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json" } });
+  return jsonResponse(JSON.stringify(body), status);
+}
+function jsonResponse(body: string, status = 200): Response {
+  return new Response(body, { status, headers: { "content-type": "application/json" } });
 }
 
-export async function handleMcp(req: Request, ctx: ToolCtx): Promise<Response> {
+type RpcMessage = { id?: unknown; method?: unknown; params?: unknown };
+const MAX_RPC_NAME_CHARS = 200;
+const MAX_RPC_ID_CHARS = 512;
+const MAX_BATCH_ITEMS = 100;
+const MAX_BATCH_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+function rpcMessage(value: unknown): RpcMessage | null {
+  return value && typeof value === "object" && !Array.isArray(value) ? value as RpcMessage : null;
+}
+
+function rpcId(value: unknown): string | number | null | undefined {
+  if (value == null) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string" && value.length <= MAX_RPC_ID_CHARS) return value;
+  return undefined;
+}
+
+function ignoredNotification(method: unknown): boolean {
+  return method === "notifications/initialized" || method === "notifications/cancelled";
+}
+
+export async function handleMcp(req: Request, ctx: ToolCtx, batchResponseLimit = MAX_BATCH_RESPONSE_BYTES): Promise<Response> {
   if (req.method !== "POST") {
     // MCP Streamable HTTP: this endpoint accepts only POST JSON-RPC. cf-memory has
     // no server-initiated notifications, so it offers no GET SSE stream. It used
@@ -994,10 +1018,13 @@ export async function handleMcp(req: Request, ctx: ToolCtx): Promise<Response> {
   }
 
   let logCalls = 0;
-  const handleOne = async (msg: { id?: unknown; method?: string; params?: Record<string, unknown> }): Promise<object | null> => {
-    if (!msg || typeof msg !== 'object' || Array.isArray(msg) || typeof msg.method !== 'string') return rpcError(null, -32600, 'Invalid Request');
-    const { id, method, params } = msg;
-    if (params != null && (typeof params !== 'object' || Array.isArray(params))) return rpcError(id, -32602, 'Invalid params');
+  const handleOne = async (msg: RpcMessage | null): Promise<object | null> => {
+    const id = rpcId(msg?.id);
+    const method = msg?.method;
+    if (id === undefined || typeof method !== "string" || method.length > MAX_RPC_NAME_CHARS) return rpcError(null, -32600, "Invalid Request");
+    const rawParams = msg?.params;
+    if (rawParams != null && (typeof rawParams !== "object" || Array.isArray(rawParams))) return rpcError(id, -32602, "Invalid params");
+    const params = rawParams as Record<string, unknown> | undefined;
     switch (method) {
       case "initialize": {
         const status = ctx.principal.invalidKey ? "invalid" : ctx.principal.anonymous ? "none" : "active";
@@ -1031,7 +1058,8 @@ export async function handleMcp(req: Request, ctx: ToolCtx): Promise<Response> {
           };
         }) });
       case "tools/call": {
-        const name = params?.name as string | undefined;
+        const name = params?.name;
+        if (typeof name !== "string" || name.length > MAX_RPC_NAME_CHARS) return rpcError(id, -32602, "Invalid tool name");
         const tool = TOOLS.find((t) => t.name === name);
         if (!tool) return rpcError(id, -32602, `Unknown tool: ${name}`);
         // Bound log work per HTTP request: a 100-call batch must not become 100
@@ -1063,14 +1091,41 @@ export async function handleMcp(req: Request, ctx: ToolCtx): Promise<Response> {
   };
 
   if (Array.isArray(body)) {
-    if (!body.length || body.length > 100) return json(rpcError(null, -32600, 'Batch must contain 1-100 requests'));
-    const out: object[] = [];
-    for (const m of body) {
-      const r = await handleOne(m as { id?: unknown; method?: string; params?: Record<string, unknown> });
-      if (r !== null) out.push(r);
+    if (!body.length || body.length > MAX_BATCH_ITEMS) return json(rpcError(null, -32600, `Batch must contain 1-${MAX_BATCH_ITEMS} requests`));
+    const encoder = new TextEncoder();
+    const requests = body.map(value => {
+      const message = rpcMessage(value);
+      const id = rpcId(message?.id);
+      const unrun = JSON.stringify(rpcError(id, -32001, "Batch response limit reached. This request was not run."));
+      const omitted = JSON.stringify(rpcError(id, -32002, "Result omitted because of the batch response limit. This request ran and may have changed state."));
+      return { message, unrun, omitted, reserve: Math.max(encoder.encode(unrun).byteLength, encoder.encode(omitted).byteLength) };
+    });
+    // Keep space for every remaining receipt and the JSON brackets/separators.
+    // An oversized result leaves earlier successes intact and stops later work.
+    let available = batchResponseLimit - (requests.length + 1) - requests.reduce((sum, request) => sum + request.reserve, 0);
+    if (available < 0) return json(rpcError(null, -32001, "Batch response limit reached. No requests were run."));
+    let saturated = false;
+    const out: string[] = [];
+    for (const request of requests) {
+      if (saturated) {
+        if (!ignoredNotification(request.message?.method)) out.push(request.unrun);
+        continue;
+      }
+      available += request.reserve;
+      const result = await handleOne(request.message);
+      if (result === null) continue;
+      const serialized = JSON.stringify(result);
+      const bytes = serialized.length > available ? Infinity : encoder.encode(serialized).byteLength;
+      if (bytes > available) {
+        out.push(request.omitted);
+        saturated = true;
+      } else {
+        out.push(serialized);
+        available -= bytes;
+      }
     }
-    return json(out);
+    return jsonResponse(`[${out.join(",")}]`);
   }
-  const res = await handleOne(body as { id?: unknown; method?: string; params?: Record<string, unknown> });
+  const res = await handleOne(rpcMessage(body));
   return res ? json(res) : new Response(null, { status: 202 });
 }
