@@ -111,6 +111,10 @@ if [ "$mode" != rotated ]; then
     fail "wrangler deploy failed (see the output above)"
   fi
 
+  say "Verifying the deployed D1 and R2 bindings"
+  CI=true node scripts/reserve-worker.mjs record-storage "$DEPLOYMENT_FILE" "$worker_id" ||
+    fail "deployed storage could not be verified; database migrations have not been run"
+
   say "Applying database migrations"
   CI=true wrangler d1 migrations apply DB --remote
   CI=true wrangler d1 migrations apply LOGS --remote

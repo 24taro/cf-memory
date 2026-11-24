@@ -74,10 +74,15 @@ interface InstallFixtureOptions {
   bindingPhase?: string;
   tokenAccepted?: boolean;
   rotation?: 'start' | 'resume' | 'upload-fails';
+  storageChange?: 'configured' | 'saved-binding' | 'after-deploy';
   existingUrl?: string;
 }
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
+const primaryDB = '11111111-1111-4111-8111-111111111111';
+const logDB = '22222222-2222-4222-8222-222222222222';
+const otherDB = '33333333-3333-4333-8333-333333333333';
+
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, storageChange, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -104,13 +109,17 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     if (bindingPhase) writeFileSync(bindingFile, JSON.stringify({
       version: 1, phase: bindingPhase, account: 'a'.repeat(32), name: 'cf-memory', workerId: 'c'.repeat(32),
       domain: 'https://api.cloudflare.com/client/v4', origin: 'https://cf-memory.test.workers.dev',
+      ...(storageChange === 'saved-binding' ? { storage: { DB: otherDB, LOGS: logDB, BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '' } } } : {}),
     }), { mode: 0o600 });
     const trace = join(root, 'wrangler-args');
     writeFileSync(trace, '');
     const wrangler = join(root, 'node_modules/wrangler/bin/wrangler.js');
     mkdirSync(dirname(wrangler), { recursive: true });
     writeFileSync(join(root, 'node_modules/wrangler/index.js'), `
-      exports.unstable_readConfig = () => ({ name: 'cf-memory' });
+      exports.unstable_readConfig = () => ({ name: 'cf-memory',
+        d1_databases: [{ binding: 'DB', database_name: '${storageChange === 'configured' ? 'another-database' : 'cf-memory'}' }, { binding: 'LOGS', database_name: 'cf-memory-logs' }],
+        r2_buckets: [{ binding: 'BUNDLES', bucket_name: 'cf-memory-bundles' }],
+      });
       exports.unstable_getVarsForDev = require(${JSON.stringify(resolve('node_modules/wrangler/wrangler-dist/cli.js'))}).unstable_getVarsForDev;
     `);
     writeFileSync(wrangler, `
@@ -143,6 +152,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
         appendFileSync(process.env.TRACE, JSON.stringify(['api', method, path]) + '\\n');
         const state = process.env.RESERVATION;
         const worker = { id: 'c'.repeat(32), name: 'cf-memory' };
+        const deployed = readFileSync(process.env.TRACE, 'utf8').includes('["deploy",');
         if (path === '/api/v1/whoami') {
           const rotated = existsSync(process.env.REMOTE_TOKEN_FILE) ? readFileSync(process.env.REMOTE_TOKEN_FILE, 'utf8') : null;
           const accepted = process.env.ROTATION ? options.headers.authorization === 'Bearer ' + (rotated || 'x'.repeat(32)) && (rotated || process.env.TOKEN_ACCEPTED === 'true') : process.env.TOKEN_ACCEPTED === 'true';
@@ -151,6 +161,18 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
             : Response.json({ error: 'unauthorized' }, { status: 401 });
         }
         if (path.endsWith('/subdomain')) return Response.json({ success: true, result: { subdomain: 'test' } });
+        if (path.includes('/d1/database/')) {
+          const uuid = path.split('/').at(-1);
+          const name = uuid === '${logDB}' ? 'cf-memory-logs' : 'cf-memory';
+          return Response.json({ success: true, result: { uuid, name } });
+        }
+        if (path.endsWith('/scripts/cf-memory/settings')) {
+          return Response.json({ success: true, result: { bindings: [
+            { name: 'DB', type: 'd1', id: deployed && '${storageChange ?? ''}' === 'after-deploy' ? '${otherDB}' : '${primaryDB}' },
+            { name: 'LOGS', type: 'd1', id: '${logDB}' },
+            { name: 'BUNDLES', type: 'r2_bucket', bucket_name: 'cf-memory-bundles' },
+          ] } });
+        }
         if (method === 'POST') {
           const submitted = JSON.parse(options.body);
           if (state === 'created') return Response.json({ success: true, result: { ...worker, tags: submitted.tags } });
@@ -161,7 +183,7 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
           return Response.json({ success: true, result: state === 'deployed' ? [{ id: 'existing' }] : [] });
         }
         if (process.env.WORKER === 'unknown') return Response.json({ success: false }, { status: 503 });
-        if (process.env.WORKER === 'present' || state === 'resume' || state === 'deployed') {
+        if (process.env.WORKER === 'present' || state === 'resume' || state === 'deployed' || deployed) {
           return Response.json({ success: true, result: { ...worker, tags: ['cf-memory-install-' + 'a'.repeat(32)] } });
         }
         return Response.json({ success: false }, { status: 404 });
@@ -320,6 +342,34 @@ it('requires the original destination and an accepted token before a routine upd
   expect(rejectedToken.calls).toContainEqual(['api', 'GET', '/api/v1/whoami']);
   expect(rejectedToken.deploy).toBeUndefined();
   expect(rejectedToken.binding).toBeNull();
+});
+
+it('checks the same D1 and R2 bindings before deploying and again before migrations', () => {
+  const setup = installFixture({ bindingPhase: 'ready' });
+  expect(setup.result.status, setup.result.stderr).toBe(0);
+  expect(setup.binding.storage).toEqual({ DB: primaryDB, LOGS: logDB, BUNDLES: { bucket_name: 'cf-memory-bundles', jurisdiction: '' } });
+  const isStorageCheck = (args: string[]) => args[2]?.endsWith('/scripts/cf-memory/settings');
+  const deploy = setup.calls.findIndex(args => args[0] === 'deploy');
+  const storageChecks = setup.calls.flatMap((args, index) => isStorageCheck(args) ? [index] : []);
+  expect(storageChecks).toHaveLength(2);
+  expect(storageChecks[0]!).toBeLessThan(deploy);
+  expect(storageChecks[1]!).toBeGreaterThan(deploy);
+  expect(storageChecks[1]!).toBeLessThan(setup.calls.findIndex(args => args[0] === 'd1'));
+});
+
+it.each(['configured', 'saved-binding'] as const)('stops a Worker update when storage differs from the %s identity', storageChange => {
+  const setup = installFixture({ bindingPhase: 'ready', storageChange });
+  expect(setup.result.status).toBe(1);
+  expect(setup.result.stderr).toContain('differs');
+  expect(setup.calls.some(args => args[0] === 'deploy' || args[0] === 'd1')).toBe(false);
+});
+
+it('keeps migrations behind the storage check even if deployment succeeds', () => {
+  const setup = installFixture({ bindingPhase: 'ready', storageChange: 'after-deploy' });
+  expect(setup.result.status).toBe(1);
+  expect(setup.result.stderr).toContain('database migrations have not been run');
+  expect(setup.deploy).toBeDefined();
+  expect(setup.calls.some(args => args[0] === 'd1')).toBe(false);
 });
 
 it('keeps an unbound saved token out of a first deployment', () => {

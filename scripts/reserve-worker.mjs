@@ -51,7 +51,7 @@ function configuredTarget() {
   const domain = `https://api${region === 'fedramp_high' ? '.fed' : ''}${setting('WRANGLER_API_ENVIRONMENT') === 'staging' ? '.staging' : ''}.cloudflare.com/client/v4`;
   const override = setting('CLOUDFLARE_API_BASE_URL') || setting('CF_API_BASE_URL');
   if (override && override !== domain) throw new Error('the Cloudflare API URL does not match the Wrangler environment');
-  return { account: account.toLowerCase(), name, domain, region, ownerHandle: config.vars?.OWNER_HANDLE || 'owner' };
+  return { account: account.toLowerCase(), name, domain, region, ownerHandle: config.vars?.OWNER_HANDLE || 'owner', config };
 }
 
 function readLocalFile(file) {
@@ -89,11 +89,11 @@ function cloudflareApi({ domain, account }) {
   const headers = auth.type === 'api_key'
     ? { 'X-Auth-Email': auth.email, 'X-Auth-Key': auth.key }
     : { Authorization: `Bearer ${auth.token}` };
-  const workers = `${domain}/accounts/${account}/workers`;
+  const base = `${domain}/accounts/${account}`;
 
   return async function request(path, options = {}) {
     try {
-      const response = await fetch(workers + path, {
+      const response = await fetch(base + path, {
         ...options, headers: { ...headers, 'Content-Type': 'application/json' },
         redirect: 'error', signal: AbortSignal.timeout(30_000),
       });
@@ -135,7 +135,8 @@ async function workerTarget(bindingFile, existingUrl, requireReady = false) {
   if (binding && (binding.account !== account || binding.name !== name || binding.domain !== domain)) {
     throw new Error('the selected Cloudflare account or Worker differs from this checkout’s saved deployment');
   }
-  const request = cloudflareApi({ domain, account });
+  const accountRequest = cloudflareApi({ domain, account });
+  const request = (path, options) => accountRequest(`/workers${path}`, options);
   const subdomain = await request('/subdomain');
   if (!subdomain.ok || !subdomain.success || !/^[a-z0-9-]+$/.test(subdomain.result?.subdomain ?? '')) {
     throw new Error('could not verify a workers.dev address for the selected account. Check Workers & Pages in Cloudflare');
@@ -148,7 +149,7 @@ async function workerTarget(bindingFile, existingUrl, requireReady = false) {
   if (binding && existing.ok && existing.success && validWorker(existing.result) && binding.workerId !== existing.result.id) {
     throw new Error('Cloudflare reports a different Worker identity for the saved name');
   }
-  return { ...target, binding, origin, request, existing, validWorker };
+  return { ...target, binding, origin, request, accountRequest, existing, validWorker };
 }
 
 function readOwnerToken(secretsFile) {
@@ -160,8 +161,60 @@ function readOwnerToken(secretsFile) {
   return token ?? null;
 }
 
+const D1_ID = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i;
+
+function namedEntry(rows, key, value) {
+  const matches = Array.isArray(rows) ? rows.filter(row => row?.[key] === value) : [];
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function verifyStorage(target) {
+  const { name, config, binding, request, accountRequest } = target;
+  const settings = await request(`/scripts/${name}/settings`);
+  const deployed = settings.result?.bindings;
+  if (!settings.ok || !settings.success || !Array.isArray(deployed)) {
+    throw new Error('could not verify the active Worker storage bindings');
+  }
+  const [DB, LOGS] = await Promise.all(['DB', 'LOGS'].map(async name => {
+    const wanted = namedEntry(config.d1_databases, 'binding', name);
+    const live = namedEntry(deployed, 'name', name);
+    if (!wanted || live?.type !== 'd1' || !D1_ID.test(live.id ?? '')) {
+      throw new Error(`could not verify the ${name} D1 binding`);
+    }
+    const id = live.id.toLowerCase();
+    if (wanted.database_id && wanted.database_id.toLowerCase() !== id) {
+      throw new Error(`the configured ${name} D1 database ID differs from the running Worker`);
+    }
+    if (!wanted.database_id && !wanted.database_name) {
+      throw new Error(`configure the original D1 database ID or name for ${name}`);
+    }
+    const database = await accountRequest(`/d1/database/${id}`);
+    if (!database.ok || !database.success || typeof database.result?.uuid !== 'string' || database.result.uuid.toLowerCase() !== id ||
+        (wanted.database_name && database.result.name !== wanted.database_name)) {
+      throw new Error(`the configured ${name} D1 database name or identity differs from the running Worker`);
+    }
+    return id;
+  }));
+  if (DB === LOGS) throw new Error('DB and LOGS must use two separate D1 databases');
+  const plannedBucket = namedEntry(config.r2_buckets, 'binding', 'BUNDLES');
+  const liveBucket = namedEntry(deployed, 'name', 'BUNDLES');
+  const jurisdiction = value => value && value !== 'default' ? value : '';
+  if (liveBucket?.type !== 'r2_bucket' || !plannedBucket?.bucket_name || liveBucket.bucket_name !== plannedBucket.bucket_name ||
+      jurisdiction(liveBucket.jurisdiction) !== jurisdiction(plannedBucket.jurisdiction)) {
+    throw new Error('the configured BUNDLES R2 bucket differs from the running Worker');
+  }
+  const BUNDLES = { bucket_name: liveBucket.bucket_name, jurisdiction: jurisdiction(liveBucket.jurisdiction) };
+  const saved = binding?.storage;
+  if (saved && (saved.DB !== DB || saved.LOGS !== LOGS || saved.BUNDLES?.bucket_name !== BUNDLES.bucket_name ||
+      saved.BUNDLES?.jurisdiction !== BUNDLES.jurisdiction)) {
+    throw new Error('the running Worker storage differs from this checkout’s saved deployment');
+  }
+  return { DB, LOGS, BUNDLES };
+}
+
 async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
-  const { account, name, domain, ownerHandle, binding, origin, request, existing, validWorker } = await workerTarget(bindingFile, existingUrl);
+  const target = await workerTarget(bindingFile, existingUrl);
+  const { account, name, domain, ownerHandle, binding, origin, request, existing, validWorker } = target;
   const token = readOwnerToken(secretsFile);
   const record = workerId => ({ version: 1, account, name, domain, origin, workerId, phase: 'pending' });
   const output = (mode, workerId) => ({ mode, account, name, domain, origin, workerId });
@@ -181,7 +234,11 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
       }
       // The previous run deployed the original Worker but may have stopped
       // before publishing its route or applying the database migrations.
-      if (binding && token) return output('update', worker.id);
+      if (binding && token) {
+        const storage = await verifyStorage(target);
+        if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
+        return output('update', worker.id);
+      }
     }
     if (!token) throw new Error(`the Worker already exists. Restore ${secretsFile} from its original checkout`);
     if (!binding && !existingUrl) {
@@ -190,7 +247,9 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
     if (!await ownsActiveToken(origin, token, ownerHandle)) {
       throw new Error('the selected Worker did not accept the saved owner token; check the deployment before retrying');
     }
-    if (!binding) writeBinding(bindingFile, { ...record(worker.id), phase: 'ready' });
+    const storage = await verifyStorage(target);
+    if (!binding) writeBinding(bindingFile, { ...record(worker.id), storage, phase: 'ready' });
+    else if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
     return output('update', worker.id);
   }
 
@@ -208,6 +267,16 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
   }
   writeBinding(bindingFile, record(created.result.id));
   return output('first', created.result.id);
+}
+
+async function recordDeployedStorage(bindingFile, workerId) {
+  const target = await workerTarget(bindingFile, '');
+  const { binding, existing, validWorker } = target;
+  if (!binding || binding.workerId !== workerId || !existing.ok || !existing.success || !validWorker(existing.result)) {
+    throw new Error('the deployed Worker identity could not be verified before database migration');
+  }
+  const storage = await verifyStorage(target);
+  if (!binding.storage) writeBinding(bindingFile, { ...binding, storage }, true);
 }
 
 async function rotateToken(bindingFile, secretsFile) {
@@ -271,12 +340,14 @@ try {
     const binding = readBinding(first);
     if (!binding || binding.workerId !== second) throw new Error('the saved deployment identity changed before completion');
     if (binding.phase !== 'ready') writeBinding(first, { ...binding, phase: 'ready' }, true);
+  } else if (command === 'record-storage') {
+    await recordDeployedStorage(first, second);
   } else if (command === 'prepare' || command === 'rotate') {
     const { mode, account, name, domain, origin, workerId } = command === 'prepare'
       ? await prepareWorker(first, second, third, fourth) : await rotateToken(first, second);
     console.log(`${mode} ${account} ${name} ${domain} ${origin} ${workerId}`);
   } else {
-    throw new Error('expected prepare, ready or rotate');
+    throw new Error('expected prepare, record-storage, ready or rotate');
   }
 } catch (error) {
   console.error(error.message);

@@ -54,10 +54,12 @@ node cf-memory-agent/scripts/agent.mjs doctor
 
 To update, pull the latest changes in the same checkout and run `./install.sh`
 again. Keep `.cf-memory.secrets` and `.cf-memory.deployment.json`. They identify
-the token and the deployment it belongs to. Regular updates preserve the token,
-databases, and bucket. If you move to another checkout, copy those two files
-and select the original Cloudflare account. See [Security](SECURITY.md) for
-token rotation.
+the token, Worker, two D1 database IDs, and R2 bucket. The installer checks the
+storage bindings before updating the Worker and again before running migrations.
+If you move to another checkout, copy both files and select the original
+Cloudflare account. Update the registered Claude Code marketplace to the new
+checkout before reconnecting Claude Code. See [Security](SECURITY.md) for token
+rotation.
 
 If the first install is interrupted, keep `.cf-memory.install-claim` and
 any deployment and token files it created, then rerun from that checkout.
