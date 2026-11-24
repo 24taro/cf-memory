@@ -139,7 +139,7 @@ async function readNote(note: NoteRow, ctx: ToolCtx, time:ProvenanceTimePresenta
   // note or a small batch from recall's candidate index.
   await ctx.services.notes.incrementView(note.id);
   const [tags, backlinks, links] = await Promise.all([
-    ctx.services.notes.tagsFor(note.id),
+    ctx.services.notes.tagsFor(note.id, ctx.principal.userId),
     ctx.services.notes.backlinks(note.id, ctx.principal.userId),
     ctx.services.notes.outgoing(note.id, ctx.principal.userId),
   ]);

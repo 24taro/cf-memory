@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { Miniflare, convertV4MiniflareOptions } from "miniflare";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import app from "../src/index";
+import { makeServices } from "../src/services";
 import { TEST_RESOURCE, accessEnvVars, bearerTokenFor, rsEnvVars, setupAccessAuth } from "./helpers";
 
 const ALICE = { id: "u_alice", handle: "alice", email: "alice@example.com", account: "01KSPALICE00000000000000000" };
@@ -611,5 +612,25 @@ describe("編集で保存先が黙って変わらない", () => {
     // 一覧は本文を返さないので、本文の文字列ではなく slug で判定する。
     const notes = ((await (await req("/api/v1/notes", bobToken)).json()) as { notes?: Array<{ slug: string }> }).notes ?? [];
     expect(notes.map((n) => n.slug)).not.toContain("fav-dashboard");
+  });
+
+  it("checks current visibility when loading tags and outgoing links", async () => {
+    const first = await put(aliceToken, {
+      slug: "visibility-metadata", body_md: "[[shared-link]]", tags: ["shared tag"], shared: true,
+    });
+    const { id } = await first.json() as { id: string };
+    expect(first.ok && id).toBeTruthy();
+    const notes = makeServices(db).notes;
+    expect(await notes.tagsFor(id, BOB.id)).toEqual(["shared tag"]);
+    expect(await notes.outgoing(id, BOB.id)).toMatchObject([{ target_slug: "shared-link" }]);
+
+    const updated = await put(aliceToken, {
+      slug: "visibility-metadata", body_md: "[[private-link]]", tags: ["private tag"], shared: false,
+    });
+    expect(updated.ok).toBe(true);
+    expect(await notes.tagsFor(id, ALICE.id)).toEqual(["private tag"]);
+    expect(await notes.outgoing(id, ALICE.id)).toMatchObject([{ target_slug: "private-link" }]);
+    expect(await notes.tagsFor(id, BOB.id)).toEqual([]);
+    expect(await notes.outgoing(id, BOB.id)).toEqual([]);
   });
 });

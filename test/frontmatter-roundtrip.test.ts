@@ -146,7 +146,7 @@ describe("B1: pull -> push -> pull is idempotent and updates the same note", () 
     await services.notes.upsert(p(), { slug: "comma-tag", title: "Comma Tag", body_md: "x", tags: ["needs, care"] });
     const md1 = await mdOf("comma-tag");
     await services.notes.upsert(p(), { body_md: md1 });
-    const tags = await services.notes.tagsFor((await services.notes.getRowBySlug(OWNER, "comma-tag"))?.id ?? "");
+    const tags = await services.notes.tagsFor((await services.notes.getRowBySlug(OWNER, "comma-tag"))?.id ?? "", OWNER);
     expect(tags).toContain("needs, care"); // survived the round-trip intact
     expect(await mdOf("comma-tag")).toBe(md1); // still idempotent
   });

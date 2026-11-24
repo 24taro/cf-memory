@@ -274,12 +274,12 @@ describe("a write-through UPDATE names content columns only (fix review 8, 17)",
     let fired = false;
     // tagsFor runs between upsert's read of the row and its UPDATE: the owner's
     // lifecycle decisions commit inside that window.
-    notes.tagsFor = async (id: string) => {
+    notes.tagsFor = async (id, viewerId) => {
       if (!fired && id === made.id) {
         fired = true;
         await f.db.prepare("UPDATE notes SET archived_at=77, valid_until=4102444800000, valid_from=5, scope='github.com/x/y', stage='evergreen', type='reference' WHERE id=?").bind(made.id).run();
       }
-      return original(id);
+      return original(id, viewerId);
     };
     try {
       const out = await notes.upsert(f.bob, { slug: "race-life", append_md: "bob line" });
@@ -299,9 +299,9 @@ describe("a write-through UPDATE names content columns only (fix review 8, 17)",
       const notes = f.services.notes;
       const original = notes.tagsFor.bind(notes);
       let fired = false;
-      notes.tagsFor = async (id: string) => {
+      notes.tagsFor = async (id, viewerId) => {
         if (!fired && id === made.id) { fired = true; await f.db.prepare(`UPDATE notes SET ${change} WHERE id=?`).bind(made.id).run(); }
-        return original(id);
+        return original(id, viewerId);
       };
       try {
         const out = await notes.upsert(f.bob, { slug, append_md: "bob line" });

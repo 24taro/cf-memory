@@ -480,7 +480,7 @@ export class NotesRepo {
     const fmTags = parsed.data.tags !== undefined ? asStringArray(parsed.data.tags) : extractTagsFromFrontmatter(input.frontmatter);
     // Partial-update safety: no tag signal at all -> keep the note's current tags
     // (matches title/body preservation; PATCH and notes_append rely on this).
-    const tagsSource = input.tags ?? (fmTags.length ? fmTags : existing ? await this.tagsFor(existing.id) : []);
+    const tagsSource = input.tags ?? (fmTags.length ? fmTags : existing ? await this.tagsFor(existing.id, principal.userId) : []);
     const tags = normalizeTags(tagsSource);
     // A write-through keeps the owner's stored frontmatter and replaces only its
     // content fields: the caller's `frontmatter` and the lifecycle keys of a body
@@ -845,7 +845,7 @@ export class NotesRepo {
       return replay(await this.appendStatus(principal,id,operationId));
     // The stored-body rule is about the concatenated body: a `---` line anywhere
     // in the appended text can close a block the note opens with.
-    const tags=await this.tagsFor(id), body=inertBody(note.body_md+'\n\n'+text);
+    const tags=await this.tagsFor(id, principal.userId), body=inertBody(note.body_md+'\n\n'+text);
     // Same bound as upsert: this door always grows the body.
     if(body.length>MAX_NOTE_BODY_CHARS)throw tooLarge();
     const contentHash=await sha256hex(`${note.title}\n${body}\n${tags.join(',')}`);
@@ -1023,10 +1023,12 @@ export class NotesRepo {
     return note;
   }
 
-  async tagsFor(noteId: string): Promise<string[]> {
+  async tagsFor(noteId: string, viewerId: string): Promise<string[]> {
+    const access = readableSqlFor("n", viewerId);
     const res = await this.db
-      .prepare("SELECT t.name AS name FROM note_tags nt JOIN tags t ON t.id=nt.tag_id WHERE nt.note_id=? ORDER BY t.name")
-      .bind(noteId)
+      .prepare(`SELECT t.name AS name FROM note_tags nt JOIN tags t ON t.id=nt.tag_id
+        JOIN notes n ON n.id=nt.note_id WHERE nt.note_id=? AND n.deleted_at IS NULL AND ${access.sql} ORDER BY t.name`)
+      .bind(noteId, ...access.args)
       .all<{ name: string }>();
     return (res.results ?? []).map((r) => r.name);
   }
@@ -1056,18 +1058,17 @@ export class NotesRepo {
   }
 
   async outgoing(noteId: string, viewerId: string): Promise<OutgoingLink[]> {
-    const vis = readableSqlFor("n", viewerId);
-    const access = vis.sql;
-    const anon = vis.args.length === 0;
-    const args: unknown[] = [...vis.args, noteId];
+    const target = readableSqlFor("n", viewerId);
+    const source = readableSqlFor("src", viewerId);
     const res = await this.db
       .prepare(
         `SELECT l.target_slug AS target_slug, n.id AS target_note_id, l.anchor_text AS anchor_text,
            CASE WHEN n.id IS NULL THEN 0 ELSE 1 END AS resolved, l.position AS position, n.title AS target_title
-         FROM links l LEFT JOIN notes n ON n.id=l.target_note_id AND n.deleted_at IS NULL AND (${access})
-         WHERE l.src_note_id=? ORDER BY l.position`,
+         FROM links l JOIN notes src ON src.id=l.src_note_id
+         LEFT JOIN notes n ON n.id=l.target_note_id AND n.deleted_at IS NULL AND ${target.sql}
+         WHERE l.src_note_id=? AND src.deleted_at IS NULL AND ${source.sql} ORDER BY l.position`,
       )
-      .bind(...args)
+      .bind(...target.args, noteId, ...source.args)
       .all<OutgoingLink>();
     return res.results ?? [];
   }

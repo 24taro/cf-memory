@@ -65,7 +65,7 @@ export class PortabilityService {
       // content_hash includes tag order/spelling from the write, while the tag
       // join returns alphabetical shared tag names. Preserve the write's tags.
       const current = { ...row, frontmatter, frontmatter_json: undefined,
-        ...(memoryKind !== 'skill' ? { shared: row.shared === 1, tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : await this.notes.tagsFor(row.id) } : { files: (await this.skills.listFiles(row.id)).map(f => ({ path: f.path, content_type: f.content_type, size: f.size, sha256: f.sha256 })) }) };
+        ...(memoryKind !== 'skill' ? { shared: row.shared === 1, tags: Array.isArray(frontmatter.tags) ? frontmatter.tags : await this.notes.tagsFor(row.id, p.userId) } : { files: (await this.skills.listFiles(row.id)).map(f => ({ path: f.path, content_type: f.content_type, size: f.size, sha256: f.sha256 })) }) };
       // Re-read the owner/liveness/current metadata after ancillary queries.
       // This prevents a deleted or changed candidate from being emitted stale.
       const live = await this.db.prepare(`SELECT ${fields} CASE WHEN length(CAST(frontmatter_json AS BLOB))<=65536 THEN frontmatter_json END AS frontmatter_json FROM ${table} WHERE user_id=? AND id=? AND deleted_at IS NULL ${subset}`).bind(p.userId, row.id).first<ExportRow>();

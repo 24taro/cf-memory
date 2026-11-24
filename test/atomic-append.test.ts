@@ -49,7 +49,7 @@ it('commits one supplement with trace, receipt, FTS, history and links while pre
   const after=await services.notes.getRowById(a.append_guard.id);
   expect(after?.body_md).toBe(before!.body_md+'\n\n'+a.text);
   for(const key of ['id','user_id','slug','title','frontmatter_json','type','kind','shared','scope','created_at','valid_from','valid_until','stage','supersedes','superseded_by','archived_at','deleted_at'] as const)expect(after?.[key]).toEqual(before?.[key]);
-  expect(await services.notes.tagsFor(a.append_guard.id)).toEqual(['Keep Me']);
+  expect(await services.notes.tagsFor(a.append_guard.id, alice.userId)).toEqual(['Keep Me']);
   const p=await services.capture.provenance('note',a.append_guard.id,alice);expect(p).toHaveLength(1);
   expect(p[0]).toMatchObject({relation:'derived_from',actor_id:'alice',event_id:eid(3101),confidence:.6});
   expect(p[0].source).toMatchObject({append_id:a.append_id,derived_memory_content_hash:r.content_hash});expect(p[0].source).not.toHaveProperty('cwd');

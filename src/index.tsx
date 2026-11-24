@@ -824,7 +824,7 @@ async function noteEditGet(c: AppCtx, handle: string, rawSlug: string): Promise<
   // The form edits the caller's OWN row at this slug, whatever handle is in the
   // URL, and noteEditPost writes only that row (ownOnly).
   const note = await services.notes.getRowBySlug(principal.userId, slug);
-  const tags = note ? await services.notes.tagsFor(note.id) : [];
+  const tags = note ? await services.notes.tagsFor(note.id, principal.userId) : [];
   return c.html(<EditPage handle={handle} sessionHandle={sessionHandle(c)} slug={slug} title={note?.title ?? ""} body={note?.body_md ?? ""} tags={tags} isNew={!note} />);
 }
 
@@ -866,7 +866,7 @@ async function noteGet(c: AppCtx, handle: string, rawSlug: string): Promise<Resp
     // B1: emit a complete, re-parseable frontmatter so `pull .md -> edit -> push`
     // round-trips slug/tags/date (not just title/stage). date = the
     // note's created_at as a full ISO string so it re-parses to the same instant.
-    const mdTags = await services.notes.tagsFor(note.id);
+    const mdTags = await services.notes.tagsFor(note.id, principal.userId);
     // decision 10: round-trip the bi-temporal validity window + supersession link
     // (as ISO / a slug) so `pull .md -> edit -> push` preserves them too. supersedes
     // is emitted as the target's SLUG (human-readable + re-resolvable on push).
@@ -900,7 +900,7 @@ async function noteGet(c: AppCtx, handle: string, rawSlug: string): Promise<Resp
   }
   await services.notes.incrementView(note.id);
   const [tags, backlinks, outgoing, resolver] = await Promise.all([
-    services.notes.tagsFor(note.id),
+    services.notes.tagsFor(note.id, principal.userId),
     services.notes.backlinks(note.id, principal.userId),
     services.notes.outgoing(note.id, principal.userId),
     resolveWiki(c.env.DB, principal.userId, handle, note.body_md),
@@ -1065,7 +1065,7 @@ api.get("/notes/:id", async (c) => {
   // web-garden page counted views before this fix).
   await services.notes.incrementView(note.id);
   const [tags, backlinks, links] = await Promise.all([
-    services.notes.tagsFor(note.id),
+    services.notes.tagsFor(note.id, principal.userId),
     services.notes.backlinks(note.id, principal.userId),
     services.notes.outgoing(note.id, principal.userId),
   ]);

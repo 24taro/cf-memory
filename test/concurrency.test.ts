@@ -157,7 +157,7 @@ describe("concurrency — note append (issue #3 acceptance criterion)", () => {
     const row = await db.prepare(`SELECT f.body,f.tags FROM notes_fts f JOIN notes n ON n.rowid=f.rowid
       WHERE n.id=?`).bind(note.id).first<{ body: string; tags: string }>();
     expect(row).toEqual({ body: saved?.body_md, tags: label });
-    expect(await services.notes.tagsFor(note.id)).toEqual([label]);
+    expect(await services.notes.tagsFor(note.id, principal.userId)).toEqual([label]);
     const links = await db.prepare("SELECT target_slug FROM links WHERE src_note_id=?").bind(note.id).all<{ target_slug: string }>();
     expect(links.results).toEqual([{ target_slug: `target-${label}` }]);
     const events = await db.prepare("SELECT COUNT(*) AS count FROM events WHERE target_id=? AND verb='note.updated'")
