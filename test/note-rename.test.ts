@@ -109,6 +109,39 @@ describe("NotesRepo.rename", () => {
     expect(await db.prepare("SELECT 1 FROM slug_redirects WHERE user_id=? AND old_slug=?").bind(OWNER, "rn-move").first()).toBeNull();
   });
 
+  it("commits a single redirect and event for concurrent renames to one destination", async () => {
+    const first = await mkNote("rn-compete-first");
+    const second = await mkNote("rn-compete-second");
+    const result = await Promise.all([
+      services.notes.rename(p(), "rn-compete-first", "rn-compete-destination"),
+      services.notes.rename(p(), "rn-compete-second", "rn-compete-destination"),
+    ]);
+    expect(result.filter(outcome => outcome.ok)).toHaveLength(1);
+    expect(result).toContainEqual({ ok: false, reason: "slug taken" });
+    const destination = await services.notes.getRowBySlug(OWNER, "rn-compete-destination");
+    expect([first, second]).toContain(destination?.id);
+    const redirects = await db.prepare("SELECT new_note_id FROM slug_redirects WHERE user_id=? AND old_slug IN (?,?)")
+      .bind(OWNER, "rn-compete-first", "rn-compete-second").all();
+    const events = await db.prepare("SELECT target_id FROM events WHERE verb='note.renamed' AND target_id IN (?,?)")
+      .bind(first, second).all();
+    expect(redirects.results).toEqual([{ new_note_id: destination?.id }]);
+    expect(events.results).toEqual([{ target_id: destination?.id }]);
+  });
+
+  it("leaves the original note and audit log intact if saving the redirect fails", async () => {
+    const id = await mkNote("rn-rollback");
+    await db.prepare(`CREATE TRIGGER test_rename_rollback BEFORE INSERT ON slug_redirects
+      WHEN NEW.old_slug='rn-rollback' BEGIN SELECT RAISE(ABORT,'test redirect write failed'); END`).run();
+    try {
+      await expect(services.notes.rename(p(), "rn-rollback", "rn-rollback-moved")).rejects.toThrow("test redirect write failed");
+    } finally {
+      await db.prepare("DROP TRIGGER test_rename_rollback").run();
+    }
+    expect((await services.notes.getRowBySlug(OWNER, "rn-rollback"))?.id).toBe(id);
+    expect(await services.notes.getRowBySlug(OWNER, "rn-rollback-moved")).toBeNull();
+    expect(await db.prepare("SELECT target_id FROM events WHERE verb='note.renamed' AND target_id=?").bind(id).first()).toBeNull();
+  });
+
   it("treats a SOFT-DELETED note at the new slug as taken (no UNIQUE-constraint 500)", async () => {
     const deadId = await mkNote("sd-dead");
     expect(await services.notes.softDelete(p(), deadId)).toBe(true); // slug stays occupied by the tombstone
@@ -133,6 +166,9 @@ describe("NotesRepo.rename", () => {
     await services.notes.rename(p(), "rn-target", "rn-target-moved");
     const after = await db.prepare("SELECT target_note_id FROM links WHERE src_note_id=? AND target_slug=?").bind(srcId, "rn-target").first<{ target_note_id: string }>();
     expect(after?.target_note_id).toBe(targetId); // unchanged — link still resolves to the (renamed) note
+    const page = await req(`/@${OWNER_HANDLE}/n/rn-src`, { headers: { get authorization() { return `Bearer ${OWNER_BEARER}`; }, accept: "text/html" } });
+    expect(page.status).toBe(200);
+    expect(await page.text()).toContain(`class="wikilink" href="/@${OWNER_HANDLE}/n/rn-target-moved"`);
   });
 });
 
@@ -215,11 +251,13 @@ describe("MCP + REST rename doors", () => {
     expect(ok.status).toBe(200);
     expect(await ok.json()).toMatchObject({ ok: true, slug: "rn-rest2" });
 
-    const bad = await req(`/api/v1/notes/rn-rest2/rename`, {
-      method: "POST",
-      headers: { get authorization() { return `Bearer ${OWNER_BEARER}`; }, "content-type": "application/json" },
-      body: JSON.stringify({}),
-    });
-    expect(bad.status).toBe(400);
+    for (const payload of [{}, { new_slug: 123 }]) {
+      const bad = await req(`/api/v1/notes/rn-rest2/rename`, {
+        method: "POST",
+        headers: { get authorization() { return `Bearer ${OWNER_BEARER}`; }, "content-type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      expect(bad.status).toBe(400);
+    }
   });
 });

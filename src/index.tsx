@@ -325,7 +325,7 @@ app.notFound((c) => {
 async function resolveWiki(db: D1Database, viewerId: string, handle: string, links: WikilinkMatch[]): Promise<WikiResolver> {
   const targetKey = (owner: string | null, slug: string) => JSON.stringify([owner, slug]);
   const keys = [...new Set(links.map(link => targetKey(link.targetHandle, link.targetSlug)))];
-  const matches = new Map<string, { handle: string; title: string }>();
+  const matches = new Map<string, { handle: string; slug: string; title: string }>();
   if (keys.length) {
     const access = readableSqlFor("n", viewerId);
     // Prefer the source namespace for an unqualified link, then use the same
@@ -334,21 +334,26 @@ async function resolveWiki(db: D1Database, viewerId: string, handle: string, lin
     const res = await db.prepare(`WITH targets AS (
         SELECT value AS target_key, json_extract(value,'$[0]') AS owner, json_extract(value,'$[1]') AS slug
         FROM json_each(?)
+      ), candidates AS (
+        SELECT targets.target_key,targets.owner,n.id,n.user_id,1 AS direct
+          FROM targets JOIN notes n ON n.slug=targets.slug AND n.deleted_at IS NULL
+        UNION ALL
+        SELECT targets.target_key,targets.owner,r.new_note_id,r.user_id,0 FROM targets JOIN slug_redirects r ON r.old_slug=targets.slug
       ), ranked AS (
-        SELECT targets.target_key, u.handle, n.title,
-          ROW_NUMBER() OVER (PARTITION BY targets.target_key ORDER BY (u.handle=?) DESC, n.created_at, n.id) AS priority
-        FROM targets JOIN notes n ON n.slug=targets.slug JOIN users u ON u.id=n.user_id
-        WHERE ((targets.owner IS NULL AND (u.handle=? OR n.shared=1)) OR u.handle=targets.owner)
+        SELECT candidates.target_key,u.handle,n.slug,n.title,
+          ROW_NUMBER() OVER (PARTITION BY candidates.target_key ORDER BY (u.handle=?) DESC,candidates.direct DESC,n.created_at,n.id) AS priority
+        FROM candidates JOIN notes n ON n.id=candidates.id AND n.user_id=candidates.user_id JOIN users u ON u.id=n.user_id
+        WHERE ((candidates.owner IS NULL AND (u.handle=? OR n.shared=1)) OR u.handle=candidates.owner)
           AND n.deleted_at IS NULL AND ${access.sql}
-      ) SELECT target_key, handle, title FROM ranked WHERE priority=1`)
+      ) SELECT target_key,handle,slug,title FROM ranked WHERE priority=1`)
       .bind(JSON.stringify(keys), handle, handle, ...access.args)
-      .all<{ target_key: string; handle: string; title: string }>();
+      .all<{ target_key: string; handle: string; slug: string; title: string }>();
     for (const row of res.results) matches.set(row.target_key, row);
   }
   return (slugText, owner) => {
     const slug = slugifyPath(slugText);
     const match = matches.get(targetKey(owner, slug));
-    return { href: `/@${encodeURIComponent(match?.handle ?? owner ?? handle)}/n/${slug}`, exists: Boolean(match), title: match?.title };
+    return { href: `/@${encodeURIComponent(match?.handle ?? owner ?? handle)}/n/${match?.slug ?? slug}`, exists: Boolean(match), title: match?.title };
   };
 }
 
@@ -1059,7 +1064,7 @@ api.post("/notes/:slug/rename", async (c) => {
   if (forbidden) return forbidden;
   const b = await jsonObject<{ new_slug?: string }>(c.req, true);
   requireStringFields(b, "new_slug");
-  if (!b.new_slug?.trim()) return c.json({ ok: false, reason: "provide new_slug" }, 400);
+  if (typeof b.new_slug !== "string" || !b.new_slug.trim()) return c.json({ ok: false, reason: "provide new_slug" }, 400);
   const r = await c.var.services.notes.rename(c.var.principal, c.req.param("slug"), b.new_slug);
   return r.ok ? c.json({ ok: true, slug: r.note.slug }) : c.json({ ok: false, reason: r.reason }, 400);
 });

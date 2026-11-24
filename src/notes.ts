@@ -986,28 +986,28 @@ export class NotesRepo {
     const note = await this.getRowBySlug(principal.userId, oldSlug);
     if (!note || note.deleted_at) return { ok: false, reason: "no such note" };
     if (newSlug === note.slug) return { ok: false, reason: "same slug" };
-    // Any row occupying newSlug blocks the rename — INCLUDING a soft-deleted one:
-    // notes' UNIQUE(user_id, slug) covers soft-deleted rows, and (unlike upsert)
-    // rename can't resurrect it in place (the renamed note has a different id), so
-    // the UPDATE would otherwise throw a raw UNIQUE-constraint 500.
-    const clash = await this.getRowBySlug(principal.userId, newSlug);
-    if (clash) return { ok: false, reason: "slug taken" };
     const ts = now();
-    await this.db.prepare("UPDATE notes SET slug=?, updated_at=? WHERE id=?").bind(newSlug, ts, note.id).run();
-    // A live note now occupies newSlug: drop any stale redirect keyed on it so we
-    // never 301 away from a real note (or form a loop).
-    await this.db.prepare("DELETE FROM slug_redirects WHERE user_id=? AND old_slug=?").bind(principal.userId, newSlug).run();
-    // Record oldSlug -> this note (by id, so a rename chain A->B->C resolves in one
-    // hop via the target note's CURRENT slug). Upsert in case oldSlug had a prior
-    // redirect (e.g. it was itself a rename target earlier).
-    await this.db
-      .prepare(
-        `INSERT INTO slug_redirects (id,user_id,old_slug,new_note_id,created_at) VALUES (?,?,?,?,?)
-         ON CONFLICT(user_id,old_slug) DO UPDATE SET new_note_id=excluded.new_note_id, created_at=excluded.created_at`,
-      )
-      .bind(ulid(), principal.userId, oldSlug, note.id, ts)
-      .run();
-    await this.event(principal.userId, principal, "note.renamed", note.id, note.title, { from: oldSlug, to: newSlug });
+    const owner = principal.userId;
+    const commit = this.mutationEvent(owner, principal, "note.renamed", note.id, note.title, ts, { from: oldSlug, to: newSlug });
+    const gate = commit.gate;
+    const [moved] = await this.db.batch([
+      // A tombstone still occupies its slug. Check the destination in the same
+      // transaction so concurrent renames report a conflict without a SQL error.
+      this.db.prepare(`UPDATE notes SET slug=?,updated_at=MAX(updated_at+1,?)
+        WHERE id=? AND user_id=? AND slug=? AND deleted_at IS NULL
+          AND NOT EXISTS(SELECT 1 FROM notes WHERE user_id=? AND slug=?)`)
+        .bind(newSlug, ts, note.id, owner, oldSlug, owner, newSlug),
+      commit.event,
+      this.db.prepare(`DELETE FROM slug_redirects WHERE user_id=? AND old_slug=? AND ${gate.sql}`).bind(owner, newSlug, ...gate.args),
+      this.db.prepare(`INSERT INTO slug_redirects (id,user_id,old_slug,new_note_id,created_at)
+        SELECT ?,?,?,?,? WHERE ${gate.sql}
+        ON CONFLICT(user_id,old_slug) DO UPDATE SET new_note_id=excluded.new_note_id, created_at=excluded.created_at`)
+        .bind(ulid(ts), owner, oldSlug, note.id, ts, ...gate.args),
+    ]);
+    if (!moved.meta.changes) {
+      const clash = await this.getRowBySlug(owner, newSlug);
+      return { ok: false, reason: clash ? "slug taken" : "no such note" };
+    }
     const renamed = await this.getRowById(note.id);
     return renamed ? { ok: true, note: renamed } : { ok: false, reason: "rename failed" };
   }
