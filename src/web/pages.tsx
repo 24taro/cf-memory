@@ -7,6 +7,7 @@ import type { BlockView } from "../services";
 import type { SkillSummary } from "../skills";
 import type { RecallSection } from "./recall-sections";
 import type { SearchFilters } from "../search";
+import type { GraphData, GraphNode } from "../serialize";
 
 function fmtDate(ms: number): string {
   return new Date(ms).toISOString().slice(0, 10);
@@ -650,8 +651,10 @@ export const PreviewPage: FC<{
 export const NetworkPage: FC<{
   handle: string;
   sessionHandle?: string;
-  topConnected: Array<{ id: string; label: string; degree: number; stub: boolean }>;
-  edges: Array<{ source: string; target: string; stub: boolean }>;
+  graph: GraphData;
+  partial: boolean;
+  topConnected: Array<GraphNode & { degree: number }>;
+  edges: Array<{ source: GraphNode; target: GraphNode }>;
   nonce: string;
 }> = (p) => (
   <Layout title="network" handle={p.handle} sessionHandle={p.sessionHandle}>
@@ -659,13 +662,14 @@ export const NetworkPage: FC<{
     <p class="meta">
       ノート同士がどうつながっているかを図で見られます。線でつながっているノートは書かれたノート、点線・薄い丸はまだ書かれていないノートです。 <a href={`/@${p.handle}/network.md`}>.md</a>
     </p>
-    <canvas id="graph" data-handle={p.handle}></canvas>
+    {p.partial ? <p class="meta">図にはつながりの多いノートと線の一部を表示します。全件は .md で確認できます。</p> : null}
+    {p.graph.nodes.length > 0 ? <canvas id="graph" aria-hidden="true" data-graph={JSON.stringify(p.graph)}></canvas> : null}
     <h2>よくつながっているノート</h2>
     <ul class="list">
       {p.topConnected.length === 0 ? <li class="muted">まだつながりがありません。</li> : null}
       {p.topConnected.map((n) => (
         <li>
-          {n.stub ? <span class="wikilink stub">{n.label}</span> : <a href={`/@${p.handle}/n/${n.id}`}>{n.label}</a>} <span class="t">· {n.degree}件のつながり</span>
+          {n.href ? <a href={n.href}>{n.label}</a> : <span class="wikilink stub">{n.label}</span>} <span class="t">· {n.degree}件のつながり</span>
         </li>
       ))}
     </ul>
@@ -675,12 +679,12 @@ export const NetworkPage: FC<{
       {p.edges.map((e) => (
         <li>
           <span class="t">
-            <a href={`/@${p.handle}/n/${e.source}`}>{e.source}</a> → {e.stub ? <span class="wikilink stub">{e.target}</span> : <a href={`/@${p.handle}/n/${e.target}`}>{e.target}</a>}
+            <a href={e.source.href}>{e.source.id}</a> → {e.target.href ? <a href={e.target.href}>{e.target.id}</a> : <span class="wikilink stub">{e.target.id}</span>}
           </span>
         </li>
       ))}
     </ul>
-    <script nonce={p.nonce} dangerouslySetInnerHTML={{ __html: graphScriptSrc() }} />
+    {p.graph.nodes.length > 0 ? <script nonce={p.nonce} dangerouslySetInnerHTML={{ __html: graphScriptSrc() }} /> : null}
   </Layout>
 );
 
@@ -721,44 +725,92 @@ export const MemoryPage: FC<{ handle: string; sessionHandle?: string; blocks: Bl
 // Inlined into the network page as a plain browser string (not TS-checked against DOM libs).
 function graphScriptSrc(): string {
   return `(function(){
-  var cv = document.getElementById("graph"); var ctx = cv.getContext("2d");
-  var handle = encodeURIComponent(cv.dataset.handle);
-  var dpr = window.devicePixelRatio || 1;
-  function size(){ cv.width = cv.clientWidth*dpr; cv.height = cv.clientHeight*dpr; }
-  size(); addEventListener("resize", size);
-  fetch("/api/v1/@" + handle + "/graph?depth=2").then(function(r){ return r.json(); }).then(function(g){
-    var N = g.nodes.map(function(n){ return { id:n.id, label:n.label, stub:n.stub, x:Math.random()*cv.width, y:Math.random()*cv.height, vx:0, vy:0 }; });
-    var idx = Object.create(null); N.forEach(function(n,i){ idx[n.id]=i; });
-    var E = g.edges.filter(function(e){ return idx[e.source]!=null && idx[e.target]!=null; });
-    function step(){
-      for (var i=0;i<N.length;i++){ for (var j=i+1;j<N.length;j++){
-        var dx=N[i].x-N[j].x, dy=N[i].y-N[j].y, d2=dx*dx+dy*dy+0.01, f=(4000*dpr)/d2, d=Math.sqrt(d2);
-        N[i].vx+=dx/d*f; N[i].vy+=dy/d*f; N[j].vx-=dx/d*f; N[j].vy-=dy/d*f;
-      }}
-      for (var k=0;k<E.length;k++){ var a=N[idx[E[k].source]], b=N[idx[E[k].target]];
-        var ex=b.x-a.x, ey=b.y-a.y, ed=Math.sqrt(ex*ex+ey*ey)+0.01, ef=(ed-90*dpr)*0.01;
-        a.vx+=ex/ed*ef; a.vy+=ey/ed*ef; b.vx-=ex/ed*ef; b.vy-=ey/ed*ef;
-      }
-      var cx=cv.width/2, cy=cv.height/2;
-      for (var m=0;m<N.length;m++){ var n=N[m]; n.vx+=(cx-n.x)*0.002; n.vy+=(cy-n.y)*0.002; n.vx*=0.85; n.vy*=0.85; n.x+=n.vx; n.y+=n.vy; }
-      ctx.clearRect(0,0,cv.width,cv.height); ctx.strokeStyle="rgba(127,127,127,.35)";
-      for (var p=0;p<E.length;p++){ var pa=N[idx[E[p].source]], pb=N[idx[E[p].target]]; ctx.beginPath(); ctx.moveTo(pa.x,pa.y); ctx.lineTo(pb.x,pb.y); ctx.stroke(); }
-      ctx.font=(12*dpr)+"px sans-serif";
-      for (var q=0;q<N.length;q++){ var nq=N[q];
-        ctx.beginPath(); ctx.arc(nq.x,nq.y,5*dpr,0,7);
-        ctx.fillStyle=nq.stub?"rgba(180,107,74,.25)":"#2f8f7d"; ctx.fill();
-        ctx.strokeStyle=nq.stub?"#b46b4a":"#2f8f7d"; ctx.stroke();
-        ctx.fillStyle="rgba(127,127,127,.9)"; ctx.fillText(nq.label, nq.x+8*dpr, nq.y+4*dpr);
-      }
-      requestAnimationFrame(step);
-    }
-    cv.addEventListener("click", function(ev){
-      var rc=cv.getBoundingClientRect(), mx=(ev.clientX-rc.left)*dpr, my=(ev.clientY-rc.top)*dpr;
-      for (var s=0;s<N.length;s++){ var ns=N[s];
-        if ((ns.x-mx)*(ns.x-mx)+(ns.y-my)*(ns.y-my) < (10*dpr)*(10*dpr) && !ns.stub){ location.href="/@"+handle+"/n/"+ns.id; }
-      }
+  var canvas = document.getElementById("graph");
+  var ctx = canvas.getContext("2d");
+  if (!ctx) return;
+  var data = JSON.parse(canvas.dataset.graph);
+  var nodes = data.nodes;
+  var index = Object.create(null);
+  nodes.forEach(function(node){ index[node.id] = node; });
+  var edges = data.edges.map(function(edge){ return { source:index[edge.source], target:index[edge.target] }; });
+  var motion = matchMedia("(prefers-reduced-motion: reduce)");
+  var dpr, remaining, frame;
+  var colors = getComputedStyle(canvas);
+  var accent = colors.getPropertyValue("--accent").trim();
+  var stub = colors.getPropertyValue("--stub").trim();
+  var text = colors.getPropertyValue("--text-2").trim();
+
+  function draw(){
+    ctx.clearRect(0,0,canvas.width,canvas.height);
+    ctx.strokeStyle = "rgba(127,127,127,.45)";
+    edges.forEach(function(edge){
+      ctx.setLineDash(edge.target.stub ? [4*dpr,3*dpr] : []);
+      ctx.beginPath();
+      ctx.moveTo(edge.source.x,edge.source.y);
+      ctx.lineTo(edge.target.x,edge.target.y);
+      ctx.stroke();
     });
-    step();
+    ctx.setLineDash([]);
+    ctx.font = (13*dpr)+"px sans-serif";
+    nodes.forEach(function(node){
+      ctx.beginPath();
+      ctx.arc(node.x,node.y,5*dpr,0,2*Math.PI);
+      ctx.fillStyle = node.stub ? stub : accent;
+      if (node.stub) ctx.globalAlpha=0.35;
+      ctx.fill();
+      ctx.globalAlpha=1;
+      ctx.fillStyle = text;
+      ctx.fillText(node.label,node.x+8*dpr,node.y+4*dpr);
+    });
+  }
+
+  function step(){
+    for (var i=0;i<nodes.length;i++) for (var j=i+1;j<nodes.length;j++) {
+      var a=nodes[i], b=nodes[j], dx=a.x-b.x, dy=a.y-b.y;
+      var distance=Math.sqrt(dx*dx+dy*dy+0.01), force=(4000*dpr)/(distance*distance);
+      a.vx+=dx/distance*force; a.vy+=dy/distance*force;
+      b.vx-=dx/distance*force; b.vy-=dy/distance*force;
+    }
+    edges.forEach(function(edge){
+      var a=edge.source, b=edge.target, dx=b.x-a.x, dy=b.y-a.y;
+      var distance=Math.sqrt(dx*dx+dy*dy)+0.01, force=(distance-90*dpr)*0.01;
+      a.vx+=dx/distance*force; a.vy+=dy/distance*force;
+      b.vx-=dx/distance*force; b.vy-=dy/distance*force;
+    });
+    nodes.forEach(function(node){
+      node.vx=(node.vx+(canvas.width/2-node.x)*0.002)*0.85;
+      node.vy=(node.vy+(canvas.height/2-node.y)*0.002)*0.85;
+      var inset=8*dpr;
+      node.x=Math.max(inset,Math.min(canvas.width-inset,node.x+node.vx));
+      node.y=Math.max(inset,Math.min(canvas.height-inset,node.y+node.vy));
+    });
+    draw();
+    if (--remaining > 0) frame=requestAnimationFrame(step);
+  }
+
+  function place(){
+    cancelAnimationFrame(frame);
+    dpr = window.devicePixelRatio || 1;
+    canvas.width=canvas.clientWidth*dpr;
+    canvas.height=canvas.clientHeight*dpr;
+    nodes.forEach(function(node,i){
+      var angle=i/nodes.length*2*Math.PI;
+      var radius=nodes.length===1 ? 0 : 0.32;
+      node.x=canvas.width*(0.5+radius*Math.cos(angle));
+      node.y=canvas.height*(0.5+radius*Math.sin(angle));
+      node.vx=0; node.vy=0;
+    });
+    draw();
+    if (!motion.matches) { remaining=120; frame=requestAnimationFrame(step); }
+  }
+  addEventListener("resize",place);
+  motion.addEventListener("change",place);
+  canvas.addEventListener("click",function(event){
+    var rect=canvas.getBoundingClientRect();
+    var x=(event.clientX-rect.left)*dpr, y=(event.clientY-rect.top)*dpr;
+    var node=nodes.find(function(n){ return n.href && (n.x-x)*(n.x-x)+(n.y-y)*(n.y-y)<(10*dpr)*(10*dpr); });
+    if (node) location.assign(node.href);
   });
+  place();
 })();`;
 }

@@ -10,7 +10,7 @@ import { renderMarkdown, type WikiResolver } from "./markdown";
 import { handleMcp, MCP_TOOL_NAMES, storedTitle } from "./mcp";
 import { NoteInputError, StaleUpsertError, storedAs } from "./notes";
 import { MAX_SYNONYM_CHARS, MAX_SYNONYMS_PER_REQUEST, searchFilters, SearchInputError, standaloneSearch } from "./search";
-import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData } from "./serialize";
+import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData, type GraphNode } from "./serialize";
 import { blockWriteResult, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
 import { attachmentDisposition, BundleQuotaError, BundlesUnconfiguredError, MAX_BUNDLE_FILE_BYTES, resolveServeContentType, validateBundlePath } from "./bundle";
 import { boundedBytes, MAX_REQUEST_BODY_BYTES, RequestBodyTooLargeError } from "./bounded-body";
@@ -352,64 +352,60 @@ async function resolveWiki(db: D1Database, viewerId: string, handle: string, lin
   };
 }
 
-// Builds the wikilink graph for the /network view (web + /network.md + the
-// GET /api/v1/:handle/graph JSON mount).
-//
-// The PAGE stays owner-gated: visiting someone else's /network gives an EMPTY
-// graph, exactly as before (forgetting that check would hand the whole mesh —
-// slugs, titles, edges — to any invited teammate; round-1 review P0).
-//
-// What changed 2026-08-22 is the CONTENT of your own graph: the rows are picked
-// by readableSql (yours + shared) instead of a hand-written `user_id = ?`.
-// Since 2026-08-20 resolveWiki resolves a [[wikilink]] against every readable
-// row, so a link to a teammate's shared note renders as a real link on the note
-// page — while this function, still bound to your user_id, could not see that
-// row and drew it as a "wanted" stub. The graph said the note had not been
-// written yet, about a note that exists and that you had just followed. A map
-// that contradicts the territory is worse than no map.
-//
-// This was the fourth hand-written read predicate; #150 fixed the other three.
+// A caller's own graph includes notes they can read, including shared notes.
+// Keep simple slugs for unique nodes and qualify collisions by their owner.
 async function buildGraph(db: D1Database, userId: string, isOwner: boolean): Promise<GraphData> {
   if (!isOwner) return { nodes: [], edges: [] };
+  type GraphNote = { id: string; user_id: string; handle: string; slug: string; title: string; shared: number };
   const vis = readableSqlFor("n", userId);
   const notesRes = await db
-    .prepare(`SELECT slug, title FROM notes n WHERE ${vis.sql} AND deleted_at IS NULL AND n.kind != 'block' `)
-    .bind(...vis.args)
-    .all<{ slug: string; title: string }>();
-  const visible = new Set((notesRes.results ?? []).map((n) => n.slug));
-  const nodes = (notesRes.results ?? []).map((n) => ({ id: n.slug, label: n.title || n.slug, stub: false }));
-  // Edges are the links OUT OF readable notes. Bound on the source note's own
-  // readability (not links.user_id, which records the row owner) so a shared
-  // note's outgoing links are part of the mesh too.
+    .prepare(`SELECT n.id,n.user_id,u.handle,n.slug,n.title,n.shared FROM notes n JOIN users u ON u.id=n.user_id
+      WHERE ${vis.sql} AND n.deleted_at IS NULL AND n.kind!='block'
+      ORDER BY (n.user_id=?) DESC,n.created_at,n.id`)
+    .bind(...vis.args, userId)
+    .all<GraphNote>();
+  const nodes: GraphNode[] = [];
+  const displayId = new Map<string, string>();
+  const bySlug = new Map<string, GraphNote[]>();
+  const owners = new Map<string, string>();
+  for (const note of notesRes.results) {
+    const existing = bySlug.get(note.slug) ?? [];
+    const id = existing.length ? `@${note.handle}/${note.slug}` : note.slug;
+    existing.push(note);
+    bySlug.set(note.slug, existing);
+    displayId.set(note.id, id);
+    owners.set(note.user_id, note.handle);
+    nodes.push({ id, label: note.title || note.slug, stub: false, href: `/@${encodeURIComponent(note.handle)}/n/${note.slug}` });
+  }
   const srcVis = readableSqlFor("s", userId);
   const edgesRes = await db
-    .prepare(`SELECT s.slug AS src, l.target_slug AS tgt, l.resolved AS resolved FROM links l JOIN notes s ON s.id=l.src_note_id WHERE ${srcVis.sql} AND s.deleted_at IS NULL AND l.kind='wikilink'`)
+    .prepare(`SELECT s.id AS source_id,s.user_id AS source_owner,l.target_slug,l.target_note_id
+      FROM links l JOIN notes s ON s.id=l.src_note_id
+      WHERE ${srcVis.sql} AND s.deleted_at IS NULL AND s.kind!='block' AND l.kind='wikilink'
+      ORDER BY s.created_at,l.position,l.id`)
     .bind(...srcVis.args)
-    .all<{ src: string; tgt: string; resolved: number }>();
-  // Resolvedness is derived from VISIBILITY here, not read off links.resolved.
-  //
-  // rebuildOutgoingLinks still resolves a [[wikilink]] within the writer's own
-  // namespace (`WHERE user_id=? AND slug=?`), so a link to a teammate's SHARED
-  // note is stored resolved=0 even though the note plainly exists. Trusting that
-  // column would keep drawing the shared target as a "wanted" stub — and once
-  // the target became visible here, the old branch structure dropped the edge
-  // entirely (neither the resolved-and-visible arm nor the unresolved-and-not-
-  // visible arm matched), so the link vanished from the map altogether.
-  //
-  // resolveWiki already decides the same question the same way — does a readable
-  // row with this slug exist — so the note page and the graph now agree by
-  // construction. Fixing links.resolved at WRITE time would be the deeper fix
-  // (it would also repair backlinks across shared notes) but it changes what
-  // target_note_id means and how stubs auto-resolve; that is its own change.
-  const edges: Array<{ source: string; target: string }> = [];
+    .all<{ source_id: string; source_owner: string; target_slug: string; target_note_id: string | null }>();
+  const edges: GraphData["edges"] = [];
   const stubSeen = new Set<string>();
-  for (const e of edgesRes.results ?? []) {
-    if (!visible.has(e.src)) continue;
-    if (!visible.has(e.tgt) && !stubSeen.has(e.tgt)) {
-      stubSeen.add(e.tgt);
-      nodes.push({ id: e.tgt, label: e.tgt, stub: true });
+  for (const edge of edgesRes.results) {
+    const source = displayId.get(edge.source_id);
+    if (!source) continue;
+    // Stored IDs keep a renamed target connected. Resolve older and dangling
+    // links against the visible rows using the source owner's namespace first.
+    let target = edge.target_note_id ? displayId.get(edge.target_note_id) : undefined;
+    if (!target) {
+      const candidates = bySlug.get(edge.target_slug);
+      const found = candidates?.find(note => note.user_id === edge.source_owner) ?? candidates?.find(note => note.shared === 1);
+      if (found) target = displayId.get(found.id);
     }
-    edges.push({ source: e.src, target: e.tgt });
+    if (!target) {
+      target = bySlug.has(edge.target_slug) ? `@${owners.get(edge.source_owner)}/${edge.target_slug}` : edge.target_slug;
+      if (!stubSeen.has(target)) {
+        stubSeen.add(target);
+        nodes.push({ id: target, label: edge.target_slug, stub: true });
+      }
+    }
+    edges.push({ source, target });
   }
   return { nodes, edges };
 }
@@ -585,13 +581,18 @@ app.get(`${H}/network`, async (c) => {
     deg.set(e.source, (deg.get(e.source) ?? 0) + 1);
     deg.set(e.target, (deg.get(e.target) ?? 0) + 1);
   }
-  const stubSet = new Set(g.nodes.filter((n) => n.stub).map((n) => n.id));
-  const topConnected = [...deg.entries()]
-    .map(([id, degree]) => ({ id, label: g.nodes.find((n) => n.id === id)?.label ?? id, degree, stub: stubSet.has(id) }))
-    .sort((a, b) => b.degree - a.degree)
-    .slice(0, 15);
-  const edges = g.edges.slice(0, 50).map((e) => ({ ...e, stub: stubSet.has(e.target) }));
-  return c.html(<NetworkPage handle={handle} sessionHandle={sessionHandle(c)} topConnected={topConnected} edges={edges} nonce={c.var.cspNonce} />);
+  const ranked = [...g.nodes].sort((a, b) => (deg.get(b.id) ?? 0) - (deg.get(a.id) ?? 0));
+  const topConnected = ranked.slice(0, 15).map(node => ({ ...node, degree: deg.get(node.id) ?? 0 }));
+  const byId = new Map(g.nodes.map(node => [node.id, node]));
+  const edges = g.edges.slice(0, 50).map(edge => ({ source: byId.get(edge.source)!, target: byId.get(edge.target)! }));
+  // Rendering repels every pair of nodes. Send a bounded preview to the
+  // browser and keep the complete, linear listing available as Markdown.
+  const graphNodes = ranked.slice(0, 150);
+  const ids = new Set(graphNodes.map(node => node.id));
+  const graphEdges = g.edges.filter(edge => ids.has(edge.source) && ids.has(edge.target)).slice(0, 300);
+  const graph = { nodes: graphNodes, edges: graphEdges };
+  const partial = graphNodes.length < g.nodes.length || graphEdges.length < g.edges.length;
+  return c.html(<NetworkPage handle={handle} sessionHandle={sessionHandle(c)} graph={graph} partial={partial} topConnected={topConnected} edges={edges} nonce={c.var.cspNonce} />);
 });
 
 app.get(`${H}/ranking`, async (c) => {

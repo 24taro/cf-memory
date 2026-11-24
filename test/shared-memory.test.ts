@@ -588,6 +588,36 @@ describe("共有ノートは検索結果の slug でそのまま開ける", () =
     expect(await page.text()).toContain('href="/@alice/n/release-step-125"');
   });
 
+  it("keeps duplicate graph nodes connected to the right owners and caps the browser preview", async () => {
+    const slug = "graph-owner-target";
+    for (const [token, title] of [[aliceToken, "Alice graph target"], [bobToken, "Bob graph target"]]) {
+      expect((await put(token, { slug, title, body_md: title })).ok).toBe(true);
+      expect((await put(token, { slug, body_md: title, shared: true })).ok).toBe(true);
+    }
+    expect((await put(aliceToken, { slug: "graph-alice-source", body_md: `[[${slug}]]`, shared: true })).ok).toBe(true);
+    const many = Array.from({ length: 170 }, (_, i) => `[[graph-check-${i + 1}]]`).join(" ");
+    expect((await put(bobToken, { slug: "graph-bob-source", body_md: `[[${slug}]] ${many}` })).ok).toBe(true);
+
+    const response = await req("/api/v1/@bob/graph", bobToken);
+    expect(response.ok).toBe(true);
+    const graph = await response.json() as import("../src/serialize").GraphData;
+    expect(new Set(graph.nodes.map(node => node.id)).size).toBe(graph.nodes.length);
+    expect(graph.nodes).toContainEqual({ id: slug, label: "Bob graph target", href: `/@bob/n/${slug}`, stub: false });
+    expect(graph.nodes).toContainEqual({ id: `@alice/${slug}`, label: "Alice graph target", href: `/@alice/n/${slug}`, stub: false });
+    expect(graph.edges).toContainEqual({ source: "graph-bob-source", target: slug });
+    expect(graph.edges).toContainEqual({ source: "graph-alice-source", target: `@alice/${slug}` });
+    expect(graph.nodes.length).toBeGreaterThan(170);
+
+    const web = await req("/@bob/network", bobToken);
+    expect(web.ok).toBe(true);
+    const html = await web.text();
+    const payload = html.match(/data-graph="([^"]+)"/)?.[1];
+    expect(html).toContain("全件は .md で確認できます。");
+    const preview = JSON.parse(payload!.replaceAll("&quot;", '"')) as import("../src/serialize").GraphData;
+    expect(preview.nodes.length).toBe(150);
+    expect(preview.edges.length).toBeLessThanOrEqual(300);
+  });
+
   it("個人ノートからのリンクは相手の backlinks に出ない", async () => {
     // 対照であり、漏洩の検査でもある。target_note_id が他人の行を指せるように
     // なった以上、リンク元の可視性を見落とすと「誰が何を参照しているか」が漏れる。

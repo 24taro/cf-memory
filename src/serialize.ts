@@ -17,8 +17,14 @@ export interface RankRow {
   views: number;
   score: number;
 }
+export interface GraphNode {
+  id: string;
+  label: string;
+  stub: boolean;
+  href?: string;
+}
 export interface GraphData {
-  nodes: Array<{ id: string; label: string; stub: boolean }>;
+  nodes: GraphNode[];
   edges: Array<{ source: string; target: string }>;
 }
 
