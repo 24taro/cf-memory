@@ -59,6 +59,7 @@ fi
 
 # The owner's token. Kept in this checkout, readable only by you, never committed.
 SECRETS_FILE=".cf-memory.secrets"
+INSTALL_CLAIM=".cf-memory.install-claim"
 DEPLOY_LOG=$(mktemp)
 trap 'rm -f "$DEPLOY_LOG"' EXIT
 set --
@@ -71,11 +72,18 @@ if secret_list=$(CI=true wrangler secret list --format json 2>"$DEPLOY_LOG"); th
   fi
   [ -s "$SECRETS_FILE" ] || fail "the Worker already exists. Restore $SECRETS_FILE from the original checkout or rotate its API token explicitly (see SECURITY.md)"
 elif grep -Eq 'Worker "[^"]+" not found\.' "$DEPLOY_LOG"; then
+  say "Reserving the Worker name for this first install"
+  reservation=$(CI=true node scripts/reserve-worker.mjs "$INSTALL_CLAIM") ||
+    fail "the first install did not reserve the Worker; no token was uploaded"
+  read -r account_id worker_name <<< "${reservation##*$'\n'}"
+  [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ ]] ||
+    fail "could not confirm the reserved Cloudflare account and Worker"
+  export CLOUDFLARE_ACCOUNT_ID="$account_id"
   if [ ! -e "$SECRETS_FILE" ]; then
     say "Generating the API token ($SECRETS_FILE)"
     (umask 077; set -C; generated_token=$(openssl rand -hex 32); printf 'API_TOKEN=%s\n' "$generated_token" > "$SECRETS_FILE")
   fi
-  set -- --secrets-file "$SECRETS_FILE"
+  set -- --secrets-file "$SECRETS_FILE" --name "$worker_name"
 else
   cat "$DEPLOY_LOG" >&2
   fail "could not verify whether the Worker already exists"
@@ -105,6 +113,7 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   sleep 3
 done
 [ "$OK" = 1 ] || fail "the Worker is deployed at $URL but did not accept the token. Run this script again in a minute"
+rm -f "$INSTALL_CLAIM"
 echo "The server accepts your token."
 
 CONNECTED=""

@@ -39,6 +39,11 @@ It reports MCP registration and hook installation separately. If either step
 fails for one client, setup still runs for the other client and the script exits
 with an error.
 
+The first install reserves the Worker name in your Cloudflare account. If it
+is interrupted, rerun it from the same checkout and keep
+`.cf-memory.install-claim` and `.cf-memory.secrets` if present. The installer
+removes the claim file once it verifies the connection.
+
 If you use Codex, add the two export lines printed by the installer to your
 shell profile and load it before launching Codex. Open `/hooks` and approve
 the four cf-memory hooks. If Codex asks again after an update, review and

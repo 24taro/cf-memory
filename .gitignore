@@ -13,3 +13,4 @@ coverage/
 .worktrees/
 .cf-memory.secrets
 .cf-memory.secrets.*
+.cf-memory.install-claim
