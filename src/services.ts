@@ -753,10 +753,11 @@ export function makeServices(db: D1Database, bundles: R2Bucket | null = null, en
   const skills = new SkillsRepo(db, bundles);
   const search = new SearchService(db);
   const memory = new MemoryService(db, notes);
-  const recall = new RecallService(notes, search, memory, skills, deferRecallViews, db, env?.OWNER_HANDLE || "owner");
+  const instanceOwner = env?.OWNER_HANDLE || "owner";
+  const recall = new RecallService(notes, search, memory, skills, deferRecallViews, db, instanceOwner);
   const retention = Number(env?.CF_MEMORY_RAW_EVENT_RETENTION_DAYS || '7');
   const capture = new CaptureService(db, Number.isFinite(retention) ? Math.max(1, Math.min(30, retention)) : 7, { git_sha: env?.BUILD_GIT_SHA || 'unknown', build_date: env?.BUILD_DATE || 'unknown', guided_search: env?.RESOURCE_URI && (env?.INTROSPECTION_SECRET?.length || 0) >= 32 ? 'configured' : 'disabled' });
-  const logs = new LogService(env?.LOGS ?? null, logSettings(env));
+  const logs = new LogService(env?.LOGS ?? null, logSettings(env), undefined, instanceOwner);
   return { notes, skills, search, memory, recall, portability: new PortabilityService(db,notes,skills), capture, logs,
     guided: new GuidedSearchService(search,capture,env?.INTROSPECTION_SECRET,env?.RESOURCE_URI) };
 }

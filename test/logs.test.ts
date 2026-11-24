@@ -550,13 +550,15 @@ describe("MCP registration and scopes", () => {
 });
 
 describe("server_status.logs", () => {
-  it("reports configuration, database size, the caller's entries and today's action bytes", async () => {
+  it("reports the caller's entry counts and reserves the whole database size for the instance owner", async () => {
     const u = user("log-status");
     await services.logs.append(u, { entries: [entry({ kind: "action", text: "a".repeat(120) }), entry()] });
-    const status = await rpc("server_status", {}, u);
+    const ownerServices = makeServices(db, null, { LOGS: logsDb, OWNER_HANDLE: u.handle } as unknown as Env);
+    const status = await rpc("server_status", {}, u, ownerServices);
     expect(status.logs).toEqual({ configured: true, daily_action_limit: null, daily_total_limit: null, action_retention_days: 90,
       size_bytes: expect.any(Number), entries: 2, today_action_bytes: 120, today_total_bytes: 125 });
     expect(status.logs.size_bytes).toBeGreaterThan(0);
+    expect((await rpc("server_status", {}, u)).logs).toEqual({ ...status.logs, size_bytes: null });
     for (const removed of ["embedding_provider", "embedding_model", "embedding_jobs", "queue", "async_embedding", "vectorize_processing"]) expect(status).not.toHaveProperty(removed);
     // Installed 0.2.x doctors pass vectorize_processing only for 'disabled' or 'configured' (until phase 5).
     expect(status.vectorize).toBe("disabled");

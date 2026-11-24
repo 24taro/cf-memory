@@ -364,7 +364,12 @@ function textWindow(text: string, offset: number): { text: string; start: number
 // --------------------------------------------------------------------- service
 
 export class LogService {
-  constructor(private db: D1Database | null, readonly settings: LogSettings = logSettings(), private clock: () => number = Date.now) {}
+  constructor(
+    private db: D1Database | null,
+    readonly settings: LogSettings = logSettings(),
+    private clock: () => number = Date.now,
+    private instanceOwner = "owner",
+  ) {}
 
   get configured(): boolean { return this.db !== null; }
 
@@ -657,9 +662,9 @@ export class LogService {
     return row ? { session_id: row.session_id, time: jstTime(row.ts), text: cutText(row.text, HANDOFF_TEXT_CHARS).text } : null;
   }
 
-  /** server_status.logs. size_bytes is the whole database (D1 result
-   * meta.size_after of the count query); entries and today's bytes are the
-   * caller's own. `entries` is a count(*) over log_user_ts: one index entry
+  /** server_status.logs. Whole-database size is shown to the configured owner.
+   * Entry counts and today's bytes are always the caller's own.
+   * `entries` is a count(*) over log_user_ts: one index entry
    * read per own row (no cheaper exact source; log_daily has no running total). */
   async status(p?: Principal) {
     const base = { configured: this.configured, daily_action_limit: this.settings.dailyActionBytes ?? null,
@@ -671,7 +676,7 @@ export class LogService {
         this.db.prepare('SELECT count(*) AS n FROM log_entries WHERE user_id=?').bind(p.userId),
         this.db.prepare('SELECT action_bytes, total_bytes, 0 AS n FROM log_daily WHERE user_id=? AND day=?').bind(p.userId, utcDay(this.clock())),
       ]);
-      const size = (count.meta as { size_after?: unknown } | undefined)?.size_after;
+      const size = p.handle === this.instanceOwner ? (count.meta as { size_after?: unknown } | undefined)?.size_after : null;
       return { ...base, size_bytes: typeof size === 'number' ? size : null, entries: count.results[0]?.n ?? 0,
         today_action_bytes: daily.results[0]?.action_bytes ?? 0, today_total_bytes: daily.results[0]?.total_bytes ?? 0 };
     } catch {

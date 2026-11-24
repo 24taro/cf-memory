@@ -299,7 +299,7 @@ const TOOLS: ToolDef[] = [
     scope:'notes:write', handler: (args,ctx) => ctx.services.portability.importProvenance(ctx.principal,args),
   },
 
-  { name: 'server_status', description: 'Authenticated build SHA/date, schema readiness and the conversation log database (`logs`: whether it is configured, database size, your entry count, today\'s stored action and total bytes, the daily byte limits — null when there is none — and action retention days).', inputSchema: { type: 'object', properties: {} }, scope: 'notes:read', handler: (_args, ctx) => serverStatus(ctx.services, ctx.principal) },
+  { name: 'server_status', description: 'Authenticated build SHA/date, schema readiness and the conversation log database (`logs`: whether it is configured, your entry count and today\'s stored bytes, the configured limits, and retention days). The instance owner also sees the total database size.', inputSchema: { type: 'object', properties: {} }, scope: 'notes:read', handler: (_args, ctx) => serverStatus(ctx.services, ctx.principal) },
   ...LOG_TOOLS,
   {
     name: 'capture_put', description: 'Store a bounded redacted short-lived capture source. Idempotent per caller/tool use. Not part of Recall.',
