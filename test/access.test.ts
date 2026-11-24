@@ -108,6 +108,13 @@ describe("verifyAccessJwt", () => {
     expect(await verifyAccessJwt(token, fullEnv())).toBeNull();
   });
 
+  it("requires string identities and numeric dates in signed assertions", async () => {
+    for (const claims of [{ email: {} }, { sub: 123 }, { iat: "123" }, { nbf: "123" }]) {
+      const token = await signJwt(validPayload(claims));
+      expect(await verifyAccessJwt(token, fullEnv())).toBeNull();
+    }
+  });
+
   it("rejects an unknown kid → null", async () => {
     // Stub fetch so the kid-miss refetch doesn't hit the live JWKS endpoint.
     vi.stubGlobal("fetch", async () => {
@@ -159,6 +166,28 @@ describe("JWKS rotation: kid miss triggers ONE refetch", () => {
     const id = await verifyAccessJwt(token, fullEnv());
     expect(id?.email).toBe("owner@example.com");
     expect(fetchCount).toBe(1); // exactly one refetch, no loop
+  });
+
+  it("keeps a cached signing key when the provider returns an unusable document", async () => {
+    const fetchKeys = vi.fn(async () => Response.json({ keys: [], supplemental: "x".repeat(256 * 1024) }));
+    vi.stubGlobal("fetch", fetchKeys);
+    expect(await verifyAccessJwt(await signJwt(validPayload(), { kid: "new-kid" }), fullEnv())).toBeNull();
+    expect(await verifyAccessJwt(await signJwt(validPayload()), fullEnv())).toEqual({ email: "owner@example.com", sub: "sub-abc" });
+    expect(fetchKeys).toHaveBeenCalledOnce();
+  });
+
+  it("refreshes an expired key set and stops accepting retired keys", async () => {
+    const token = await signJwt(validPayload({ exp: nowSec() + 3600 }));
+    const jwk = await crypto.subtle.exportKey("jwk", publicKey);
+    const fetchKeys = vi.fn(async () => Response.json({ keys: [{ ...jwk, kid: "current-kid" }] }));
+    vi.stubGlobal("fetch", fetchKeys);
+    const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now() + 11 * 60_000);
+    try {
+      expect(await verifyAccessJwt(token, fullEnv())).toBeNull();
+      expect(fetchKeys).toHaveBeenCalledOnce();
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("returns null (no retry loop) when the kid is absent even after a refetch", async () => {

@@ -17,6 +17,7 @@
 // domain). That signature + aud pinning is what makes header-based identity safe.
 
 import type { Env } from "./types";
+import { boundedJson } from "./bounded-body";
 
 export interface AccessIdentity {
   email: string;
@@ -29,9 +30,15 @@ interface Jwk {
   [k: string]: unknown;
 }
 
-// Module-level JWKS cache (per instance lifetime). Keyed by team domain so a
-// re-used isolate serving multiple configs stays correct; value is a Map by kid.
-const jwksCache = new Map<string, Map<string, CryptoKey>>();
+// Cache by team domain and expire the whole set so a warm isolate eventually
+// stops accepting retired keys even if it has never seen a newer key ID.
+const jwksCache = new Map<string, { keys: Map<string, CryptoKey>; expiresAt: number }>();
+const JWKS_CACHE_TTL_MS = 10 * 60_000;
+
+function currentKeys(teamDomain: string): Map<string, CryptoKey> | undefined {
+  const cached = jwksCache.get(teamDomain);
+  return cached && cached.expiresAt > Date.now() ? cached.keys : undefined;
+}
 
 // W4: cooldown gate for the FORCED refetch on a kid-miss, keyed by team domain.
 // A forged token with a random kid is a kid-miss on EVERY request -- unlike a
@@ -43,6 +50,10 @@ const jwksCache = new Map<string, Map<string, CryptoKey>>();
 // within the cooldown window on any miss thereafter.
 const lastForcedRefetch = new Map<string, number>();
 const FORCED_REFETCH_COOLDOWN_MS = 60_000;
+const JWKS_TIMEOUT_MS = 5_000;
+const MAX_JWKS_RESPONSE_BYTES = 256 * 1024;
+const MAX_JWKS_KEYS = 32;
+const MAX_JWT_LENGTH = 64 * 1024;
 
 // Clock skew tolerance (seconds) for exp/nbf/iat checks.
 const SKEW = 60;
@@ -64,25 +75,23 @@ function b64urlToJson<T>(s: string): T | null {
   }
 }
 
-/** Fetch + parse the team JWKS into a kid→CryptoKey map, caching per team domain.
- * `forceRefresh` bypasses the cache (kid-rotation path). Test seam: `seedJwks`
- * lets unit tests inject keys without network access. */
-async function getKeys(teamDomain: string, forceRefresh = false): Promise<Map<string, CryptoKey>> {
-  if (!forceRefresh) {
-    const cached = jwksCache.get(teamDomain);
-    if (cached) return cached;
-  }
+/** Fetch the active key set. A failed refresh leaves any still-fresh keys available. */
+async function refreshKeys(teamDomain: string): Promise<Map<string, CryptoKey>> {
   const map = new Map<string, CryptoKey>();
   try {
-    const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`);
+    const res = await fetch(`https://${teamDomain}/cdn-cgi/access/certs`, {
+      cache: "no-store",
+      redirect: "error",
+      signal: AbortSignal.timeout(JWKS_TIMEOUT_MS),
+    });
     if (!res.ok) {
-      // Do not cache a failed fetch — keep any previous cache so a transient
-      // JWKS outage doesn't wipe known-good keys, and allow a later retry.
-      return jwksCache.get(teamDomain) ?? map;
+      void res.body?.cancel().catch(() => {});
+      return currentKeys(teamDomain) ?? map;
     }
-    const body = (await res.json()) as { keys?: Jwk[] };
-    for (const jwk of body.keys ?? []) {
-      if (!jwk.kid) continue;
+    const body = await boundedJson(res, MAX_JWKS_RESPONSE_BYTES) as { keys?: Jwk[] } | null;
+    if (!Array.isArray(body?.keys) || body.keys.length > MAX_JWKS_KEYS) return currentKeys(teamDomain) ?? map;
+    for (const jwk of body.keys) {
+      if (!jwk || typeof jwk.kid !== "string" || !jwk.kid || jwk.kty !== "RSA") continue;
       try {
         const key = await crypto.subtle.importKey("jwk", jwk as JsonWebKey, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
         map.set(jwk.kid, key);
@@ -90,21 +99,22 @@ async function getKeys(teamDomain: string, forceRefresh = false): Promise<Map<st
         // skip malformed key
       }
     }
-    jwksCache.set(teamDomain, map);
+    if (!map.size && body.keys.length) return currentKeys(teamDomain) ?? map;
+    jwksCache.set(teamDomain, { keys: map, expiresAt: Date.now() + JWKS_CACHE_TTL_MS });
     return map;
   } catch {
     // Network error (DNS, timeout, reset) or parsing error — fail closed by
     // returning the previous cache (or empty map), never throwing. Allows
     // verifyAccessJwt to maintain its fail-closed invariant: return null,
     // never reject.
-    return jwksCache.get(teamDomain) ?? map;
+    return currentKeys(teamDomain) ?? map;
   }
 }
 
 /** TEST SEAM: seed the JWKS cache for a team domain so verifyAccessJwt can run
  * fully offline (no network). Not used in production paths. */
 export function seedJwks(teamDomain: string, keys: Map<string, CryptoKey>): void {
-  jwksCache.set(teamDomain, keys);
+  jwksCache.set(teamDomain, { keys, expiresAt: Date.now() + JWKS_CACHE_TTL_MS });
 }
 
 /** TEST SEAM: clear the cache between tests. Also clears the W4 forced-refetch
@@ -135,7 +145,7 @@ export async function verifyAccessJwt(token: string | undefined | null, env: Env
   const teamDomain = env.ACCESS_TEAM_DOMAIN?.trim();
   const aud = env.ACCESS_AUD?.trim();
   if (!teamDomain || !aud) return null; // feature off
-  if (!token) return null;
+  if (!token || token.length > MAX_JWT_LENGTH) return null;
 
   const parts = token.split(".");
   if (parts.length !== 3) return null;
@@ -145,11 +155,22 @@ export async function verifyAccessJwt(token: string | undefined | null, env: Env
   const payload = b64urlToJson<AccessPayload>(payloadB64);
   if (!header || !payload) return null;
   if (header.alg !== "RS256") return null;
-  if (!header.kid) return null;
+  if (typeof header.kid !== "string" || !header.kid) return null;
 
-  let keys = await getKeys(teamDomain);
-  let key = keys.get(header.kid);
-  if (!key) {
+  // Reject claims that cannot belong to this application before fetching keys.
+  // The signature still gates every returned identity.
+  const audList = typeof payload.aud === "string" ? [payload.aud] : payload.aud;
+  if (!Array.isArray(audList) || !audList.every(value => typeof value === "string") || !audList.includes(aud)) return null;
+  if (payload.iss !== `https://${teamDomain}`) return null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (typeof payload.exp !== "number" || !Number.isFinite(payload.exp) || payload.exp <= nowSec - SKEW) return null;
+  if (payload.nbf !== undefined && (typeof payload.nbf !== "number" || !Number.isFinite(payload.nbf) || payload.nbf > nowSec + SKEW)) return null;
+  if (payload.iat !== undefined && (typeof payload.iat !== "number" || !Number.isFinite(payload.iat) || payload.iat > nowSec + SKEW)) return null;
+  if (typeof payload.email !== "string" || !payload.email.trim() || typeof payload.sub !== "string" || !payload.sub.trim()) return null;
+
+  const cached = currentKeys(teamDomain);
+  let key = (cached ?? await refreshKeys(teamDomain)).get(header.kid);
+  if (!key && cached) {
     // Cloudflare rotates the Access signing keys; a long-lived isolate's cache
     // can predate the current set, so a kid miss triggers a refetch to recover.
     // W4: gate the refetch behind a per-team-domain cooldown -- a FORGED token
@@ -164,8 +185,7 @@ export async function verifyAccessJwt(token: string | undefined | null, env: Env
     const last = lastForcedRefetch.get(teamDomain) ?? 0;
     if (Date.now() - last > FORCED_REFETCH_COOLDOWN_MS) {
       lastForcedRefetch.set(teamDomain, Date.now());
-      keys = await getKeys(teamDomain, true);
-      key = keys.get(header.kid);
+      key = (await refreshKeys(teamDomain)).get(header.kid);
     }
   }
   if (!key) return null;
@@ -185,19 +205,6 @@ export async function verifyAccessJwt(token: string | undefined | null, env: Env
   }
   if (!ok) return null;
 
-  // aud must include the configured Application Audience tag.
-  const audList = Array.isArray(payload.aud) ? payload.aud : payload.aud != null ? [payload.aud] : [];
-  if (!audList.includes(aud)) return null;
-
-  // iss must be the team domain.
-  if (payload.iss !== `https://${teamDomain}`) return null;
-
-  const nowSec = Math.floor(Date.now() / 1000);
-  if (typeof payload.exp !== "number" || payload.exp <= nowSec - SKEW) return null;
-  if (typeof payload.nbf === "number" && payload.nbf > nowSec + SKEW) return null;
-  if (typeof payload.iat === "number" && payload.iat > nowSec + SKEW) return null;
-
-  if (!payload.email || !payload.sub) return null;
   return { email: payload.email, sub: payload.sub };
 }
 

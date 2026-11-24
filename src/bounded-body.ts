@@ -7,9 +7,9 @@ export class RequestBodyTooLargeError extends Error {
 }
 
 /** Read a body with a byte ceiling, independently of the declared length. */
-export async function boundedBytes(req: Request, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
-  if (Number(req.headers.get('content-length')) > maxBytes) throw new RequestBodyTooLargeError();
-  const reader = req.body?.getReader();
+export async function boundedBytes(source: Request | Response, maxBytes: number): Promise<Uint8Array<ArrayBuffer>> {
+  if (Number(source.headers.get('content-length')) > maxBytes) throw new RequestBodyTooLargeError();
+  const reader = source.body?.getReader();
   if (!reader) return new Uint8Array();
   const chunks: Uint8Array[] = [];
   let size = 0;
@@ -32,6 +32,6 @@ export async function boundedBytes(req: Request, maxBytes: number): Promise<Uint
   return bytes;
 }
 
-export async function boundedJson(req: Request, maxBytes = MAX_REQUEST_BODY_BYTES): Promise<unknown> {
-  return JSON.parse(new TextDecoder().decode(await boundedBytes(req, maxBytes)));
+export async function boundedJson(source: Request | Response, maxBytes = MAX_REQUEST_BODY_BYTES): Promise<unknown> {
+  return JSON.parse(new TextDecoder().decode(await boundedBytes(source, maxBytes)));
 }

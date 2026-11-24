@@ -1,6 +1,4 @@
 // ============================================================================
-// COPY THIS FILE VERBATIM into cf-memory / tasks / search.
-//
 // Replaces the earlier rs-verify.ts (JWT + JWKS). Tokens are opaque now, so a
 // resource server cannot check one by itself — it asks the authorization
 // server. That call goes over a Cloudflare service binding, so it stays inside
@@ -10,6 +8,11 @@
 //   - `auth` is on the request path. If it is down, this server rejects.
 //   - Revocation takes effect on the NEXT request, not at token expiry.
 // ============================================================================
+
+import { boundedJson } from "./bounded-body";
+
+const MAX_INTROSPECTION_RESPONSE_BYTES = 64 * 1024;
+const INTROSPECTION_TIMEOUT_MS = 5_000;
 
 export interface VerifiedToken {
   /** `user:<ULID>` (a person) or `machine:<name>`. Stable — resolve accounts by
@@ -45,6 +48,8 @@ export async function introspectToken(
     res = await config.auth.fetch(
       new Request("https://auth.internal/introspect", {
         method: "POST",
+        redirect: "error",
+        signal: AbortSignal.timeout(INTROSPECTION_TIMEOUT_MS),
         headers: {
           authorization: `Bearer ${config.secret}`,
           "content-type": "application/x-www-form-urlencoded",
@@ -55,11 +60,14 @@ export async function introspectToken(
   } catch {
     return null;
   }
-  if (!res.ok) return null;
+  if (!res.ok) {
+    void res.body?.cancel().catch(() => {});
+    return null;
+  }
 
   let body: unknown;
   try {
-    body = await res.json();
+    body = await boundedJson(res, MAX_INTROSPECTION_RESPONSE_BYTES);
   } catch {
     return null;
   }

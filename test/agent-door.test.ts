@@ -145,6 +145,13 @@ describe("agent door — what introspection says", () => {
     }
   });
 
+  it("refuses introspection documents above the response budget", async () => {
+    const sub = `user:${OWNER_ACCOUNT}`;
+    const body = { active: true, sub, aud: TEST_RESOURCE, scope: "notes:read", email: OWNER_EMAIL, supplemental: "x".repeat(64 * 1024) };
+    const token = await bearerTokenFor({ sub, email: OWNER_EMAIL, respondWith: { status: 200, body } });
+    expect((await get("/api/v1/notes", token)).status).toBe(401);
+  });
+
   it("refuses when introspection fails rather than treating the failure as a pass", async () => {
     // auth is on this server's request path (the accepted SPOF). Down must mean
     // "not authorised", never "let it through".
