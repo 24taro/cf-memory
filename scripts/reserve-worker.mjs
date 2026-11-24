@@ -1,6 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { linkSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 import { unstable_getVarsForDev, unstable_readConfig } from 'wrangler';
 
 function wranglerJson(...args) {
@@ -126,9 +127,11 @@ function existingOrigin(value) {
   throw new Error('--existing-url must be the original HTTPS Worker URL or its /mcp endpoint');
 }
 
-async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
-  const { account, name, domain, region, ownerHandle } = configuredTarget();
+async function workerTarget(bindingFile, existingUrl, requireReady = false) {
+  const target = configuredTarget();
+  const { account, name, domain, region } = target;
   const binding = readBinding(bindingFile);
+  if (requireReady && binding?.phase !== 'ready') throw new Error('token rotation requires a verified deployment from this checkout');
   if (binding && (binding.account !== account || binding.name !== name || binding.domain !== domain)) {
     throw new Error('the selected Cloudflare account or Worker differs from this checkout’s saved deployment');
   }
@@ -140,22 +143,31 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
   const origin = `https://${name}.${subdomain.result.subdomain}${region === 'fedramp_high' ? '.fed' : ''}.workers.dev`;
   if (binding && binding.origin !== origin) throw new Error('the selected Worker URL differs from this checkout’s saved deployment');
   if (existingUrl && existingOrigin(existingUrl) !== origin) throw new Error('the selected Worker URL differs from --existing-url');
+  const existing = await request(`/workers/${name}`);
+  const validWorker = result => result?.name === name && /^[a-f0-9]{32}$/i.test(result.id ?? '');
+  if (binding && existing.ok && existing.success && validWorker(existing.result) && binding.workerId !== existing.result.id) {
+    throw new Error('Cloudflare reports a different Worker identity for the saved name');
+  }
+  return { ...target, binding, origin, request, existing, validWorker };
+}
 
+function readOwnerToken(secretsFile) {
   const saved = readLocalFile(secretsFile);
   const token = saved?.match(/^API_TOKEN=([^\r\n]*)/m)?.[1];
   if (saved !== null && (!token || token.length < 32)) {
     throw new Error(`${secretsFile} holds no API_TOKEN of 32 or more characters`);
   }
+  return token ?? null;
+}
+
+async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
+  const { account, name, domain, ownerHandle, binding, origin, request, existing, validWorker } = await workerTarget(bindingFile, existingUrl);
+  const token = readOwnerToken(secretsFile);
   const record = workerId => ({ version: 1, account, name, domain, origin, workerId, phase: 'pending' });
-  const validWorker = result => result?.name === name && /^[a-f0-9]{32}$/i.test(result.id ?? '');
   const output = (mode, workerId) => ({ mode, account, name, domain, origin, workerId });
-  const existing = await request(`/workers/${name}`);
 
   if (existing.ok && existing.success && validWorker(existing.result)) {
     const worker = existing.result;
-    if (binding && binding.workerId !== worker.id) {
-      throw new Error('Cloudflare reports a different Worker identity for the saved name');
-    }
     const claim = readLocalFile(claimFile);
     const ownsClaim = /^[a-f0-9]{32}$/.test(claim ?? '') && Array.isArray(worker.tags) && worker.tags.includes(`cf-memory-install-${claim}`);
     if (binding?.phase === 'pending' || (!binding && ownsClaim)) {
@@ -183,7 +195,7 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
   }
 
   if (existing.status !== 404 || existing.success !== false) throw new Error('could not verify whether the Worker already exists');
-  if (binding || saved !== null || existingUrl) throw new Error('the original Worker could not be verified; the saved token cannot be used on a new Worker');
+  if (binding || token !== null || existingUrl) throw new Error('the original Worker could not be verified; the saved token cannot be used on a new Worker');
 
   // Cloudflare's create-only request arbitrates across checkouts. Never fall
   // back to an upsert when another checkout claims the name first.
@@ -198,17 +210,71 @@ async function prepareWorker(claimFile, bindingFile, secretsFile, existingUrl) {
   return output('first', created.result.id);
 }
 
+async function rotateToken(bindingFile, secretsFile) {
+  const { account, name, domain, ownerHandle, binding, origin, existing, validWorker } = await workerTarget(bindingFile, '', true);
+  if (!existing.ok || !existing.success || !validWorker(existing.result)) {
+    throw new Error('the original Worker could not be verified; no token was uploaded');
+  }
+  const current = readOwnerToken(secretsFile);
+  const pendingFile = `${secretsFile}.next`;
+  const readPending = () => {
+    const value = readLocalFile(pendingFile);
+    if (value === null) return null;
+    const token = value.match(/^API_TOKEN=([a-f0-9]{64})\n?$/)?.[1];
+    if (!token) throw new Error(`${pendingFile} is not a valid staged rotation token`);
+    return token;
+  };
+  let pending = readPending();
+  if (!pending || !await ownsActiveToken(origin, pending, ownerHandle)) {
+    if (!current || !await ownsActiveToken(origin, current, ownerHandle)) {
+      throw new Error('the original Worker did not accept the saved token or a pending rotation token');
+    }
+    if (!pending) {
+      try {
+        writeFileSync(pendingFile, `API_TOKEN=${randomBytes(32).toString('hex')}\n`, { flag: 'wx', mode: 0o600 });
+      } catch (error) {
+        if (error.code !== 'EEXIST') throw error;
+      }
+      pending = readPending();
+      if (!pending) throw new Error('the staged token changed while rotating');
+    }
+    try {
+      execFileSync(process.execPath, ['node_modules/wrangler/bin/wrangler.js', 'secret', 'put', 'API_TOKEN', '--name', name], {
+        input: pending,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        encoding: 'utf8',
+        env: { ...process.env, CI: 'true', CLOUDFLARE_ACCOUNT_ID: account, CLOUDFLARE_API_BASE_URL: domain },
+        timeout: 90_000,
+      });
+    } catch {
+      throw new Error(`Cloudflare did not confirm the upload. Keep ${pendingFile} and rerun --rotate-token to resume`);
+    }
+    let verified = false;
+    for (let attempt = 0; attempt < 5 && !verified; attempt++) {
+      if (attempt) await delay(2_000);
+      verified = await ownsActiveToken(origin, pending, ownerHandle);
+    }
+    if (!verified) throw new Error(`the Worker has not accepted the staged token. Keep ${pendingFile} and rerun --rotate-token to resume`);
+  }
+  if (readPending() !== pending || readBinding(bindingFile)?.workerId !== binding.workerId) {
+    throw new Error('the local deployment or staged token changed while rotating');
+  }
+  renameSync(pendingFile, secretsFile);
+  return { mode: 'rotated', account, name, domain, origin, workerId: binding.workerId };
+}
+
 try {
   const [command, first, second, third, fourth] = process.argv.slice(2);
   if (command === 'ready') {
     const binding = readBinding(first);
     if (!binding || binding.workerId !== second) throw new Error('the saved deployment identity changed before completion');
     if (binding.phase !== 'ready') writeBinding(first, { ...binding, phase: 'ready' }, true);
-  } else if (command === 'prepare') {
-    const { mode, account, name, domain, origin, workerId } = await prepareWorker(first, second, third, fourth);
+  } else if (command === 'prepare' || command === 'rotate') {
+    const { mode, account, name, domain, origin, workerId } = command === 'prepare'
+      ? await prepareWorker(first, second, third, fourth) : await rotateToken(first, second);
     console.log(`${mode} ${account} ${name} ${domain} ${origin} ${workerId}`);
   } else {
-    throw new Error('expected prepare or ready');
+    throw new Error('expected prepare, ready or rotate');
   }
 } catch (error) {
   console.error(error.message);

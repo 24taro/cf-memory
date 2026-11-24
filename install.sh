@@ -4,6 +4,7 @@
 #   ./install.sh              deploy, then connect Claude Code and Codex if installed
 #   ./install.sh --no-client  deploy only
 #   ./install.sh --existing-url URL  adopt an older checkout at its original Worker URL
+#   ./install.sh --rotate-token      rotate the token on this checkout's verified Worker
 #
 # Safe to run again: it redeploys the same Worker with the same token and
 # applies only the migrations that are not applied yet.
@@ -12,15 +13,17 @@ cd "$(dirname "$0")"
 
 CLIENTS=1
 EXISTING_URL=""
+ROTATE_TOKEN=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --no-client) CLIENTS=0 ;;
+    --rotate-token) ROTATE_TOKEN=1 ;;
     --existing-url)
       [ "$#" -gt 1 ] && [[ -n "$2" && "$2" != --* ]] || { echo "--existing-url requires the original Worker URL" >&2; exit 2; }
       EXISTING_URL=$2
       shift
       ;;
-    -h|--help) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -28,6 +31,10 @@ done
 
 say()  { printf '\n==> %s\n' "$*"; }
 fail() { printf '\nerror: %s\n' "$*" >&2; exit 1; }
+
+if [ "$ROTATE_TOKEN" = 1 ] && [ -n "$EXISTING_URL" ]; then
+  fail "use --existing-url to verify the original installation before running --rotate-token"
+fi
 
 for tool in node npm openssl curl; do
   command -v "$tool" >/dev/null 2>&1 || fail "$tool is required but was not found"
@@ -70,8 +77,12 @@ SECRETS_FILE=".cf-memory.secrets"
 INSTALL_CLAIM=".cf-memory.install-claim"
 DEPLOYMENT_FILE=".cf-memory.deployment.json"
 say "Verifying the Cloudflare account and Worker"
-target=$(CI=true node scripts/reserve-worker.mjs prepare "$INSTALL_CLAIM" "$DEPLOYMENT_FILE" "$SECRETS_FILE" "$EXISTING_URL") ||
-  fail "could not prepare the selected Worker; no token was uploaded"
+if [ "$ROTATE_TOKEN" = 1 ]; then
+  target=$(CI=true node scripts/reserve-worker.mjs rotate "$DEPLOYMENT_FILE" "$SECRETS_FILE") || fail "could not complete token rotation"
+else
+  target=$(CI=true node scripts/reserve-worker.mjs prepare "$INSTALL_CLAIM" "$DEPLOYMENT_FILE" "$SECRETS_FILE" "$EXISTING_URL") ||
+    fail "could not prepare the selected Worker; no token was uploaded"
+fi
 read -r mode account_id worker_name api_url URL worker_id <<< "${target##*$'\n'}"
 [[ "$account_id" =~ ^[[:xdigit:]]{32}$ && "$worker_name" =~ ^[a-z0-9-]+$ &&
    "$worker_id" =~ ^[[:xdigit:]]{32}$ && -n "$api_url" && "$URL" =~ ^https://[a-z0-9.-]+\.workers\.dev$ ]] ||
@@ -84,7 +95,7 @@ if [ "$mode" = first ]; then
     (umask 077; set -C; generated_token=$(openssl rand -hex 32); printf 'API_TOKEN=%s\n' "$generated_token" > "$SECRETS_FILE")
   fi
   set -- --secrets-file "$SECRETS_FILE" "$@"
-elif [ "$mode" != update ]; then
+elif [ "$mode" != update ] && [ "$mode" != rotated ]; then
   fail "could not confirm the deployment mode"
 fi
 chmod 600 "$SECRETS_FILE"
@@ -92,26 +103,28 @@ TOKEN=$(sed -n 's/^API_TOKEN=//p' "$SECRETS_FILE" | head -n 1)
 export -n TOKEN
 [ "${#TOKEN}" -ge 32 ] || fail "$SECRETS_FILE holds no API_TOKEN of 32 or more characters"
 
-say "Deploying the Worker (creates the D1 databases and the R2 bucket on first run)"
-if ! CI=true wrangler deploy "$@" \
+if [ "$mode" != rotated ]; then
+  say "Deploying the Worker (creates the D1 databases and the R2 bucket on first run)"
+  if ! CI=true wrangler deploy "$@" \
     --var "BUILD_GIT_SHA:$(git rev-parse HEAD 2>/dev/null || echo unknown)" \
     --var "BUILD_DATE:$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
-  fail "wrangler deploy failed (see the output above)"
+    fail "wrangler deploy failed (see the output above)"
+  fi
+
+  say "Applying database migrations"
+  CI=true wrangler d1 migrations apply DB --remote
+  CI=true wrangler d1 migrations apply LOGS --remote
+
+  say "Checking $URL"
+  OK=0
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    if printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -q -fsS -m 15 -H @- "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
+    sleep 3
+  done
+  [ "$OK" = 1 ] || fail "the Worker is deployed at $URL but did not accept the token. Run this script again in a minute"
+  node scripts/reserve-worker.mjs ready "$DEPLOYMENT_FILE" "$worker_id"
+  rm -f "$INSTALL_CLAIM"
 fi
-
-say "Applying database migrations"
-CI=true wrangler d1 migrations apply DB --remote
-CI=true wrangler d1 migrations apply LOGS --remote
-
-say "Checking $URL"
-OK=0
-for _ in 1 2 3 4 5 6 7 8 9 10; do
-  if printf 'Authorization: Bearer %s\n' "$TOKEN" | curl -q -fsS -m 15 -H @- "$URL/api/v1/whoami" 2>/dev/null | grep -q '"token_status":"active"'; then OK=1; break; fi
-  sleep 3
-done
-[ "$OK" = 1 ] || fail "the Worker is deployed at $URL but did not accept the token. Run this script again in a minute"
-node scripts/reserve-worker.mjs ready "$DEPLOYMENT_FILE" "$worker_id"
-rm -f "$INSTALL_CLAIM"
 echo "The server accepts your token."
 
 CONNECTED=""

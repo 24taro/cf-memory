@@ -73,10 +73,11 @@ interface InstallFixtureOptions {
   dotEnv?: string;
   bindingPhase?: string;
   tokenAccepted?: boolean;
+  rotation?: 'start' | 'resume' | 'upload-fails';
   existingUrl?: string;
 }
 
-function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, existingUrl = worker === 'present' && savedToken && !bindingPhase ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
+function installFixture({ worker = 'present', reservation = 'created', savedToken = true, clients = false, dotEnv = '', bindingPhase = '', tokenAccepted = true, rotation, existingUrl = worker === 'present' && savedToken && !bindingPhase && !rotation ? 'https://cf-memory.test.workers.dev' : '' }: InstallFixtureOptions = {}) {
   const root = mkdtempSync(join(tmpdir(), 'cf-memory-install-'));
   try {
     const bin = join(root, 'bin');
@@ -88,10 +89,17 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     symlinkSync(resolve('cf-memory-agent'), join(root, 'cf-memory-agent'), 'dir');
     symlinkSync(process.execPath, join(bin, 'node'));
     const tokenFile = join(root, '.cf-memory.secrets');
+    const stagedTokenFile = `${tokenFile}.next`;
+    const remoteTokenFile = join(root, 'remote-fixture-token');
+    const originalToken = 'x'.repeat(32);
     const claimFile = join(root, '.cf-memory.install-claim');
     const bindingFile = join(root, '.cf-memory.deployment.json');
     if (dotEnv) writeFileSync(join(root, '.env'), dotEnv);
-    if (savedToken) writeFileSync(tokenFile, `API_TOKEN=${'x'.repeat(32)}\n`, { mode: 0o600 });
+    if (savedToken) writeFileSync(tokenFile, `API_TOKEN=${originalToken}\n`, { mode: 0o600 });
+    if (rotation === 'resume') {
+      writeFileSync(stagedTokenFile, `API_TOKEN=${'f'.repeat(64)}\n`, { mode: 0o600 });
+      writeFileSync(remoteTokenFile, 'f'.repeat(64), { mode: 0o600 });
+    }
     if (reservation === 'resume' || reservation === 'deployed') writeFileSync(claimFile, 'a'.repeat(32), { mode: 0o600 });
     if (bindingPhase) writeFileSync(bindingFile, JSON.stringify({
       version: 1, phase: bindingPhase, account: 'a'.repeat(32), name: 'cf-memory', workerId: 'c'.repeat(32),
@@ -118,10 +126,17 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
           'deployment-target', process.env.CLOUDFLARE_ACCOUNT_ID, process.env.CLOUDFLARE_API_BASE_URL,
         ]) + '\\n');
       }
+      if (args[0] === 'secret' && args[1] === 'put') {
+        if (process.env.ROTATION === 'upload-fails') process.exit(42);
+        require('node:fs').writeFileSync(process.env.REMOTE_TOKEN_FILE, require('node:fs').readFileSync(0, 'utf8'));
+        require('node:fs').appendFileSync(process.env.TRACE, JSON.stringify([
+          'rotation-target', process.env.CLOUDFLARE_ACCOUNT_ID, process.env.CLOUDFLARE_API_BASE_URL,
+        ]) + '\\n');
+      }
     `);
     const fetchMock = join(root, 'mock-cloudflare.mjs');
     writeFileSync(fetchMock, `
-      import { appendFileSync } from 'node:fs';
+      import { appendFileSync, existsSync, readFileSync } from 'node:fs';
       globalThis.fetch = async (url, options) => {
         const method = options.method ?? 'GET';
         const path = new URL(url).pathname;
@@ -129,7 +144,9 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
         const state = process.env.RESERVATION;
         const worker = { id: 'c'.repeat(32), name: 'cf-memory' };
         if (path === '/api/v1/whoami') {
-          return process.env.TOKEN_ACCEPTED === 'true'
+          const rotated = existsSync(process.env.REMOTE_TOKEN_FILE) ? readFileSync(process.env.REMOTE_TOKEN_FILE, 'utf8') : null;
+          const accepted = process.env.ROTATION ? options.headers.authorization === 'Bearer ' + (rotated || 'x'.repeat(32)) && (rotated || process.env.TOKEN_ACCEPTED === 'true') : process.env.TOKEN_ACCEPTED === 'true';
+          return accepted
             ? Response.json({ token_status: 'active', handle: 'owner', scopes: ['admin'] })
             : Response.json({ error: 'unauthorized' }, { status: 401 });
         }
@@ -155,20 +172,24 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     stub('curl', `cat >/dev/null\nprintf '%s\\n' '{"token_status":"active"}'`);
     stub('codex', 'exit 0');
     stub('claude', `case "$1 $2" in\n  "--version ") echo '2.1.327 (Claude Code)' ;;\n  'mcp add-json') node -e 'require("node:fs").writeFileSync(process.env.HOME + "/.claude.json", JSON.stringify({mcpServers:{"cf-memory":JSON.parse(require("node:fs").readFileSync(0,"utf8"))}}))' ;;\n  *) exit 1 ;;\nesac`);
-    const args = ['install.sh', ...(clients ? [] : ['--no-client']), ...(existingUrl ? ['--existing-url', existingUrl] : [])];
+    const args = ['install.sh', ...(clients ? [] : ['--no-client']), ...(rotation ? ['--rotate-token'] : []), ...(existingUrl ? ['--existing-url', existingUrl] : [])];
     const result = spawnSync('/bin/bash', args, {
       cwd: root,
       encoding: 'utf8',
       env: {
         HOME: root, CODEX_HOME: join(root, '.codex'), PATH: `${bin}:/usr/bin:/bin`,
         WORKER: worker, TRACE: trace, RESERVATION: reservation, NODE_OPTIONS: `--import=${fetchMock}`, TOKEN_ACCEPTED: String(tokenAccepted),
+        ROTATION: rotation ?? '', REMOTE_TOKEN_FILE: remoteTokenFile,
       },
     });
     const calls = readFileSync(trace, 'utf8').trim().split('\n').map(line => JSON.parse(line) as string[]);
     const deploy = calls.find(args => args[0] === 'deploy');
     const hooks = join(root, '.codex', 'hooks.json');
+    const localToken = existsSync(tokenFile) ? readFileSync(tokenFile, 'utf8') : '';
     return {
       result, calls, deploy, tokenExists: existsSync(tokenFile), claimExists: existsSync(claimFile),
+      staged: existsSync(stagedTokenFile), keptOriginalToken: localToken === `API_TOKEN=${originalToken}\n`,
+      savedVerifiedToken: existsSync(remoteTokenFile) && localToken === `API_TOKEN=${readFileSync(remoteTokenFile, 'utf8')}\n`,
       binding: existsSync(bindingFile) ? JSON.parse(readFileSync(bindingFile, 'utf8')) : null,
       codex: existsSync(hooks) ? readFileSync(hooks, 'utf8') : '',
     };
@@ -176,6 +197,45 @@ function installFixture({ worker = 'present', reservation = 'created', savedToke
     rmSync(root, { recursive: true, force: true });
   }
 }
+
+it('rotates the token only at the bound Worker and keeps the deployment settings and migrations untouched', () => {
+  const f = installFixture({ bindingPhase: 'ready', rotation: 'start' });
+  expect(f.result.status, f.result.stderr).toBe(0);
+  expect(f.calls).toContainEqual(['secret', 'put', 'API_TOKEN', '--name', 'cf-memory']);
+  expect(f.calls).toContainEqual(['rotation-target', 'a'.repeat(32), 'https://api.cloudflare.com/client/v4']);
+  expect(f.calls.some(args => args[0] === 'deploy' || args[0] === 'd1')).toBe(false);
+  expect(f.savedVerifiedToken).toBe(true);
+  expect(f.staged).toBe(false);
+});
+
+it('promotes a previously staged token already accepted by the original Worker', () => {
+  const f = installFixture({ bindingPhase: 'ready', rotation: 'resume' });
+  expect(f.result.status, f.result.stderr).toBe(0);
+  expect(f.calls.some(args => args[0] === 'secret')).toBe(false);
+  expect(f.savedVerifiedToken).toBe(true);
+  expect(f.staged).toBe(false);
+});
+
+it('leaves the original token and staged retry in place when Cloudflare cannot confirm the upload', () => {
+  const f = installFixture({ bindingPhase: 'ready', rotation: 'upload-fails' });
+  expect(f.result.status).toBe(1);
+  expect(f.result.stderr).toContain('rerun --rotate-token to resume');
+  expect(f.keptOriginalToken).toBe(true);
+  expect(f.staged).toBe(true);
+});
+
+it('checks the saved deployment and credential before making a rotation', () => {
+  for (const f of [
+    installFixture({ rotation: 'start' }),
+    installFixture({ bindingPhase: 'ready', rotation: 'start', dotEnv: `CLOUDFLARE_ACCOUNT_ID=${'b'.repeat(32)}\n` }),
+    installFixture({ bindingPhase: 'ready', rotation: 'start', tokenAccepted: false }),
+  ]) {
+    expect(f.result.status).toBe(1);
+    expect(f.calls.some(args => args[0] === 'secret')).toBe(false);
+    expect(f.keptOriginalToken).toBe(true);
+    expect(f.staged).toBe(false);
+  }
+});
 
 it('reports Claude hook failure separately and still sets up Codex', () => {
   const { result, codex } = installFixture({ clients: true });

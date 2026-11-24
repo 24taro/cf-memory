@@ -12,20 +12,18 @@ secret, is the owner with every scope. Anyone who has the token can read and
 write everything in the instance. It is compared in constant time, and a token
 shorter than 32 characters is refused.
 
-To rotate it, select the original Cloudflare account. After the new token is
-uploaded the old one stops working, so refresh the connected clients:
+Run the following command from the checkout that installed or adopted the
+Worker. It verifies the saved Cloudflare account, Worker identity and URL
+before uploading the new token.
 
 ```bash
-(umask 077; set -C; token=$(openssl rand -hex 32) &&
-  printf 'API_TOKEN=%s\n' "$token" > .cf-memory.secrets.next) &&
-  sed -n 's/^API_TOKEN=//p' .cf-memory.secrets.next | npx wrangler secret put API_TOKEN &&
-  mv .cf-memory.secrets.next .cf-memory.secrets &&
-  ./install.sh
+./install.sh --rotate-token
 ```
 
-Restart the clients. If you use the standalone CLI, provide the new token on
-standard input to `login --key-stdin`. Give it an explicit new token when the
-server origin changes.
+If the command is interrupted, keep `.cf-memory.secrets.next` and repeat the
+same command to resume. The new token replaces the saved one after the Worker
+accepts it. Restart the clients and reload the Codex environment. For the
+standalone CLI, provide the new token on standard input to `login --key-stdin`.
 
 **What leaves your machine.** The hook plugin sends prompts, final replies, one
 line per tool action and the head of failed output to your Worker, and nowhere
