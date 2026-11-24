@@ -399,9 +399,15 @@ export class CaptureService {
       return { client_id: row.client_id, updated_at: row.updated_at, status, state };
     });
   }
-  async prune() {
-    // Bounded deletion avoids unbounded maintenance work on a request.
-    const r = await this.db.prepare('DELETE FROM capture_events WHERE rowid IN (SELECT rowid FROM capture_events WHERE expires_at<? LIMIT 500)').bind(Date.now()).run();
-    return r.meta.changes;
+  async prune(cutoff = Date.now(), maxBatches = 1) {
+    const batchSize = 500;
+    const statement = this.db.prepare('DELETE FROM capture_events WHERE rowid IN (SELECT rowid FROM capture_events WHERE expires_at<=? ORDER BY expires_at LIMIT ?)').bind(cutoff, batchSize);
+    let removed = 0;
+    for (let batch = 0; batch < maxBatches; batch++) {
+      const { meta } = await statement.run();
+      removed += meta.changes;
+      if (meta.changes < batchSize) break;
+    }
+    return removed;
   }
 }

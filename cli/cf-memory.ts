@@ -2,7 +2,7 @@
 // cf-memory CLI — the third door over the same store. Thin wrapper over the REST
 // API. Run: `node --experimental-strip-types cli/cf-memory.ts <cmd> …`
 import type { Dirent } from "node:fs";
-import { readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, chmodSync, renameSync, rmSync, statSync, lstatSync, realpathSync, readlinkSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, readFileSync, writeFileSync, mkdirSync, readdirSync, existsSync, chmodSync, renameSync, rmSync, statSync, lstatSync, realpathSync, readlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { execSync } from "node:child_process";
@@ -247,9 +247,8 @@ function parseFrontmatterValue(raw: string, json: boolean): string {
 }
 
 // A server-supplied relative path (note slug, skill slug, bundle file path)
-// resolved under `base`, or an error: absolute paths, backslashes, drive
-// prefixes and anything that normalises to `base` itself or outside it are
-// refused, so a response can only ever write below the directory the user named.
+// Resolve a server-supplied name lexically. The filesystem checks below also
+// verify each existing component before opening or replacing a file.
 // `flat` additionally requires a direct child (a single path segment).
 function confinedPath(base: string, rel: unknown, what: string, flat = false): string {
   const root = resolve(base);
@@ -260,6 +259,69 @@ function confinedPath(base: string, rel: unknown, what: string, flat = false): s
   if (!within || within === ".." || within.startsWith(`..${sep}`) || isAbsolute(within)) throw unsafe();
   if (flat && dirname(target) !== root) throw unsafe();
   return target;
+}
+
+function checkDirectories(root: string, directory: string, create: boolean): void {
+  let current = root;
+  for (const component of relative(root, directory).split(sep).filter(Boolean)) {
+    current = join(current, component);
+    if (!lstatSync(current, { throwIfNoEntry: false })) {
+      if (!create) return;
+      try { mkdirSync(current); } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+    }
+    if (!lstatSync(current).isDirectory()) throw new Error(`expected a real directory: ${current}`);
+  }
+}
+
+function transferRoot(dir: string, create: boolean): string {
+  const absolute = resolve(dir);
+  const cwd = realpathSync(process.cwd());
+  const fromCwd = relative(cwd, absolute);
+  if (!isAbsolute(fromCwd) && fromCwd !== ".." && !fromCwd.startsWith(`..${sep}`)) {
+    checkDirectories(cwd, absolute, create);
+    return absolute;
+  }
+  // The operator chose a destination outside this checkout. Resolve its
+  // parent so ordinary system aliases such as macOS /tmp keep working.
+  const parent = dirname(absolute);
+  if (create) mkdirSync(parent, { recursive: true });
+  const anchor = realpathSync(parent);
+  const target = join(anchor, relative(parent, absolute));
+  checkDirectories(anchor, target, create);
+  return target;
+}
+
+function checkOutputFile(root: string, target: string, createParents = false) {
+  checkDirectories(root, dirname(target), createParents);
+  const existing = lstatSync(target, { throwIfNoEntry: false });
+  if (existing && !existing.isFile()) throw new Error(`expected a regular output file: ${target}`);
+  return existing;
+}
+
+function writeTransferFile(root: string, target: string, contents: string): void {
+  const existing = checkOutputFile(root, target, true);
+  const temporary = join(dirname(target), `.cf-memory-${randomUUID()}.tmp`);
+  try {
+    writeFileSync(temporary, contents, { flag: "wx", mode: existing ? existing.mode & 0o777 : 0o666 });
+    if (existing) chmodSync(temporary, existing.mode & 0o777);
+    // Rename replaces the directory entry instead of writing through a link.
+    renameSync(temporary, target);
+  } finally {
+    rmSync(temporary, { force: true });
+  }
+}
+
+function readTransferFile(root: string, target: string): string {
+  if (!checkOutputFile(root, target)) throw new Error(`file disappeared: ${target}`);
+  const file = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    if (!fstatSync(file).isFile()) throw new Error(`expected a regular input file: ${target}`);
+    return readFileSync(file, "utf8");
+  } finally {
+    closeSync(file);
+  }
 }
 
 // Minimal leading `---` frontmatter split, matching the `.md` twin the server
@@ -490,14 +552,15 @@ async function main() {
       const r = await api(cfg, "GET", `/api/v1/@${h}/skills/${encodeURIComponent(slug)}/install`);
       // The bundle's slug and file paths are the server's (and the skill author's)
       // text: resolve every one inside the skills dir BEFORE writing anything.
-      const dir = confinedPath(flags.dir ?? join(".claude", "skills"), r.bundle.slug, "skill slug", true);
+      const root = transferRoot(flags.dir ?? join(".claude", "skills"), true);
+      const dir = confinedPath(root, r.bundle.slug, "skill slug", true);
       const targets: string[] = r.bundle.files.map((f: { path: unknown }) => confinedPath(dir, f.path, "bundle file path"));
-      mkdirSync(dir, { recursive: true });
+      for (const target of targets) checkOutputFile(root, target);
+      checkDirectories(root, dir, true);
       let skipped = 0;
       r.bundle.files.forEach((f: { content?: unknown }, i: number) => {
         if (typeof f.content !== "string") return void skipped++; // url-only entry (large/binary bundle file): CLI fetch-materialization is a deferred follow-up
-        mkdirSync(dirname(targets[i]), { recursive: true }); // f.path may include scripts/ references/ assets/ subdirs
-        writeFileSync(targets[i], f.content);
+        writeTransferFile(root, targets[i], f.content);
       });
       console.log(`installed ${r.bundle.name} v${r.bundle.version} → ${dir}/${skipped ? ` (${skipped} large/binary file(s) not materialized — fetch each via its url)` : ""}`);
       break;
@@ -517,7 +580,7 @@ async function main() {
       break;
     }
     case "push": {
-      const dir = _[0] ?? ".";
+      const dir = transferRoot(_[0] ?? ".", false);
       // Top-level `<dir>/<leaf>.md` only, as before. `--namespaces` also sends one
       // namespace level, `<dir>/<ns>/<leaf>.md` (what `pull` writes for an ns/leaf
       // slug): opt-in, because a directory's sub-folders are often not notes at all.
@@ -525,9 +588,9 @@ async function main() {
       // never descended into; a sub-folder that cannot be listed is skipped.
       const files: string[] = [];
       for (const e of readdirSync(dir, { withFileTypes: true })) {
-        if (!e.isDirectory()) {
+        if (e.isFile()) {
           if (e.name.endsWith(".md")) files.push(e.name);
-        } else if (flags.namespaces && !e.name.startsWith(".") && e.name !== "node_modules") {
+        } else if (e.isDirectory() && flags.namespaces && !e.name.startsWith(".") && e.name !== "node_modules") {
           let leaves: Dirent[];
           try {
             leaves = readdirSync(join(dir, e.name), { withFileTypes: true });
@@ -536,13 +599,13 @@ async function main() {
             continue;
           }
           for (const leaf of leaves) {
-            if (!leaf.isDirectory() && leaf.name.endsWith(".md")) files.push(`${e.name}/${leaf.name}`);
+            if (leaf.isFile() && leaf.name.endsWith(".md")) files.push(`${e.name}/${leaf.name}`);
           }
         }
       }
       for (const f of files) {
         const slug = f.replace(/\.md$/, "");
-        const { data, body } = splitFrontmatter(readFileSync(join(dir, f), "utf8"));
+        const { data, body } = splitFrontmatter(readTransferFile(dir, join(dir, f)));
         // #117: `--global` omits scope; else `--scope`, then any frontmatter `scope:`, then git-derived.
         const scope = flags.global ? undefined : flags.scope ?? data.scope ?? resolveScope();
         await api(cfg, "POST", "/api/v1/notes", { slug, title: data.title ?? slug, body_md: body, scope });
@@ -551,19 +614,18 @@ async function main() {
       break;
     }
     case "pull": {
-      const dir = _[0] ?? "garden";
-      mkdirSync(dir, { recursive: true });
+      const dir = transferRoot(_[0] ?? "garden", true);
       const r = await api(cfg, "GET", "/api/v1/notes?limit=200");
       // Slugs are the server's text: refuse the whole listing before writing if any would land outside `dir`.
       const targets: string[] = r.notes.map((n: { slug: unknown }) => `${confinedPath(dir, n.slug, "note slug")}.md`);
+      for (const target of targets) checkOutputFile(dir, target);
       for (const [i, n] of r.notes.entries()) {
         // A namespaced slug (`ns/leaf`) is requested segment by segment, the shape of the server's /n/:ns/:slug route.
         const note = await api(cfg, "GET", `/api/v1/@${cfg.handle}/n/${String(n.slug).split("/").map(encodeURIComponent).join("/")}`);
         // Mirror the server's `.md` twin frontmatter so a later `push` round-trips
         // title instead of resetting it to slug.
         const fm = frontmatterBlock({ title: note.title ?? n.slug, stage: note.stage ?? "seedling" });
-        mkdirSync(dirname(targets[i]), { recursive: true }); // `ns/leaf` → <dir>/ns/ (the target is already confined to <dir>)
-        writeFileSync(targets[i], `${fm}${note.body_md ?? ""}\n`);
+        writeTransferFile(dir, targets[i], `${fm}${note.body_md ?? ""}\n`);
       }
       console.log(`pulled ${r.notes.length} notes → ${dir}/`);
       break;

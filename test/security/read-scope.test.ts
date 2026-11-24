@@ -383,7 +383,8 @@ const HEX = "ab".repeat(32);
 const TITLE = "PROBE-TITLE-7f3a";
 const TEAM_TITLE = "PROBE-TEAMTITLE-7f3a";
 const TEAM_BODY = "PROBE-TEAMBODY-7f3a";
-const STORED = [BODY, BLOCK, SKILL, FILE, TITLE, TEAM_TITLE, TEAM_BODY];
+const SKILL_NAME = "PROBE-SKILL-NAME-7f3a";
+const STORED = [BODY, BLOCK, SKILL, FILE, TITLE, TEAM_TITLE, TEAM_BODY, SKILL_NAME];
 const BOGUS_GUARD = { id: "x", content_hash: "x", scope: "global", shared: false, updated_at: 0, provenance_count: 0 };
 const PROV = { source_event_ids: [HEX], generated_by: "probe", confidence: 0.5, rationale: "probe" };
 
@@ -449,6 +450,7 @@ describe("write-scoped operations return no stored content without notes:read", 
     const bob = await bearerTokenFor({ sub: `user:${BOB.account}`, aud: TEST_RESOURCE, scopes: "notes:read notes:write", email: BOB.email });
     expect((await post("/api/v1/notes", bob, { slug: "team-probe", title: TEAM_TITLE, body_md: TEAM_BODY, type: "project" })).status).toBeLessThan(300);
     expect((await post("/api/v1/notes", full, { slug: "titled-probe", title: TITLE, body_md: "a stored title" })).status).toBeLessThan(300);
+    expect((await post("/api/v1/skills", full, { slug: "alice-skill", name: SKILL_NAME })).status).toBeLessThan(300);
     expect((await mcp(full, "memory_set", { label: "probe", value: BLOCK })).isError).toBe(false);
   };
 

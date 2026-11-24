@@ -637,7 +637,7 @@ describe("cli/cf-memory.ts: server-supplied paths stay inside the target directo
     } finally { await srv.close(); }
   });
 
-  it("push --namespaces descends exactly one namespace level and skips dot-directories, node_modules, symlinked directories and non-.md files", async () => {
+  it("push --namespaces descends one level and sends regular Markdown files only", async () => {
     const s = scratch("push-walk"), srv = await stub();
     try {
       const garden = join(s.work, "garden"), outside = join(s.dir, "outside");
@@ -646,10 +646,33 @@ describe("cli/cf-memory.ts: server-supplied paths stay inside the target directo
       writeFileSync(join(outside, "secret.md"), "outside\n");
       symlinkSync(outside, join(garden, "linked"));
       for (const f of ["top.md", "ns/leaf.md", "ns/notes.txt", "ns/deep/too-deep.md", ".git/HEAD.md", ".obsidian/x.md", "node_modules/README.md", "node_modules/pkg/README.md", ".hidden.md"]) writeFileSync(join(garden, f), "body\n");
+      symlinkSync("top.md", join(garden, "top-alias.md"));
+      symlinkSync("leaf.md", join(garden, "ns", "leaf-alias.md"));
       const push = await runCli(["push", garden, "--global", "--namespaces"], { env: serverEnv(s, srv), cwd: s.work });
       expect(push.code).toBe(0);
       const slugs = srv.requests.filter((r) => r.method === "POST").map((r) => JSON.parse(r.raw).slug).sort();
       expect(slugs).toEqual([".hidden", "ns/leaf", "top"]); // `.hidden.md` at the top level was pushed before too
+    } finally { await srv.close(); }
+  });
+
+  it("pull replaces an ordinary file and refuses an existing Markdown alias", async () => {
+    const s = scratch("pull-alias"), srv = await stub({ notes: [{ slug: "note", title: "T", body_md: "new text" }] });
+    try {
+      const garden = join(s.work, "garden");
+      mkdirSync(garden);
+      const original = join(garden, "original.md"), destination = join(garden, "note.md");
+      writeFileSync(original, "original text");
+      writeFileSync(destination, "earlier note");
+      const options = { env: serverEnv(s, srv), cwd: s.work };
+      expect((await runCli(["pull", garden], options)).code).toBe(0);
+      expect(readFileSync(destination, "utf8")).toContain("new text");
+
+      rmSync(destination);
+      symlinkSync("original.md", destination);
+      const refused = await runCli(["pull", garden], options);
+      expect(refused.code).not.toBe(0);
+      expect(refused.stderr).toContain("expected a regular output file");
+      expect(readFileSync(original, "utf8")).toBe("original text");
     } finally { await srv.close(); }
   });
 

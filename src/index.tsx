@@ -13,13 +13,14 @@ import { searchFilters, SearchInputError, standaloneSearch } from "./search";
 import { atomFeed, buildPrompt, changesMd, networkMd, noteMd, profileMd, rankingMd, type GraphData } from "./serialize";
 import { blockWriteResult, ensureOwner, getUserByHandle, getUserById, makeServices, resolvePrincipal, serverStatus, type Services, type UserRow } from "./services";
 import { attachmentDisposition, BundleQuotaError, BundlesUnconfiguredError, MAX_BUNDLE_FILE_BYTES, resolveServeContentType, validateBundlePath } from "./bundle";
+import { boundedBytes, MAX_REQUEST_BODY_BYTES, RequestBodyTooLargeError } from "./bounded-body";
 import { SkillsRepo, type SkillInput, type SkillRow } from "./skills";
 import { slugify, slugifyPath } from "./slug";
 import type { Env, Principal } from "./types";
 import { isReadable, readableSqlFor } from "./visibility";
 import { pruneLogs, logSettings } from './logs';
 import { Layout } from "./web/layout";
-import { CaptureInputError } from './capture';
+import { CaptureInputError, CaptureService } from './capture';
 import { AgentHealthPage, CaptureEventPage, CapturePage, CaptureSessionPage, CaptureSessionsPage, ProvenancePage } from './web/agent-pages';
 import { type ActivityRow, ActivityPage, ChangesPage, EditPage, HomePage, MemoryPage, MissingNotePage, NetworkPage, NotePage, PreviewPage, ProfilePage, RankingPage, SearchPage, SkillEditPage, SkillPage, SkillsListPage } from "./web/pages";
 import { toRecallSections } from "./web/recall-sections";
@@ -218,6 +219,16 @@ app.use("*", async (c, next) => {
   return requireRead(c) ?? next();
 });
 
+// MCP parses its own bounded JSON and bundle PUT has a smaller byte limit after
+// its ownership check. Bound the other body-consuming routes before Hono parses.
+app.use("*", async (c, next) => {
+  const request = c.req.raw;
+  if (c.req.path !== "/mcp" && request.body && CSRF_GUARDED_METHODS.has(request.method) && request.method !== "PUT") {
+    c.req.raw = new Request(request, { body: await boundedBytes(request, MAX_REQUEST_BODY_BYTES) });
+  }
+  return next();
+});
+
 /** Canonical resource URI of this instance == the `aud` every access token must
  * carry. Unset, it is this request's own origin: an advertisement can never
  * name another deployment. (Token validation never uses this fallback — it
@@ -260,6 +271,7 @@ app.get("/.well-known/oauth-protected-resource/mcp", (c) => {
 // retry the write. (The MCP door already wraps tool errors into a structured,
 // retryable toolError, so this only shapes the REST/web responses.)
 app.onError((err, c) => {
+  if (err instanceof RequestBodyTooLargeError) return c.json({ error: err.message }, 413);
   if (err instanceof StaleUpsertError) {
     return c.json({ error: "conflict", message: "write conflict under concurrent updates; retry the request" }, 409, { "Retry-After": "1" });
   }
@@ -1161,7 +1173,8 @@ api.post("/skills", async (c) => {
   if (forbidden) return forbidden;
   const b = await c.req.json<SkillInput>();
   const { skill, created } = await c.var.services.skills.upsert(c.var.principal, b);
-  return c.json({ id: skill.id, slug: skill.slug, name: skill.name, version: skill.version, created }, created ? 201 : 200);
+  const { principal } = c.var;
+  return c.json({ id: skill.id, slug: skill.slug, ...(allows(principal, "notes:read") ? { name: skill.name } : {}), version: skill.version, created }, created ? 201 : 200);
 });
 
 // issue #36: soft-delete, own-skill only (mirrors DELETE /notes/:id). Slug-
@@ -1212,8 +1225,7 @@ api.get(`/:h{@[^/]+}/skills/:slug/install`, async (c) => {
 
 // Bundle file upload/delete (phase 2b). ID-keyed, so requireWrite() (scope only)
 // is insufficient — additionally hard-check owner (404, not 403, for a readable-
-// but-not-owned or deleted skill). Per-file size enforced twice: a fast
-// Content-Length pre-check AND a post-read byteLength (Content-Length is spoofable).
+// but-not-owned or deleted skill). Count received bytes before buffering a file.
 api.put(`/skills/:id/files/:path{.+}`, async (c) => {
   const forbidden = requireWrite(c);
   if (forbidden) return forbidden;
@@ -1223,14 +1235,12 @@ api.put(`/skills/:id/files/:path{.+}`, async (c) => {
   if (!skill || skill.user_id !== principal.userId || skill.deleted_at) return c.json({ error: "not found" }, 404);
   const path = validateBundlePath(c.req.param("path"));
   if (!path) return c.json({ error: "invalid path" }, 400);
-  const cl = Number(c.req.header("content-length"));
-  if (Number.isFinite(cl) && cl > MAX_BUNDLE_FILE_BYTES) return c.json({ error: "file too large" }, 413);
-  const bytes = new Uint8Array(await c.req.arrayBuffer());
-  if (bytes.byteLength > MAX_BUNDLE_FILE_BYTES) return c.json({ error: "file too large" }, 413);
   try {
+    const bytes = await boundedBytes(c.req.raw, MAX_BUNDLE_FILE_BYTES);
     const row = await services.skills.putFile(principal, skill, path, bytes, c.req.header("content-type") ?? null);
     return c.json({ ok: true, path: row.path, size: row.size, sha256: row.sha256, content_type: row.content_type });
   } catch (e) {
+    if (e instanceof RequestBodyTooLargeError) return c.json({ error: "file too large" }, 413);
     if (e instanceof BundleQuotaError) return c.json({ error: "bundle quota exceeded", reason: e.reason }, 413);
     if (e instanceof BundlesUnconfiguredError) return c.json({ error: "bundle files not enabled" }, 501);
     throw e;
@@ -1553,10 +1563,14 @@ app.all("/mcp", async (c) => {
 });
 
 export default Object.assign(app, {
-  /** Daily maintenance (cron `0 18 * * *` = 03:00 JST): delete `action` and
-   * `error` rows past LOG_ACTION_RETENTION_DAYS and old `log_daily` rows, in
-   * bounded batches for at most ~20 s. Whatever is left resumes the next day. */
+  /** Daily maintenance deletes expired Capture originals, orphaned attachments,
+   * and old operation logs in bounded batches. */
   async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext) {
+    if (env.DB) {
+      ctx.waitUntil(new CaptureService(env.DB).prune(controller.scheduledTime, 20).then(removed => {
+        if (removed) console.info(JSON.stringify({ event: 'cf_memory_capture_prune', removed }));
+      }).catch(() => console.error('[capture] prune failed; retries next run')));
+    }
     if (env.BUNDLES) {
       ctx.waitUntil(new SkillsRepo(env.DB, env.BUNDLES).sweepBundleFiles(controller.scheduledTime).then(removed => {
         if (removed) console.info(JSON.stringify({ event: 'cf_memory_bundle_sweep', removed }));

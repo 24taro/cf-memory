@@ -4,6 +4,8 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
 import { makeServices } from '../src/services';
 import { handleMcp } from '../src/mcp';
+import worker from '../src/index';
+import type { Env } from '../src/types';
 import { principalFixture } from './helpers';
 import { boundToolPayload, redactPayload } from '../cf-memory-agent/scripts/redact.mjs';
 const alice = principalFixture({ userId: 'alice', handle: 'alice', scopes: new Set(['notes:read', 'notes:write']) });
@@ -196,7 +198,12 @@ describe('capture: short-lived private originals, durable provenance', () => {
   it('expired raw sources disappear while provenance survives', async () => {
     await db.prepare('UPDATE capture_events SET expires_at=0 WHERE user_id=?').bind('alice').run();
     expect((await services.capture.timeline(alice, { anchor_event_id: eid(5) })).found).toBe(false);
-    await services.capture.prune();
+    const pending: Promise<unknown>[] = [];
+    const ctx = { waitUntil: (task: Promise<unknown>) => { pending.push(task); } } as ExecutionContext;
+    await worker.scheduled({ scheduledTime: Date.now() } as ScheduledController, { DB: db } as Env, ctx);
+    await Promise.all(pending);
+    expect(await db.prepare('SELECT count(*) AS n FROM capture_events WHERE user_id=?').bind(alice.userId).first('n')).toBe(0);
+    expect(await db.prepare('SELECT count(*) AS n FROM capture_events WHERE user_id=?').bind(bob.userId).first('n')).toBeGreaterThan(0);
     expect((await db.prepare('SELECT count(*) AS n FROM memory_provenance').first<{ n: number }>())?.n).toBe(1);
   });
   it('health isolates clients and version verifies migration readiness', async () => {

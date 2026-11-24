@@ -823,7 +823,7 @@ const TOOLS: ToolDef[] = [
         version: typeof args.version === "string" ? args.version : undefined,
         scope: typeof args.scope === "string" ? args.scope : undefined,
       }, creationProvenance(args, ctx, 'skill'));
-      return { id: skill.id, slug: skill.slug, name: skill.name, version: skill.version, created, ...(args.provenance !== undefined ? { provenance_stored: true } : {}) };
+      return { id: skill.id, slug: skill.slug, ...(allows(ctx.principal, "notes:read") ? { name: skill.name } : {}), version: skill.version, created, ...(args.provenance !== undefined ? { provenance_stored: true } : {}) };
     },
   },
   {
@@ -867,15 +867,16 @@ const TOOLS: ToolDef[] = [
       const row = await ctx.services.skills.getFileRow(s.id, path); // manifest only — check size before fetching bytes
       if (!row) return { found: false, reason: "no such file" };
       const meta = { found: true as const, path, content_type: row.content_type, size: row.size, sha256: row.sha256 };
-      if ((row.size ?? 0) > 256 * 1024) {
+      const maxInlineBytes = 256 * 1024;
+      if ((row.size ?? 0) > maxInlineBytes) {
         const handle = await ctx.services.skills.ownerHandle(s.user_id);
         return { ...meta, too_large: true, url: `/@${handle}/skills/${s.slug}/files/${encodeBundlePath(path)}` }; // no R2 read for a large file
       }
-      const f = await ctx.services.skills.getFile(s.id, path);
-      if (!f) return { found: false, reason: "no such file" }; // manifest/object drift
+      const bytes = await ctx.services.skills.readFileBytes(row, maxInlineBytes);
+      if (!bytes) return { found: false, reason: "no such file" }; // manifest/object drift
       return isInlineTextType(row.content_type)
-        ? { ...meta, encoding: "utf8", content: new TextDecoder().decode(f.bytes) }
-        : { ...meta, encoding: "base64", content: base64FromBytes(f.bytes) };
+        ? { ...meta, encoding: "utf8", content: new TextDecoder().decode(bytes) }
+        : { ...meta, encoding: "base64", content: base64FromBytes(bytes) };
     },
   },
   {

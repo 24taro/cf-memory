@@ -9,6 +9,7 @@ import {
   INLINE_CONTENT_MAX_BYTES,
   isInlineTextType,
   MAX_BUNDLE_FILE_COUNT,
+  MAX_BUNDLE_FILE_BYTES,
   MAX_BUNDLE_TOTAL_BYTES,
   sanitizeUploadContentType,
   validateBundlePath,
@@ -457,11 +458,18 @@ export class SkillsRepo {
    * object is missing (manifest/object drift → 404). */
   async getFile(skillId: string, path: string): Promise<{ row: SkillFileRow; bytes: Uint8Array } | null> {
     if (!this.bundles) throw new BundlesUnconfiguredError();
-    const row = await this.db.prepare("SELECT * FROM skill_files WHERE skill_id=? AND path=?").bind(skillId, path).first<SkillFileRow>();
+    const row = await this.getFileRow(skillId, path);
     if (!row) return null;
+    const bytes = await this.readFileBytes(row);
+    return bytes ? { row, bytes } : null;
+  }
+
+  /** Read the immutable key selected by the caller's manifest snapshot. */
+  async readFileBytes(row: SkillFileRow, maxBytes = MAX_BUNDLE_FILE_BYTES): Promise<Uint8Array | null> {
+    if (!this.bundles) throw new BundlesUnconfiguredError();
     const obj = await this.bundles.get(row.r2_key);
-    if (!obj) return null;
-    return { row, bytes: new Uint8Array(await obj.arrayBuffer()) };
+    if (!obj || obj.size > maxBytes || (row.size !== null && obj.size !== row.size)) return null;
+    return new Uint8Array(await obj.arrayBuffer());
   }
 
   /** Manifest row only (pure D1, no R2 read) — lets a caller check size/type
@@ -556,8 +564,8 @@ export class SkillsRepo {
       const base = { path: row.path, content_type: row.content_type ?? undefined, size: row.size ?? undefined, sha256: row.sha256 ?? undefined };
       const url = `/@${handle}/skills/${skill.slug}/files/${encodeBundlePath(row.path)}`;
       if (this.bundles && (row.size ?? 0) <= INLINE_CONTENT_MAX_BYTES && isInlineTextType(row.content_type)) {
-        const obj = await this.bundles.get(row.r2_key); // read R2 directly — row already has r2_key (no redundant D1 re-SELECT via getFile)
-        files.push(obj ? { ...base, content: new TextDecoder().decode(await obj.arrayBuffer()) } : { ...base, url });
+        const bytes = await this.readFileBytes(row, INLINE_CONTENT_MAX_BYTES);
+        files.push(bytes ? { ...base, content: new TextDecoder().decode(bytes) } : { ...base, url });
       } else {
         files.push({ ...base, url });
       }
