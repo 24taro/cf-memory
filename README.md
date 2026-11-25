@@ -28,15 +28,32 @@ Node.js 22.12+ (22.x) or 24+ with npm, OpenSSL, and curl. Use Claude Code
 2.1.327 or later, or the Codex CLI with `/hooks` support. The handoff below
 has been verified on Codex CLI 0.170.0 and 0.172.0.
 
+In the Cloudflare dashboard, open **Workers & Pages** for the account you
+want to use and make sure it has a `workers.dev` subdomain.
+[Configure a `workers.dev` subdomain](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/#configure-workersdev).
+
 ```bash
 git clone https://github.com/24taro/cf-memory.git
 cd cf-memory
-./install.sh
+```
+
+If your Cloudflare login has access to one account, run `./install.sh`.
+If it has access to multiple accounts, replace `YOUR_ACCOUNT_ID` with the ID
+of the account you want to use.
+[Find your Cloudflare account ID](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/#copy-your-account-id).
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=YOUR_ACCOUNT_ID ./install.sh
 ```
 
 Approve the Cloudflare login when prompted. The installer provisions the
 storage, deploys the Worker, saves the API token, and connects the clients
 it finds. Use `./install.sh --no-client` for the Worker alone.
+
+Claude Code versions older than 2.1.327 on `PATH` stop installation before
+deployment, even for Codex users. Update Claude Code, or run the installer
+with `codex` available on `PATH` after removing the older `claude` from
+that shell's search path.
 
 - **Claude Code.** Restart it after installation.
 - **Codex.** Load the two printed `export` lines in your shell before
@@ -126,7 +143,10 @@ it in D1, and skill attachments live in R2. Recalled text becomes part of the
 coding client's context and follows that client's model and data settings.
 The browser UI loads Google Fonts and may request external images embedded in
 notes. The installer stores the API token in `.cf-memory.secrets` in this
-checkout (mode 0600, ignored by Git).
+checkout (mode 0600, ignored by Git). When you connect Claude Code, the
+installer also saves the token as an Authorization header in Claude Code's
+user MCP configuration (`~/.claude.json` by default, or `.claude.json` in
+`CLAUDE_CONFIG_DIR` if set). Keep both files private.
 
 ### Delete conversation logs
 

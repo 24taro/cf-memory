@@ -21,13 +21,22 @@ Worker 1つ、D1 データベース2つ、R2 バケット1つで動きます。�
 
 **必要なもの。** R2 を有効にした Workers Paid プラン、Git、Bash、Node.js 22.12 以降の 22.x または 24 以上と npm、OpenSSL、curl。クライアントは Claude Code 2.1.327 以降か、`/hooks` が使える Codex CLI を用意します。以下の引き継ぎ手順は Codex CLI 0.170.0 と 0.172.0 で確認済みです。
 
+導入先の Cloudflare アカウントで **Workers & Pages** を開き、`workers.dev` サブドメインが設定されていることを確認します。[サブドメインの設定手順](https://developers.cloudflare.com/workers/configuration/routing/workers-dev/#configure-workersdev)
+
 ```bash
 git clone https://github.com/24taro/cf-memory.git
 cd cf-memory
-./install.sh
+```
+
+Cloudflare のログインで使えるアカウントが1つなら `./install.sh` を実行します。複数ある場合は、`YOUR_ACCOUNT_ID` を導入先のアカウント ID に置き換えます。[アカウント ID の確認手順](https://developers.cloudflare.com/fundamentals/account/find-account-and-zone-ids/#copy-your-account-id)
+
+```bash
+CLOUDFLARE_ACCOUNT_ID=YOUR_ACCOUNT_ID ./install.sh
 ```
 
 Cloudflare のログインを求められたら承認してください。インストーラーがストレージを作成し、Worker をデプロイして API トークンを保存し、見つかったクライアントを接続します。Worker だけを導入する場合は `./install.sh --no-client` を使います。
+
+Claude Code 2.1.327 未満が `PATH` にあると、Codex だけを使う場合でもデプロイ前に停止します。Claude Code を更新するか、旧版の `claude` をそのシェルの検索パスから外し、`codex` が使える状態でインストーラーを実行してください。
 
 - **Claude Code**は導入後に再起動します。
 - **Codex**は、表示された `export` 2 行をシェルで反映してから起動し、`/hooks` で cf-memory のフック4件を承認します。
@@ -85,7 +94,9 @@ flowchart LR
 
 ## データの置き場所
 
-フックは会話データを自分の Worker に送信します。会話データは自分の Cloudflare アカウントの D1 に、スキルの添付ファイルは R2 に保存されます。想起したテキストはクライアントのコンテキストに入り、そのクライアントのモデルとデータの設定に従います。Web 画面は Google Fonts を読み込み、ノート内に外部画像があればその配信元にも接続します。インストーラーは API トークンをこのチェックアウトの `.cf-memory.secrets`（権限 `0600`、Git の対象外）に保存します。
+フックは会話データを自分の Worker に送信します。会話データは自分の Cloudflare アカウントの D1 に、スキルの添付ファイルは R2 に保存されます。想起したテキストはクライアントのコンテキストに入り、そのクライアントのモデルとデータの設定に従います。Web 画面は Google Fonts を読み込み、ノート内に外部画像があればその配信元にも接続します。
+
+インストーラーは API トークンをこのチェックアウトの `.cf-memory.secrets`（権限 `0600`、Git の対象外）に保存します。Claude Code を接続する場合は、ユーザーの MCP 設定（既定は `~/.claude.json`、`CLAUDE_CONFIG_DIR` を設定した場合はその中の `.claude.json`）の Authorization ヘッダーにも保存します。どちらのファイルも非公開で扱ってください。
 
 ### 会話ログを削除する
 
